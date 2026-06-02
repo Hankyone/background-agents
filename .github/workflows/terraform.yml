@@ -171,10 +171,14 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
 
       - name: Stop managing Vercel state
-        if: ${{ secrets.WEB_PLATFORM == 'cloudflare' }}
         run: |
+          if [ "$WEB_PLATFORM" != "cloudflare" ]; then
+            exit 0
+          fi
           terraform state list | grep '^module\.web_app' | xargs -r terraform state rm
         working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          WEB_PLATFORM: ${{ secrets.WEB_PLATFORM }}
 
       - name: Terraform Plan
         id: plan
@@ -318,10 +322,14 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
 
       - name: Stop managing Vercel state
-        if: ${{ secrets.WEB_PLATFORM == 'cloudflare' }}
         run: |
+          if [ "$WEB_PLATFORM" != "cloudflare" ]; then
+            exit 0
+          fi
           terraform state list | grep '^module\.web_app' | xargs -r terraform state rm
         working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          WEB_PLATFORM: ${{ secrets.WEB_PLATFORM }}
 
       - name: Terraform Apply
         run: terraform apply -auto-approve
