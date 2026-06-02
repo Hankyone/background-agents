@@ -170,6 +170,12 @@ jobs:
             -backend-config='endpoints={s3="https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"}'
         working-directory: ${{ env.TF_WORKING_DIR }}
 
+      - name: Stop managing Vercel state
+        if: ${{ secrets.WEB_PLATFORM == 'cloudflare' }}
+        run: |
+          terraform state list | grep '^module\.web_app' | xargs -r terraform state rm
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
       - name: Terraform Plan
         id: plan
         run: |
@@ -309,6 +315,12 @@ jobs:
             -backend-config="access_key=${{ secrets.R2_ACCESS_KEY_ID }}" \
             -backend-config="secret_key=${{ secrets.R2_SECRET_ACCESS_KEY }}" \
             -backend-config='endpoints={s3="https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"}'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Stop managing Vercel state
+        if: ${{ secrets.WEB_PLATFORM == 'cloudflare' }}
+        run: |
+          terraform state list | grep '^module\.web_app' | xargs -r terraform state rm
         working-directory: ${{ env.TF_WORKING_DIR }}
 
       - name: Terraform Apply
