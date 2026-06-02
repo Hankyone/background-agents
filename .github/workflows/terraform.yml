@@ -233,7 +233,7 @@ jobs:
           TF_VAR_enable_durable_object_bindings: "${{ secrets.ENABLE_DURABLE_OBJECT_BINDINGS || 'true' }}"
           TF_VAR_control_plane_migration_tag: "${{ secrets.CONTROL_PLANE_MIGRATION_TAG || 'v1' }}"
           TF_VAR_control_plane_migration_old_tag: ${{ secrets.CONTROL_PLANE_MIGRATION_OLD_TAG }}
-          TF_VAR_control_plane_new_sqlite_classes: ${{ secrets.CONTROL_PLANE_NEW_SQLITE_CLASSES }}
+          TF_VAR_control_plane_new_sqlite_classes: "${{ secrets.CONTROL_PLANE_NEW_SQLITE_CLASSES || '[]' }}"
           TF_VAR_sandbox_provider: "${{ secrets.SANDBOX_PROVIDER || 'modal' }}"
           TF_VAR_daytona_api_url: ${{ secrets.DAYTONA_API_URL }}
           TF_VAR_daytona_api_key: ${{ secrets.DAYTONA_API_KEY }}
@@ -381,7 +381,7 @@ jobs:
           TF_VAR_enable_durable_object_bindings: "${{ secrets.ENABLE_DURABLE_OBJECT_BINDINGS || 'true' }}"
           TF_VAR_control_plane_migration_tag: "${{ secrets.CONTROL_PLANE_MIGRATION_TAG || 'v1' }}"
           TF_VAR_control_plane_migration_old_tag: ${{ secrets.CONTROL_PLANE_MIGRATION_OLD_TAG }}
-          TF_VAR_control_plane_new_sqlite_classes: ${{ secrets.CONTROL_PLANE_NEW_SQLITE_CLASSES }}
+          TF_VAR_control_plane_new_sqlite_classes: "${{ secrets.CONTROL_PLANE_NEW_SQLITE_CLASSES || '[]' }}"
           TF_VAR_sandbox_provider: "${{ secrets.SANDBOX_PROVIDER || 'modal' }}"
           TF_VAR_daytona_api_url: ${{ secrets.DAYTONA_API_URL }}
           TF_VAR_daytona_api_key: ${{ secrets.DAYTONA_API_KEY }}
