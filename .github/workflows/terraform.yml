@@ -182,6 +182,7 @@ jobs:
         env:
           TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           TF_VAR_cloudflare_worker_subdomain: ${{ secrets.CLOUDFLARE_WORKER_SUBDOMAIN }}
           TF_VAR_vercel_api_token: "${{ secrets.VERCEL_API_TOKEN || '000000000000000000000000' }}"
           TF_VAR_vercel_team_id: "${{ secrets.VERCEL_TEAM_ID || 'unused' }}"
@@ -207,6 +208,7 @@ jobs:
           TF_VAR_allowed_users: ${{ secrets.ALLOWED_USERS }}
           TF_VAR_allowed_email_domains: ${{ secrets.ALLOWED_EMAIL_DOMAINS }}
           TF_VAR_deployment_name: ${{ secrets.DEPLOYMENT_NAME }}
+          TF_VAR_custom_domain: ${{ secrets.CUSTOM_DOMAIN }}
           TF_VAR_enable_github_bot: "${{ secrets.ENABLE_GITHUB_BOT || 'false' }}"
           TF_VAR_github_webhook_secret: ${{ secrets.GH_WEBHOOK_SECRET }}
           TF_VAR_github_bot_username: ${{ secrets.GH_BOT_USERNAME }}
@@ -315,6 +317,7 @@ jobs:
         env:
           TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           TF_VAR_cloudflare_worker_subdomain: ${{ secrets.CLOUDFLARE_WORKER_SUBDOMAIN }}
           TF_VAR_vercel_api_token: "${{ secrets.VERCEL_API_TOKEN || '000000000000000000000000' }}"
           TF_VAR_vercel_team_id: "${{ secrets.VERCEL_TEAM_ID || 'unused' }}"
@@ -340,6 +343,7 @@ jobs:
           TF_VAR_allowed_users: ${{ secrets.ALLOWED_USERS }}
           TF_VAR_allowed_email_domains: ${{ secrets.ALLOWED_EMAIL_DOMAINS }}
           TF_VAR_deployment_name: ${{ secrets.DEPLOYMENT_NAME }}
+          TF_VAR_custom_domain: ${{ secrets.CUSTOM_DOMAIN }}
           TF_VAR_enable_github_bot: "${{ secrets.ENABLE_GITHUB_BOT || 'false' }}"
           TF_VAR_github_webhook_secret: ${{ secrets.GH_WEBHOOK_SECRET }}
           TF_VAR_github_bot_username: ${{ secrets.GH_BOT_USERNAME }}

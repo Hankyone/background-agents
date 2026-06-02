@@ -353,6 +353,12 @@ variable "deployment_name" {
   type        = string
 }
 
+variable "custom_domain" {
+  description = "Optional custom domain for the web app, such as agents.example.com. When set, service URLs and auth callbacks use this hostname."
+  type        = string
+  default     = ""
+}
+
 variable "app_name" {
   description = "Display name shown in the web UI tab title, sign-in page, bot messages (Slack, Linear), PR body footer, and outbound HTTP User-Agent headers."
   type        = string

@@ -113,3 +113,14 @@ resource "null_resource" "web_app_cloudflare_deploy" {
     local_file.web_app_wrangler_production,
   ]
 }
+
+resource "cloudflare_workers_custom_domain" "web_app" {
+  count = var.web_platform == "cloudflare" && var.custom_domain != "" ? 1 : 0
+
+  account_id = var.cloudflare_account_id
+  zone_id    = var.cloudflare_zone_id
+  hostname   = var.custom_domain
+  service    = "open-inspect-web-${local.name_suffix}"
+
+  depends_on = [null_resource.web_app_cloudflare_deploy]
+}

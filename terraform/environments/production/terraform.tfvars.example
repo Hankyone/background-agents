@@ -203,6 +203,10 @@ web_platform = "vercel"
 # The web app URL will be: https://open-inspect-{deployment_name}.vercel.app
 deployment_name = ""
 
+# Optional custom domain for the web app, for example "agents.example.com".
+# Requires cloudflare_zone_id when web_platform = "cloudflare".
+custom_domain = ""
+
 # Path to project root (relative to this directory)
 project_root = "../../../"
 

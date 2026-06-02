@@ -8,12 +8,13 @@ locals {
   control_plane_url  = "https://${local.control_plane_host}"
   ws_url             = "wss://${local.control_plane_host}"
 
-  # Web app URL depends on deployment platform
-  web_app_url = var.web_platform == "cloudflare" ? (
+  # Web app URL depends on deployment platform, with optional custom-domain override.
+  default_web_app_url = var.web_platform == "cloudflare" ? (
     "https://open-inspect-web-${local.name_suffix}.${var.cloudflare_worker_subdomain}.workers.dev"
     ) : (
     "https://open-inspect-${local.name_suffix}.vercel.app"
   )
+  web_app_url = var.custom_domain != "" ? "https://${var.custom_domain}" : local.default_web_app_url
 
   # Worker script paths (deterministic output locations)
   control_plane_script_path = "${var.project_root}/packages/control-plane/dist/index.js"
