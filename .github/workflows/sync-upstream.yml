@@ -84,7 +84,7 @@ jobs:
           # (mirrors the path filter in terraform.yml). Doc-only syncs skip the deploy.
           if grep -qE '^(terraform/|scripts/|packages/|\.github/workflows/terraform\.yml$)' changed-paths.txt; then
             echo "Deploy-relevant changes detected; dispatching $DEPLOY_WORKFLOW."
-            gh workflow run "$DEPLOY_WORKFLOW" --ref main
+            gh workflow run "$DEPLOY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main
           else
             echo "No deploy-relevant paths changed; skipping deploy."
           fi
