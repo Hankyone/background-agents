@@ -12,6 +12,7 @@ Runs as PID 1 inside the sandbox. Responsibilities:
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -568,10 +569,8 @@ class SandboxSupervisor:
 
             existing = {}
             if auth_file.exists():
-                try:
+                with contextlib.suppress(Exception):
                     existing = json.loads(auth_file.read_text())
-                except Exception:
-                    pass
 
             existing["openai"] = openai_entry
 
@@ -609,10 +608,8 @@ class SandboxSupervisor:
 
             existing = {}
             if auth_file.exists():
-                try:
+                with contextlib.suppress(Exception):
                     existing = json.loads(auth_file.read_text())
-                except Exception:
-                    pass
 
             existing["anthropic"] = anthropic_entry
 
