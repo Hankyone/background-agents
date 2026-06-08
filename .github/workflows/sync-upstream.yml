@@ -38,6 +38,7 @@ jobs:
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+      UPSTREAM_SYNC_TOKEN_CONFIGURED: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@v6
@@ -91,6 +92,10 @@ jobs:
           # Only redeploy when the synced changes touch something the deploy cares about
           # (mirrors the path filter in terraform.yml). Doc-only syncs skip the deploy.
           if grep -qE '^(terraform/|scripts/|packages/|\.github/workflows/terraform\.yml$)' changed-paths.txt; then
+            if [ "$UPSTREAM_SYNC_TOKEN_CONFIGURED" = "true" ]; then
+              echo "Deploy-relevant changes detected; push used UPSTREAM_SYNC_TOKEN, so the push event will trigger $DEPLOY_WORKFLOW."
+              exit 0
+            fi
             echo "Deploy-relevant changes detected; dispatching $DEPLOY_WORKFLOW."
             gh workflow run "$DEPLOY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main
           else
