@@ -81,9 +81,9 @@ export interface SessionParticipant {
 export interface Session {
   id: string;
   title: string | null;
-  repoOwner: string;
-  repoName: string;
-  baseBranch: string;
+  repoOwner: string | null;
+  repoName: string | null;
+  baseBranch: string | null;
   branchName: string | null;
   baseSha: string | null;
   currentSha: string | null;
@@ -366,9 +366,9 @@ export type ServerMessage =
 export interface SessionState {
   id: string;
   title: string | null;
-  repoOwner: string;
-  repoName: string;
-  baseBranch: string;
+  repoOwner: string | null;
+  repoName: string | null;
+  baseBranch: string | null;
   branchName: string | null;
   status: SessionStatus;
   sandboxStatus: SandboxStatus;
@@ -560,15 +560,31 @@ export type CallbackContext =
   | LinearCallbackContext
   | AutomationCallbackContext;
 
+function hasRepositoryIdentifier(value: string | null | undefined): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 // API response types
-export const createSessionRequestSchema = z.object({
-  repoOwner: z.string(),
-  repoName: z.string(),
-  title: z.string().optional(),
-  model: z.string().optional(),
-  reasoningEffort: z.string().optional(),
-  branch: z.string().optional(),
-});
+export const createSessionRequestSchema = z
+  .object({
+    repoOwner: z.string().trim().min(1).nullish(),
+    repoName: z.string().trim().min(1).nullish(),
+    title: z.string().optional(),
+    model: z.string().optional(),
+    reasoningEffort: z.string().optional(),
+    branch: z.string().optional(),
+  })
+  .refine(
+    (data) => hasRepositoryIdentifier(data.repoOwner) === hasRepositoryIdentifier(data.repoName),
+    {
+      message: "repoOwner and repoName must be provided together",
+      path: ["repoName"],
+    }
+  )
+  .refine((data) => hasRepositoryIdentifier(data.repoOwner) || !data.branch?.trim(), {
+    message: "branch requires repoOwner and repoName",
+    path: ["branch"],
+  });
 
 export type CreateSessionRequest = z.infer<typeof createSessionRequestSchema>;
 
@@ -630,8 +646,8 @@ export interface SpawnChildSessionRequest {
 
 /** Returned by parent DO's GET /internal/spawn-context */
 export interface SpawnContext {
-  repoOwner: string;
-  repoName: string;
+  repoOwner: string | null;
+  repoName: string | null;
   repoId: number | null;
   model: string;
   reasoningEffort: string | null;
@@ -668,8 +684,8 @@ export interface ChildSessionDetail {
     id: string;
     title: string;
     status: SessionStatus;
-    repoOwner: string;
-    repoName: string;
+    repoOwner: string | null;
+    repoName: string | null;
     branchName: string | null;
     model: string;
     createdAt: number;
@@ -753,10 +769,6 @@ import type { TriggerConfig } from "../triggers/conditions";
 export interface Automation {
   id: string;
   name: string;
-  repoOwner: string;
-  repoName: string;
-  baseBranch: string;
-  repoId: number | null;
   instructions: string;
   triggerType: AutomationTriggerType;
   scheduleCron: string | null;
@@ -772,13 +784,14 @@ export interface Automation {
   deletedAt: number | null;
   eventType: string | null;
   triggerConfig: TriggerConfig | null;
+  repoOwner: string | null;
+  repoName: string | null;
+  baseBranch: string | null;
+  repoId: number | null;
 }
 
 export interface CreateAutomationRequest {
   name: string;
-  repoOwner: string;
-  repoName: string;
-  baseBranch?: string;
   instructions: string;
   triggerType?: AutomationTriggerType;
   scheduleCron?: string;
@@ -788,16 +801,21 @@ export interface CreateAutomationRequest {
   eventType?: string;
   triggerConfig?: TriggerConfig;
   sentryClientSecret?: string;
+  repoOwner?: string | null;
+  repoName?: string | null;
+  baseBranch?: string | null;
 }
 
 export interface UpdateAutomationRequest {
   name?: string;
   instructions?: string;
+  repoOwner?: string | null;
+  repoName?: string | null;
   scheduleCron?: string;
   scheduleTz?: string;
   model?: string;
   reasoningEffort?: string | null;
-  baseBranch?: string;
+  baseBranch?: string | null;
   eventType?: string;
   triggerConfig?: TriggerConfig;
 }
