@@ -172,6 +172,16 @@ jobs:
             -backend-config='endpoints={s3="https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"}'
         working-directory: ${{ env.TF_WORKING_DIR }}
 
+      - name: Stop managing Vercel state
+        run: |
+          if [ "$WEB_PLATFORM" != "cloudflare" ]; then
+            exit 0
+          fi
+          terraform state list | grep '^module\.web_app' | xargs -r terraform state rm
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          WEB_PLATFORM: ${{ secrets.WEB_PLATFORM }}
+
       - name: Terraform Plan
         id: plan
         run: |
@@ -184,6 +194,7 @@ jobs:
         env:
           TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           TF_VAR_cloudflare_worker_subdomain: ${{ secrets.CLOUDFLARE_WORKER_SUBDOMAIN }}
           TF_VAR_vercel_api_token: "${{ secrets.VERCEL_API_TOKEN || '000000000000000000000000' }}"
           TF_VAR_vercel_team_id: "${{ secrets.VERCEL_TEAM_ID || 'unused' }}"
@@ -213,6 +224,7 @@ jobs:
           TF_VAR_allowed_emails: ${{ secrets.ALLOWED_EMAILS }}
           TF_VAR_allowed_github_orgs: ${{ secrets.ALLOWED_GITHUB_ORGS }}
           TF_VAR_deployment_name: ${{ secrets.DEPLOYMENT_NAME }}
+          TF_VAR_custom_domain: ${{ secrets.CUSTOM_DOMAIN }}
           TF_VAR_enable_github_bot: "${{ secrets.ENABLE_GITHUB_BOT || 'false' }}"
           TF_VAR_github_webhook_secret: ${{ secrets.GH_WEBHOOK_SECRET }}
           TF_VAR_github_bot_username: ${{ secrets.GH_BOT_USERNAME }}
@@ -225,6 +237,9 @@ jobs:
           TF_VAR_linear_webhook_secret: ${{ secrets.LINEAR_WEBHOOK_SECRET }}
           TF_VAR_web_platform: "${{ secrets.WEB_PLATFORM || 'vercel' }}"
           TF_VAR_enable_durable_object_bindings: "${{ secrets.ENABLE_DURABLE_OBJECT_BINDINGS || 'true' }}"
+          TF_VAR_control_plane_migration_tag: "${{ secrets.CONTROL_PLANE_MIGRATION_TAG || 'v1' }}"
+          TF_VAR_control_plane_migration_old_tag: ${{ secrets.CONTROL_PLANE_MIGRATION_OLD_TAG }}
+          TF_VAR_control_plane_new_sqlite_classes: "${{ secrets.CONTROL_PLANE_NEW_SQLITE_CLASSES || '[]' }}"
           TF_VAR_sandbox_provider: "${{ secrets.SANDBOX_PROVIDER || 'modal' }}"
           TF_VAR_daytona_api_url: ${{ secrets.DAYTONA_API_URL }}
           TF_VAR_daytona_api_key: ${{ secrets.DAYTONA_API_KEY }}
@@ -329,12 +344,46 @@ jobs:
             -backend-config='endpoints={s3="https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"}'
         working-directory: ${{ env.TF_WORKING_DIR }}
 
+      - name: Stop managing Vercel state
+        run: |
+          if [ "$WEB_PLATFORM" != "cloudflare" ]; then
+            exit 0
+          fi
+          terraform state list | grep '^module\.web_app' | xargs -r terraform state rm
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          WEB_PLATFORM: ${{ secrets.WEB_PLATFORM }}
+
+      - name: Clear custom domain DNS records
+        run: |
+          if [ "$WEB_PLATFORM" != "cloudflare" ] || [ -z "$CUSTOM_DOMAIN" ]; then
+            exit 0
+          fi
+
+          records="$(curl -fsS \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?name=$CUSTOM_DOMAIN" \
+            | jq -r '.result[] | select(.type == "A" or .type == "AAAA" or .type == "CNAME") | .id')"
+
+          for record_id in $records; do
+            curl -fsS -X DELETE \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$record_id" \
+              >/dev/null
+          done
+        env:
+          WEB_PLATFORM: ${{ secrets.WEB_PLATFORM }}
+          CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+
       - name: Terraform Apply
         run: terraform apply -auto-approve
         working-directory: ${{ env.TF_WORKING_DIR }}
         env:
           TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
           TF_VAR_cloudflare_worker_subdomain: ${{ secrets.CLOUDFLARE_WORKER_SUBDOMAIN }}
           TF_VAR_vercel_api_token: "${{ secrets.VERCEL_API_TOKEN || '000000000000000000000000' }}"
           TF_VAR_vercel_team_id: "${{ secrets.VERCEL_TEAM_ID || 'unused' }}"
@@ -364,6 +413,7 @@ jobs:
           TF_VAR_allowed_emails: ${{ secrets.ALLOWED_EMAILS }}
           TF_VAR_allowed_github_orgs: ${{ secrets.ALLOWED_GITHUB_ORGS }}
           TF_VAR_deployment_name: ${{ secrets.DEPLOYMENT_NAME }}
+          TF_VAR_custom_domain: ${{ secrets.CUSTOM_DOMAIN }}
           TF_VAR_enable_github_bot: "${{ secrets.ENABLE_GITHUB_BOT || 'false' }}"
           TF_VAR_github_webhook_secret: ${{ secrets.GH_WEBHOOK_SECRET }}
           TF_VAR_github_bot_username: ${{ secrets.GH_BOT_USERNAME }}
@@ -376,6 +426,9 @@ jobs:
           TF_VAR_linear_webhook_secret: ${{ secrets.LINEAR_WEBHOOK_SECRET }}
           TF_VAR_web_platform: "${{ secrets.WEB_PLATFORM || 'vercel' }}"
           TF_VAR_enable_durable_object_bindings: "${{ secrets.ENABLE_DURABLE_OBJECT_BINDINGS || 'true' }}"
+          TF_VAR_control_plane_migration_tag: "${{ secrets.CONTROL_PLANE_MIGRATION_TAG || 'v1' }}"
+          TF_VAR_control_plane_migration_old_tag: ${{ secrets.CONTROL_PLANE_MIGRATION_OLD_TAG }}
+          TF_VAR_control_plane_new_sqlite_classes: "${{ secrets.CONTROL_PLANE_NEW_SQLITE_CLASSES || '[]' }}"
           TF_VAR_sandbox_provider: "${{ secrets.SANDBOX_PROVIDER || 'modal' }}"
           TF_VAR_daytona_api_url: ${{ secrets.DAYTONA_API_URL }}
           TF_VAR_daytona_api_key: ${{ secrets.DAYTONA_API_KEY }}

@@ -1,0 +1,181 @@
+name: Sync Upstream
+
+# Keeps this fork's `main` current with the upstream repository, and — crucially —
+# makes sure the running deployment is redeployed after a sync so the live app is
+# always up to date.
+#
+# Why the explicit deploy dispatch: pushes made with the default GITHUB_TOKEN do NOT
+# trigger other workflows (GitHub's recursion guard). So a plain `git push` here would
+# update the repo but never run the Terraform deploy. `workflow_dispatch` is the
+# documented exception that GITHUB_TOKEN *is* allowed to trigger, so we use it.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the merged main / sync branch
+  actions: write # dispatch the Terraform deploy workflow
+  pull-requests: write # open a PR when the sync conflicts
+  issues: write # comment on handoff PRs
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/ColeMurray/background-agents.git
+  UPSTREAM_BRANCH: main
+  DEPLOY_WORKFLOW: terraform.yml
+  CONFLICT_BRANCH: sync/upstream
+  PUSH_BLOCKED_BRANCH: sync/upstream-push-blocked
+
+jobs:
+  sync:
+    name: Sync main from upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+      UPSTREAM_SYNC_TOKEN_CONFIGURED: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+      - name: Merge upstream into main
+        id: merge
+        run: |
+          set -euo pipefail
+          git checkout main
+          before="$(git rev-parse HEAD)"
+
+          # Nothing new upstream -> done.
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            echo "Already up to date with upstream."
+            echo "status=up-to-date" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Try a clean merge. If it conflicts, abort and hand off to the conflict step.
+          if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+            git diff --name-only "$before" HEAD > changed-paths.txt
+            if git push origin main; then
+              echo "Merged upstream cleanly."
+              echo "status=merged" >> "$GITHUB_OUTPUT"
+            else
+              echo "Merged upstream cleanly, but GitHub rejected the push."
+              echo "This usually means upstream changed .github/workflows/* and the sync token lacks workflow-file write permission."
+              git reset --hard "$before"
+              echo "status=push-blocked" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            git merge --abort
+            echo "Merge conflicts with local customizations."
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy after clean sync
+        if: steps.merge.outputs.status == 'merged'
+        run: |
+          set -euo pipefail
+          # Only redeploy when the synced changes touch something the deploy cares about
+          # (mirrors the path filter in terraform.yml). Doc-only syncs skip the deploy.
+          if grep -qE '^(terraform/|scripts/|packages/|\.github/workflows/terraform\.yml$)' changed-paths.txt; then
+            if [ "$UPSTREAM_SYNC_TOKEN_CONFIGURED" = "true" ]; then
+              echo "Deploy-relevant changes detected; push used UPSTREAM_SYNC_TOKEN, so the push event will trigger $DEPLOY_WORKFLOW."
+              exit 0
+            fi
+            echo "Deploy-relevant changes detected; dispatching $DEPLOY_WORKFLOW."
+            gh workflow run "$DEPLOY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main
+          else
+            echo "No deploy-relevant paths changed; skipping deploy."
+          fi
+
+      - name: Open conflict PR and ask the bot to resolve
+        if: steps.merge.outputs.status == 'conflict'
+        env:
+          BOT_USERNAME: ${{ secrets.GH_BOT_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          # Don't clobber an in-flight resolution: if a conflict PR is already open,
+          # leave it alone (the bot or a human may already be working on it).
+          existing="$(gh pr list --state open --head "$CONFLICT_BRANCH" --json number --jq 'length')"
+          if [ "$existing" != "0" ]; then
+            echo "A conflict PR for $CONFLICT_BRANCH is already open; not touching it."
+            exit 0
+          fi
+
+          # Publish the upstream tip as the PR head. The PR will show as conflicting;
+          # resolving it (merging main in and fixing conflicts) makes it mergeable.
+          git push -f origin "upstream/$UPSTREAM_BRANCH:refs/heads/$CONFLICT_BRANCH"
+
+          body="$(printf '%s\n' \
+            'Automated upstream sync could not cleanly merge: upstream changes conflict' \
+            'with this fork'\''s customizations (Cloudflare web hosting, sync workflow, etc.).' \
+            '' \
+            'To resolve: merge `main` into this branch, fix the conflicts **preserving our' \
+            'customizations**, push, then merge this PR. Merging redeploys automatically.')"
+
+          gh pr create --base main --head "$CONFLICT_BRANCH" \
+            --title "Sync upstream — conflicts need resolution" \
+            --body "$body"
+
+          # Best-effort: ask the OpenInspect bot to resolve it. NOTE: the bot only acts
+          # on mentions from an allowed trigger user — add `github-actions[bot]` to the
+          # repo's allowed trigger users in the OpenInspect dashboard for this to fire.
+          if [ -n "${BOT_USERNAME:-}" ]; then
+            gh pr comment "$CONFLICT_BRANCH" --body "@${BOT_USERNAME} please merge \`main\` into this branch and resolve the conflicts, preserving our Cloudflare web-hosting and upstream-sync customizations, then push the resolution."
+          fi
+
+      - name: Open push-blocked PR and ask the bot to sync
+        if: steps.merge.outputs.status == 'push-blocked'
+        env:
+          BOT_USERNAME: ${{ secrets.GH_BOT_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          existing="$(gh pr list --state open --head "$PUSH_BLOCKED_BRANCH" --json number --jq 'length')"
+          if [ "$existing" != "0" ]; then
+            echo "A push-blocked sync PR for $PUSH_BLOCKED_BRANCH is already open; not touching it."
+            exit 0
+          fi
+
+          git fetch origin main
+          git checkout -B "$PUSH_BLOCKED_BRANCH" origin/main
+          git commit --allow-empty -m "chore: request upstream sync handoff"
+          git push -f origin "$PUSH_BLOCKED_BRANCH"
+
+          upstream_sha="$(git rev-parse "upstream/$UPSTREAM_BRANCH")"
+          body="$(printf '%s\n' \
+            'Automated upstream sync merged cleanly in CI, but GitHub rejected the push because' \
+            'the upstream update modifies `.github/workflows/*` and the default Actions token' \
+            'cannot update workflow files.' \
+            '' \
+            "Upstream target: \`$UPSTREAM_BRANCH\` at \`$upstream_sha\`" \
+            '' \
+            'This PR is a handoff trigger. The branch intentionally contains only an empty commit;' \
+            'the agent should merge upstream into this branch or open a replacement PR with the' \
+            'actual sync result, preserving this fork'\''s Cloudflare web-hosting and sync customizations.' \
+            '' \
+            'To make future workflow-file syncs fully automatic, configure `UPSTREAM_SYNC_TOKEN`' \
+            'with repo contents and workflow-file write permission.')"
+
+          gh pr create --base main --head "$PUSH_BLOCKED_BRANCH" \
+            --title "Sync upstream — workflow-file update needs handoff" \
+            --body "$body"
+
+          if [ -n "${BOT_USERNAME:-}" ]; then
+            gh pr comment "$PUSH_BLOCKED_BRANCH" --body "@${BOT_USERNAME} please sync this fork with upstream \`$UPSTREAM_BRANCH\` at \`$upstream_sha\`, preserving our Cloudflare web-hosting and upstream-sync customizations. This handoff exists because GitHub Actions could not push upstream workflow-file changes with the default token."
+          fi
