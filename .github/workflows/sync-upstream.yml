@@ -121,6 +121,11 @@ jobs:
           # resolving it (merging main in and fixing conflicts) makes it mergeable.
           git push -f origin "upstream/$UPSTREAM_BRANCH:refs/heads/$CONFLICT_BRANCH"
 
+          # GitHub's branch index can lag behind the push by a few seconds; without
+          # a brief wait gh pr create fails with "Head sha can't be blank / No commits
+          # between main and sync/upstream" even though the branch was just pushed.
+          sleep 5
+
           body="$(printf '%s\n' \
             'Automated upstream sync could not cleanly merge: upstream changes conflict' \
             'with this fork'\''s customizations (Cloudflare web hosting, sync workflow, etc.).' \
@@ -128,9 +133,17 @@ jobs:
             'To resolve: merge `main` into this branch, fix the conflicts **preserving our' \
             'customizations**, push, then merge this PR. Merging redeploys automatically.')"
 
-          gh pr create --base main --head "$CONFLICT_BRANCH" \
-            --title "Sync upstream — conflicts need resolution" \
-            --body "$body"
+          # Retry PR creation — the branch ref may still be propagating through
+          # GitHub's API caches after the push.
+          for attempt in 1 2 3; do
+            if gh pr create --base main --head "$CONFLICT_BRANCH" \
+              --title "Sync upstream — conflicts need resolution" \
+              --body "$body"; then
+              break
+            fi
+            echo "PR creation attempt $attempt failed; retrying in 5s..."
+            sleep 5
+          done
 
           # Best-effort: ask the OpenInspect bot to resolve it. NOTE: the bot only acts
           # on mentions from an allowed trigger user — add `github-actions[bot]` to the
