@@ -66,6 +66,8 @@ import { PullRequestCreationClaims, SessionPullRequestService } from "./pull-req
 import { findPrArtifactForRepo } from "./pr-artifacts";
 import { RepoSecretsStore } from "../db/repo-secrets";
 import { GlobalSecretsStore } from "../db/global-secrets";
+import { EnvironmentSecretsStore } from "../db/environment-secrets";
+import { EnvironmentStore } from "../db/environments";
 import {
   auditSecretsMerge,
   mergeSecretSources,
@@ -1687,6 +1689,12 @@ export class SessionDO extends DurableObject<Env> {
       }
     }
 
+    // Environment provenance: the id is stored on the session; the name is
+    // resolved live (resolveEnvironmentName) so a deleted environment surfaces
+    // as null — the UI renders "environment deleted" (§7.6).
+    const environmentId = session?.environment_id ?? null;
+    const environmentName = await this.resolveEnvironmentName(environmentId);
+
     return {
       id: this.getPublicSessionId(session),
       title: session?.title ?? null,
@@ -1710,7 +1718,31 @@ export class SessionDO extends DurableObject<Env> {
       ttydToken,
       sandboxDashboardUrl: this.getSandboxDashboardUrl(sandbox?.modal_object_id),
       repositories: this.getSessionRepositoryStates(session),
+      environmentId,
+      environmentName,
     };
+  }
+
+  /**
+   * The launch environment's current display name, or null when the session has
+   * no environment or the environment was deleted after launch (§7.6). Resolved
+   * live rather than snapshotted so deletion is reflected; best-effort, so a
+   * lookup failure resolves null rather than failing the whole state read.
+   */
+  private async resolveEnvironmentName(environmentId: string | null): Promise<string | null> {
+    if (!environmentId || !this.env.DB) {
+      return null;
+    }
+    try {
+      const environment = await new EnvironmentStore(this.env.DB).getById(environmentId);
+      return environment?.name ?? null;
+    } catch (e) {
+      this.log.warn("Failed to resolve environment name for session state", {
+        environment_id: environmentId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return null;
+    }
   }
 
   /**
@@ -1823,11 +1855,14 @@ export class SessionDO extends DurableObject<Env> {
     const globalSecrets = await globalStore.getDecryptedSecrets();
 
     const repoStore = new RepoSecretsStore(this.env.DB, encryptionKey);
+    const environmentSecretsStore = new EnvironmentSecretsStore(this.env.DB, encryptionKey);
     const sources = await buildLaunchUnitSecretSources({
-      environmentId: null, // PR-9: session.environment_id
+      environmentId: session.environment_id,
       globalSecrets,
       members: this.repository.getSessionRepositories(),
       loadMemberSecrets: (member) => this.loadMemberRepoSecrets(session, member, repoStore),
+      loadEnvironmentSecrets: (environmentId) =>
+        environmentSecretsStore.getDecryptedSecrets(environmentId),
     });
 
     const merge = mergeSecretSources(sources);
