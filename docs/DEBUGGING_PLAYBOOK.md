@@ -10,13 +10,13 @@ joining across service boundaries.
 
 Every log line includes:
 
-| Field       | Type   | Description                                      |
-| ----------- | ------ | ------------------------------------------------ |
-| `level`     | string | `debug` \| `info` \| `warn` \| `error`           |
-| `service`   | string | `control-plane` \| `modal-infra` \| `slack-bot`  |
-| `component` | string | Sub-area (e.g. `router`, `session-do`, `bridge`) |
-| `msg`       | string | Stable event identifier for querying             |
-| `ts`        | number | Epoch milliseconds                               |
+| Field       | Type   | Description                                              |
+| ----------- | ------ | -------------------------------------------------------- |
+| `level`     | string | `debug` \| `info` \| `warn` \| `error`                   |
+| `service`   | string | `web` \| `control-plane` \| `modal-infra` \| `slack-bot` |
+| `component` | string | Sub-area (e.g. `router`, `session-do`, `bridge`)         |
+| `msg`       | string | Stable event identifier for querying                     |
+| `ts`        | number | Epoch milliseconds                                       |
 
 ## Correlation Fields
 
@@ -51,6 +51,13 @@ For Slack with Modal, the path is: **slack-bot -> control-plane -> modal-infra -
 2. Control-plane router propagates `trace_id` into Durable Object and provider calls.
 3. Provider-specific clients or endpoints bind the same trace to sandbox startup logs where
    supported.
+
+### Web API correlation
+
+The Next.js API layer accepts a valid inbound `x-trace-id` or generates one at the `/api` edge. It
+also generates a fresh hop-local `x-request-id` for the web response and logs. When the web service
+calls the control-plane, it forwards only `x-trace-id`; the control-plane still generates its own
+per-hop `request_id`.
 
 To trace a full request: filter by `trace_id` across all three services, or narrow by `session_id` +
 `message_id` for a specific prompt run.
@@ -116,13 +123,14 @@ One `image_build.*` vocabulary covers both scope kinds; events carry `scope_kind
 
 #### Session Durable Object (`component: "session-do"`)
 
-| Event             | Level      | Key Fields                                                                                                     | Description                    |
-| ----------------- | ---------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| `do.request`      | info       | `http_method`, `http_path`, `http_status`, `duration_ms`, `outcome`                                            | One per DO internal route call |
-| `ws.connect`      | info, warn | `ws_type` (sandbox\|client), `outcome`, `reject_reason`, `sandbox_id`, `participant_id`, `duration_ms`         | WebSocket lifecycle            |
-| `prompt.enqueue`  | info       | `message_id`, `source`, `author_id`, `user_id`, `model`, `content_length`, `has_attachments`, `queue_position` | Message queued                 |
-| `prompt.dispatch` | info       | `message_id`, `outcome`, `reason`, `model`, `has_sandbox_ws`, `queue_wait_ms`                                  | Message sent to sandbox        |
-| `prompt.complete` | info, warn | `message_id`, `outcome`, `total_duration_ms`, `processing_duration_ms`, `queue_duration_ms`                    | Prompt run finished            |
+| Event                        | Level       | Key Fields                                                                                                            | Description                         |
+| ---------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `do.request`                 | info        | `http_method`, `http_path`, `http_status`, `duration_ms`, `outcome`                                                   | One per DO internal route call      |
+| `ws.connect`                 | info, warn  | `ws_type` (sandbox\|client), `outcome`, `reject_reason`, `sandbox_id`, `participant_id`, `duration_ms`                | WebSocket lifecycle                 |
+| `prompt.enqueue`             | info        | `message_id`, `source`, `author_id`, `user_id`, `model`, `content_length`, `has_attachments`, `queue_position`        | Message queued                      |
+| `prompt.dispatch`            | info        | `message_id`, `outcome`, `reason`, `model`, `has_sandbox_ws`, `queue_wait_ms`                                         | Message sent to sandbox             |
+| `prompt.complete`            | info, warn  | `message_id`, `outcome`, `total_duration_ms`, `processing_duration_ms`, `queue_duration_ms`                           | Prompt run finished                 |
+| `callback.complete_delivery` | info, error | `session_id`, `message_id`, `source`, `outcome`, `duration_ms`, `attempts`, `retries`, `http_status`, `reject_reason` | Completion callback delivery result |
 
 #### Lifecycle Manager (`component: "lifecycle-manager"`)
 
