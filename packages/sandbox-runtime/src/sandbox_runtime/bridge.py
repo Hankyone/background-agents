@@ -29,6 +29,11 @@ import websockets
 from websockets import ClientConnection, State
 from websockets.exceptions import InvalidStatus
 
+from .attachment_processor import (
+    AttachmentProcessor,
+    HydratedSessionAttachment,
+    parse_session_image_attachments,
+)
 from .constants import BOOT_WARNINGS_FILE_PATH, REPO_MANIFEST_FILE_PATH
 from .log_config import configure_logging, get_logger
 from .repo_config import find_repo_entry, load_repo_manifest
@@ -242,6 +247,13 @@ class AgentBridge:
             service="sandbox",
             sandbox_id=sandbox_id,
             session_id=session_id,
+        )
+        self.attachment_processor = AttachmentProcessor(
+            control_plane_url=control_plane_url,
+            session_id=session_id,
+            auth_token=auth_token,
+            log=self.log,
+            warn_user=self._send_media_warning,
         )
 
         self.sse_inactivity_timeout = self._resolve_timeout_seconds(
@@ -573,6 +585,10 @@ class AgentBridge:
                 continue
             await self._send_event({"type": "warning", **entry})
 
+    async def _send_media_warning(self, message: str) -> None:
+        """Surface non-fatal media handling failures to the user timeline."""
+        await self._send_event({"type": "warning", "scope": "media", "message": message})
+
     async def _send_event(self, event: dict[str, Any]) -> None:
         """Send event to control plane, buffering if WS is unavailable."""
         event_type = event.get("type", "unknown")
@@ -769,6 +785,7 @@ class AgentBridge:
         content = cmd.get("content", "")
         model = cmd.get("model")
         reasoning_effort = cmd.get("reasoningEffort")
+        raw_attachments = cmd.get("attachments")
         author_data = cmd.get("author", {})
         start_time = time.time()
         outcome = "success"
@@ -793,11 +810,25 @@ class AgentBridge:
             if not self.opencode_session_id:
                 await self._create_opencode_session()
 
+            session_attachments, rejected_attachments = parse_session_image_attachments(
+                raw_attachments
+            )
+            if rejected_attachments:
+                self.log.warn(
+                    "prompt.invalid_attachments",
+                    message_id=message_id,
+                    rejected_count=rejected_attachments,
+                )
+                await self._send_media_warning(
+                    f"{rejected_attachments} invalid attachment(s) were skipped."
+                )
+            attachments = await self.attachment_processor.process(session_attachments)
+
             had_error = False
             error_message = None
             emitted_output = False
             async for event in self._stream_opencode_response_sse(
-                message_id, content, model, reasoning_effort
+                message_id, content, model, reasoning_effort, attachments
             ):
                 if event.get("type") == "error":
                     had_error = True
@@ -995,6 +1026,7 @@ class AgentBridge:
         model: str | None,
         opencode_message_id: str | None = None,
         reasoning_effort: str | None = None,
+        attachments: list[HydratedSessionAttachment] | None = None,
     ) -> dict[str, Any]:
         """Build request body for OpenCode prompt requests.
 
@@ -1005,8 +1037,12 @@ class AgentBridge:
                                  When provided, OpenCode uses this as the user message ID,
                                  and assistant responses will have parentID pointing to it.
             reasoning_effort: Optional reasoning effort level (e.g., "high", "max")
+            attachments: Optional list of attachment dicts (type/name/url/content/mimeType)
+                         to forward as OpenCode file parts.
         """
-        request_body: dict[str, Any] = {"parts": [{"type": "text", "text": content}]}
+        parts: list[dict[str, Any]] = [{"type": "text", "text": content}]
+        parts.extend(dict(part) for part in self.attachment_processor.build_file_parts(attachments))
+        request_body: dict[str, Any] = {"parts": parts}
 
         if opencode_message_id:
             request_body["messageID"] = opencode_message_id
@@ -1097,6 +1133,7 @@ class AgentBridge:
         content: str,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        attachments: list[HydratedSessionAttachment] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream response from OpenCode using Server-Sent Events.
 
@@ -1117,7 +1154,7 @@ class AgentBridge:
 
         opencode_message_id = OpenCodeIdentifier.ascending("message")
         request_body = self._build_prompt_request_body(
-            content, model, opencode_message_id, reasoning_effort
+            content, model, opencode_message_id, reasoning_effort, attachments
         )
 
         sse_url = f"{self.opencode_base_url}/event"
