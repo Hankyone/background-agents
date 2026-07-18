@@ -220,7 +220,6 @@ export function createSessionLifecycleHandler(
           baseBranch: repo.baseBranch,
         }))
       );
-
       const sandboxId = deps.generateId();
       deps.repository.createSandbox({
         id: sandboxId,

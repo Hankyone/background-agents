@@ -31,6 +31,7 @@ interface SessionSandboxEventProcessorDeps {
   updateLastActivity: (timestamp: number) => void;
   scheduleInactivityCheck: () => Promise<void>;
   processMessageQueue: () => Promise<void>;
+  handleReady: (event: Extract<SandboxEvent, { type: "ready" }>) => Promise<void>;
 }
 
 /** How long a pending push waits for its terminal event before rejecting. */
@@ -69,6 +70,10 @@ export class SessionSandboxEventProcessor {
     if (event.type === "session_title") {
       this.deps.applySessionTitleUpdate(event.title, { onlyIfUnset: true });
       return;
+    }
+
+    if (event.type === "ready") {
+      await this.deps.handleReady(event);
     }
 
     const eventMessageId = "messageId" in event ? event.messageId : null;
@@ -183,7 +188,6 @@ export class SessionSandboxEventProcessor {
       if (messageId) {
         this.deps.repository.upsertExecutionCompleteEvent(messageId, event, now);
       }
-
       const isStillProcessing =
         completionMessageId != null && processingMessage?.id === completionMessageId;
 

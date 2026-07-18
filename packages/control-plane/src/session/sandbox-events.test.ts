@@ -47,6 +47,7 @@ function createProcessor() {
   const reconcileSessionStatusAfterExecution = vi.fn(async (_success: boolean) => {});
   const scheduleInactivityCheck = vi.fn(async () => {});
   const processMessageQueue = vi.fn(async () => {});
+  const handleReady = vi.fn(async () => {});
   const updateLastActivity = vi.fn();
   const getIsProcessing = vi.fn(() => false);
   const applySessionTitleUpdate = vi.fn((title: string) => ({ ok: true as const, title }));
@@ -72,6 +73,7 @@ function createProcessor() {
     updateLastActivity,
     scheduleInactivityCheck,
     processMessageQueue,
+    handleReady,
   });
 
   return {
@@ -84,6 +86,7 @@ function createProcessor() {
     reconcileSessionStatusAfterExecution,
     scheduleInactivityCheck,
     processMessageQueue,
+    handleReady,
     updateLastActivity,
     applySessionTitleUpdate,
     waitUntil,
@@ -91,6 +94,23 @@ function createProcessor() {
 }
 
 describe("SessionSandboxEventProcessor", () => {
+  it("releases the next prompt without waiting for diff work", async () => {
+    const h = createProcessor();
+    h.repository.getProcessingMessage.mockReturnValue({ id: "msg-1" });
+    h.repository.getMessageTimestamps.mockReturnValue({ created_at: 1000, started_at: 1100 });
+
+    await h.processor.processSandboxEvent({
+      type: "execution_complete",
+      messageId: "msg-1",
+      success: true,
+      sandboxId: "sb-1",
+      timestamp: 2000,
+    });
+
+    expect(h.processMessageQueue).toHaveBeenCalledOnce();
+    expect(h.reconcileSessionStatusAfterExecution).toHaveBeenCalledWith(true);
+  });
+
   it("updates heartbeat without broadcasting", async () => {
     const h = createProcessor();
     const event: SandboxEvent = {

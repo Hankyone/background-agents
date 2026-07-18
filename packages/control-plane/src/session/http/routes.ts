@@ -39,6 +39,11 @@ export interface SessionInternalRouteHandlers {
   childSummary: SessionInternalRouteHandler;
   cancel: SessionInternalRouteHandler;
   childSessionUpdate: SessionInternalRouteHandler;
+  diffState: SessionInternalRouteHandler;
+  diffStore: SessionInternalRouteHandler;
+  diffFailure: SessionInternalRouteHandler;
+  diffResolveFile: SessionInternalRouteHandler;
+  diffRetry: SessionInternalRouteHandler;
 }
 
 /**
@@ -112,5 +117,14 @@ export function createSessionInternalRoutes(
       path: SessionInternalPaths.childSessionUpdate,
       handler: handlers.childSessionUpdate,
     },
+    { method: "GET", path: SessionInternalPaths.diffState, handler: handlers.diffState },
+    { method: "POST", path: SessionInternalPaths.diffStore, handler: handlers.diffStore },
+    { method: "POST", path: SessionInternalPaths.diffFailure, handler: handlers.diffFailure },
+    {
+      method: "GET",
+      path: SessionInternalPaths.diffResolveFile,
+      handler: handlers.diffResolveFile,
+    },
+    { method: "POST", path: SessionInternalPaths.diffRetry, handler: handlers.diffRetry },
   ];
 }

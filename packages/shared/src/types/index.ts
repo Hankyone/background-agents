@@ -106,6 +106,43 @@ export { serverMessageSchema } from "./server-messages";
 export type { ServerMessage } from "./server-messages";
 
 export {
+  SESSION_DIFF_VERSION,
+  SESSION_DIFF_MAX_FILES,
+  SESSION_DIFF_MAX_FILE_PATCH_BYTES,
+  SESSION_DIFF_MAX_TOTAL_PATCH_BYTES,
+  SESSION_DIFF_MAX_BUNDLE_BYTES,
+  SESSION_DIFF_MAX_ERROR_LENGTH,
+  SESSION_DIFF_REFRESH_TIMEOUT_MS,
+  diffRenderStateSchema,
+  diffFileStatusSchema,
+  sessionDiffBaselineRepositorySchema,
+  sessionDiffFileUploadSchema,
+  sessionDiffFileSchema,
+  sessionDiffRepositoryUploadSchema,
+  sessionDiffRepositorySchema,
+  sessionDiffUploadSchema,
+  storedSessionDiffBundleSchema,
+  sessionDiffManifestSchema,
+  sessionDiffStateSchema,
+  sessionDiffFailureSchema,
+  toSessionDiffManifest,
+} from "./session-diffs";
+export type {
+  DiffRenderState,
+  DiffFileStatus,
+  SessionDiffBaselineRepository,
+  SessionDiffFileUpload,
+  SessionDiffFile,
+  SessionDiffRepositoryUpload,
+  SessionDiffRepository,
+  SessionDiffUpload,
+  StoredSessionDiffBundle,
+  SessionDiffManifest,
+  SessionDiffState,
+  SessionDiffFailure,
+} from "./session-diffs";
+
+export {
   userPreferencesRequestSchema,
   linearCallbackContextSchema,
   linearStartCallbackSchema,

@@ -118,6 +118,8 @@ import {
 } from "./http/handlers/participants.handler";
 import { MessageService } from "./services/message.service";
 import { createAlarmHandler, type AlarmHandler } from "./alarm/handler";
+import { SessionDiffStore } from "./diffs/store";
+import { SessionDiffService } from "./diffs/service";
 
 /**
  * Timeout for WebSocket authentication (in milliseconds).
@@ -147,6 +149,7 @@ export class SessionDO extends DurableObject<Env> {
   private sql: SqlStorage;
   private repository: SessionRepository;
   private attachmentRepository: SessionAttachmentRepository;
+  private diffService: SessionDiffService;
   private initialized = false;
   private log: Logger;
   // WebSocket manager (lazily initialized like lifecycleManager)
@@ -224,6 +227,11 @@ export class SessionDO extends DurableObject<Env> {
     childSummary: (_request, url) => this.childSessionsHandler.getChildSummary(url),
     cancel: () => this.sessionLifecycleHandler.cancel(),
     childSessionUpdate: (request) => this.childSessionsHandler.childSessionUpdate(request),
+    diffState: () => this.diffService.handleState(),
+    diffStore: (request) => this.diffService.handleUpload(request),
+    diffFailure: (request) => this.diffService.handleFailure(request),
+    diffResolveFile: (_request, url) => this.diffService.handleResolveFile(url),
+    diffRetry: () => this.diffService.handleRetry(),
   });
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -236,6 +244,20 @@ export class SessionDO extends DurableObject<Env> {
       this.attachmentRepository
     );
     this.log = createLogger("session-do", {}, parseLogLevel(env.LOG_LEVEL));
+    this.diffService = new SessionDiffService({
+      store: new SessionDiffStore(this.sql),
+      repository: this.repository,
+      storage: ctx.storage,
+      log: this.log,
+      generateId: () => generateId(),
+      now: () => Date.now(),
+      hasSandboxConnection: () => Boolean(this.wsManager.getSandboxSocket()),
+      sendRefreshCommand: (command) => {
+        const sandboxSocket = this.wsManager.getSandboxSocket();
+        return sandboxSocket ? this.wsManager.send(sandboxSocket, command) : false;
+      },
+      broadcast: (message) => this.broadcast(message),
+    });
     // Note: session_id context is set in ensureInitialized() once DB is ready
   }
 
@@ -644,6 +666,7 @@ export class SessionDO extends DurableObject<Env> {
         updateLastActivity: (timestamp) => this.updateLastActivity(timestamp),
         scheduleInactivityCheck: () => this.scheduleInactivityCheck(),
         processMessageQueue: () => this.messageQueue.processMessageQueue(),
+        handleReady: (event) => this.diffService.handleReady(event),
       });
     }
 
@@ -675,6 +698,7 @@ export class SessionDO extends DurableObject<Env> {
           repoOwner: entry.repoOwner,
           repoName: entry.repoName,
           baseBranch: entry.baseBranch ?? "main",
+          baseSha: entry.row?.base_sha ?? null,
         })),
       getUserEnvVars: () => this.getUserEnvVars(),
       updateSandboxStatus: (status) => this.updateSandboxStatus(status),
