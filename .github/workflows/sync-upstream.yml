@@ -25,6 +25,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # In a fork checkout, `gh pr` defaults to the *parent* repo (ColeMurray/…), so
+  # `gh pr create --head sync/upstream` looks for the branch there, doesn't find
+  # it, and fails with "No commits between main and sync/upstream". Pinning
+  # GH_REPO points every gh call in this workflow at the fork.
+  GH_REPO: ${{ github.repository }}
   UPSTREAM_URL: https://github.com/ColeMurray/background-agents.git
   UPSTREAM_BRANCH: main
   DEPLOY_WORKFLOW: terraform.yml
@@ -121,9 +126,7 @@ jobs:
           # resolving it (merging main in and fixing conflicts) makes it mergeable.
           git push -f origin "upstream/$UPSTREAM_BRANCH:refs/heads/$CONFLICT_BRANCH"
 
-          # GitHub's branch index can lag behind the push by a few seconds; without
-          # a brief wait gh pr create fails with "Head sha can't be blank / No commits
-          # between main and sync/upstream" even though the branch was just pushed.
+          # GitHub's branch index can lag behind the push by a few seconds.
           sleep 5
 
           body="$(printf '%s\n' \
@@ -133,7 +136,7 @@ jobs:
             'To resolve: merge `main` into this branch, fix the conflicts **preserving our' \
             'customizations**, push, then merge this PR. Merging redeploys automatically.')"
 
-          # Retry PR creation — the branch ref may still be propagating through
+          # Retry PR creation in case the branch ref is still propagating through
           # GitHub's API caches after the push.
           for attempt in 1 2 3; do
             if gh pr create --base main --head "$CONFLICT_BRANCH" \
