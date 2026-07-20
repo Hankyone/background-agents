@@ -23,6 +23,7 @@ import {
   HttpError,
 } from "./routes/shared";
 import { integrationSettingsRoutes } from "./routes/integration-settings";
+import { commitSigningRoutes } from "./routes/commit-signing";
 import { modelPreferencesRoutes } from "./routes/model-preferences";
 import { reposRoutes } from "./routes/repos";
 import { secretsRoutes } from "./routes/secrets";
@@ -80,6 +81,11 @@ const SANDBOX_AUTH_ROUTES: RegExp[] = [
   /^\/sessions\/[^/]+\/children\/[^/]+$/, // GET child detail
   /^\/sessions\/[^/]+\/children\/[^/]+\/cancel$/, // POST cancel child
   /^\/sessions\/[^/]+\/slack-notify$/, // Agent-initiated Slack notification
+];
+
+/** Routes that require the session-specific sandbox token and reject internal HMAC auth. */
+const SANDBOX_AUTH_ONLY_ROUTES: RegExp[] = [
+  /^\/sessions\/[^/]+\/commit-signing$/, // Public signing configuration and remote signer
 ];
 
 /** Diff endpoints the sandbox needs, constrained by both path and method. */
@@ -145,13 +151,17 @@ function isSandboxAuthRoute(path: string, method: string): boolean {
   );
 }
 
+function isSandboxAuthOnlyRoute(path: string): boolean {
+  return SANDBOX_AUTH_ONLY_ROUTES.some((pattern) => pattern.test(path));
+}
+
 function isScmAgnosticRoute(path: string): boolean {
   return (
     /^\/analytics\/(summary|timeseries|breakdown|pull-requests)$/.test(path) ||
     // Identity upserts are independent of the SCM provider. Only the known auth
     // providers are agnostic; an unimplemented SCM (e.g. gitlab) still 501s.
     /^\/provider-identities\/(github|slack|linear|google)\/[^/]+$/.test(path) ||
-    /^\/sessions\/[^/]+\/tunnel-urls$/.test(path) ||
+    /^\/sessions\/[^/]+\/(tunnel-urls|commit-signing)$/.test(path) ||
     /^\/sessions\/[^/]+\/diff(?:\/.*)?$/.test(path)
   );
 }
@@ -330,6 +340,9 @@ const routes: Route[] = [
   // Integration settings
   ...integrationSettingsRoutes,
 
+  // Deployment-wide commit signing identity
+  ...commitSigningRoutes,
+
   // Automations
   ...automationRoutes,
 
@@ -401,24 +414,26 @@ export async function handleRequest(
 
   // Require authentication for non-public routes
   if (!isPublicRoute(path)) {
-    const acceptsSandboxAuth = isSandboxAuthRoute(path, method);
-    // First try HMAC auth (for web app, slack bot, etc.)
-    const hmacAuthError = await requireInternalAuth(request, env, ctx);
-    let authError = hmacAuthError;
+    const requiresSandboxAuth = isSandboxAuthOnlyRoute(path);
+    let hmacAuthError: Response | null = null;
+    let authError: Response | null;
 
-    if (hmacAuthError) {
-      // HMAC auth failed - check if this route accepts sandbox auth
-      if (acceptsSandboxAuth) {
+    if (requiresSandboxAuth) {
+      const sessionIdMatch = path.match(/^\/sessions\/([^/]+)\//);
+      authError = sessionIdMatch
+        ? await verifySandboxAuth(request, env, sessionIdMatch[1], ctx)
+        : error("Unauthorized: Invalid session path", 401);
+    } else {
+      const acceptsSandboxAuth = isSandboxAuthRoute(path, method);
+      // First try HMAC auth (for web app, slack bot, etc.)
+      hmacAuthError = await requireInternalAuth(request, env, ctx);
+      authError = hmacAuthError;
+
+      if (hmacAuthError && acceptsSandboxAuth) {
         // Extract session ID from path (e.g., /sessions/abc123/pr -> abc123)
         const sessionIdMatch = path.match(/^\/sessions\/([^/]+)\//);
         if (sessionIdMatch) {
-          const sessionId = sessionIdMatch[1];
-          const sandboxAuthError = await verifySandboxAuth(request, env, sessionId, ctx);
-          if (!sandboxAuthError) {
-            authError = null;
-          } else {
-            authError = sandboxAuthError;
-          }
+          authError = await verifySandboxAuth(request, env, sessionIdMatch[1], ctx);
         }
       }
     }

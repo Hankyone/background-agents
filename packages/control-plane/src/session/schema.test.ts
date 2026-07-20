@@ -261,6 +261,5 @@ describe("applyMigrations", () => {
     const migration = MIGRATIONS.find((item) => item.id === 36);
     expect(migration).toBeDefined();
     expect(migration?.run).toContain("CREATE TABLE IF NOT EXISTS session_diff");
-    expect(MIGRATIONS.some((item) => item.id === 37)).toBe(false);
   });
 });

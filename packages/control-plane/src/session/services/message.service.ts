@@ -15,16 +15,16 @@ export interface EnqueuePromptRequest {
   attachments?: SessionAttachmentReference[];
   callbackContext?: Record<string, unknown>;
 
-  // Identity enrichment (from router D1 lookup at prompt time)
-  authorDisplayName?: string;
-  authorEmail?: string;
-  authorLogin?: string;
-
-  // SCM token enrichment (from cross-provider identity resolution)
-  scmUserId?: string;
-  scmAccessTokenEncrypted?: string;
-  scmRefreshTokenEncrypted?: string;
-  scmTokenExpiresAt?: number;
+  // Trusted SCM enrichment resolved by the router at prompt time.
+  scmEnrichment?: {
+    userId: string | null;
+    login: string | null;
+    name: string | null;
+    email: string | null;
+    accessTokenEncrypted: string | null;
+    refreshTokenEncrypted: string | null;
+    tokenExpiresAt: number | null;
+  };
 }
 
 export type ListEventsRequest = SessionEventListRequest;

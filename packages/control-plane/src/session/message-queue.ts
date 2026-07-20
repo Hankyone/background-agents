@@ -12,7 +12,7 @@ import {
 import type { ClientInfo, MessageSource, SandboxEvent } from "../types";
 import type { SourceControlProviderName } from "../source-control";
 import type { SandboxLifecycle } from "../sandbox/lifecycle/manager";
-import type { ParticipantRow, SandboxCommand } from "./types";
+import type { ParticipantRow, PromptGitIdentity, SandboxCommand } from "./types";
 import type { SessionRepository } from "./repository";
 import {
   AttachmentClaimConflictError,
@@ -26,6 +26,7 @@ import type { SessionStatusService } from "./session-status-service";
 import type { EnqueuePromptRequest } from "./services/message.service";
 import { getAvatarUrl } from "./participant-service";
 import { resolveParticipantName } from "./participant-name";
+import { resolveGitAuthorIdentity } from "./identity";
 import { validateReasoningEffort } from "./reasoning-effort";
 import {
   parseStoredSessionAttachments,
@@ -58,6 +59,26 @@ interface EnqueuePromptCoreData {
 interface EnqueuedPrompt {
   messageId: string;
   position: number;
+}
+
+function resolveParticipantGitIdentity(
+  participant: ParticipantRow | null,
+  scmProvider: SourceControlProviderName
+): PromptGitIdentity {
+  const gitAuthor = resolveGitAuthorIdentity({
+    scmProvider,
+    scmUserId: participant?.scm_user_id,
+    scmLogin: participant?.scm_login,
+    scmName: participant?.scm_name,
+    scmEmail: participant?.scm_email,
+  });
+  return gitAuthor
+    ? {
+        mode: "attributed-user",
+        name: gitAuthor.name,
+        email: gitAuthor.email,
+      }
+    : { mode: "agent-only" };
 }
 
 export class SessionMessageQueue {
@@ -170,6 +191,7 @@ export class SessionMessageQueue {
     }
 
     const author = this.repository.getParticipantById(message.author_id);
+    const gitIdentity = resolveParticipantGitIdentity(author, this.scmProvider);
     const session = this.repository.getSession();
     const resolvedModel = getValidModelOrDefault(message.model || session?.model);
     const resolvedEffort =
@@ -185,8 +207,7 @@ export class SessionMessageQueue {
       reasoningEffort: resolvedEffort,
       author: {
         userId: author?.user_id ?? "unknown",
-        scmName: author?.scm_name ?? null,
-        scmEmail: author?.scm_email ?? null,
+        gitIdentity,
       },
       attachments: parseStoredSessionAttachments(message.attachments, () =>
         this.log.error("prompt.invalid_stored_attachments")
@@ -340,26 +361,20 @@ export class SessionMessageQueue {
     if (!participant) {
       participant = this.participantService.create(
         data.authorId,
-        data.authorDisplayName || data.authorId
+        data.scmEnrichment?.name || data.authorId
       );
     }
 
-    // COALESCE update: populate identity fields on non-owner participants
-    const hasEnrichment =
-      data.authorDisplayName ||
-      data.authorEmail ||
-      data.authorLogin ||
-      data.scmUserId ||
-      data.scmAccessTokenEncrypted;
-    if (hasEnrichment) {
+    if (data.scmEnrichment !== undefined) {
+      const enrichment = data.scmEnrichment;
       this.repository.updateParticipantCoalesce(participant.id, {
-        scmName: data.authorDisplayName ?? null,
-        scmEmail: data.authorEmail ?? null,
-        scmLogin: data.authorLogin ?? null,
-        scmUserId: data.scmUserId ?? null,
-        scmAccessTokenEncrypted: data.scmAccessTokenEncrypted ?? null,
-        scmRefreshTokenEncrypted: data.scmRefreshTokenEncrypted ?? null,
-        scmTokenExpiresAt: data.scmTokenExpiresAt ?? null,
+        scmName: enrichment.name,
+        scmEmail: enrichment.email,
+        scmLogin: enrichment.login,
+        scmUserId: enrichment.userId,
+        scmAccessTokenEncrypted: enrichment.accessTokenEncrypted,
+        scmRefreshTokenEncrypted: enrichment.refreshTokenEncrypted,
+        scmTokenExpiresAt: enrichment.tokenExpiresAt,
       });
       participant = this.repository.getParticipantById(participant.id) ?? participant;
     }
@@ -405,7 +420,6 @@ export class SessionMessageQueue {
       data.reasoningEffort,
       this.log
     );
-
     try {
       this.repository.createMessageWithAttachments(
         {

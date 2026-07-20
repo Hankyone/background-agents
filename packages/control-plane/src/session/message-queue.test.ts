@@ -114,7 +114,7 @@ function buildQueue() {
 
   const wsManager = {
     getSandboxSocket: vi.fn(() => null as WebSocket | null),
-    send: vi.fn(() => true),
+    send: vi.fn((_ws: WebSocket, _message: ServerMessage) => true),
   };
 
   const participantService = {
@@ -394,6 +394,87 @@ describe("SessionMessageQueue", () => {
     expect(h.broadcast).toHaveBeenCalledWith({ type: "processing_status", isProcessing: true });
   });
 
+  it("falls back atomically when GitHub author mapping is incomplete", async () => {
+    const h = buildQueue();
+    const sandboxWs = { readyState: 1 } as WebSocket;
+    h.repository.getNextPendingMessage.mockReturnValue(createMessage({ id: "msg-agent-only" }));
+    h.repository.getParticipantById.mockReturnValue(
+      createParticipant({
+        scm_user_id: null,
+        scm_login: "octocat",
+        scm_name: "Octo Cat",
+        scm_email: "private@example.com",
+      })
+    );
+    h.wsManager.getSandboxSocket.mockReturnValue(sandboxWs);
+
+    await h.queue.processMessageQueue();
+
+    expect(h.wsManager.send).toHaveBeenCalledWith(
+      sandboxWs,
+      expect.objectContaining({
+        author: {
+          userId: "user-1",
+          gitIdentity: { mode: "agent-only" },
+        },
+      })
+    );
+  });
+
+  it("resolves each dispatched prompt's Git author from its current participant", async () => {
+    const h = buildQueue();
+    const sandboxWs = { readyState: 1 } as WebSocket;
+    h.wsManager.getSandboxSocket.mockReturnValue(sandboxWs);
+    h.repository.getNextPendingMessage
+      .mockReturnValueOnce(createMessage({ id: "msg-ada", author_id: "part-ada" }))
+      .mockReturnValueOnce(createMessage({ id: "msg-grace", author_id: "part-grace" }));
+    h.repository.getParticipantById
+      .mockReturnValueOnce(
+        createParticipant({
+          id: "part-ada",
+          user_id: "user-ada",
+          scm_user_id: "1001",
+          scm_login: "ada",
+          scm_name: "Ada Lovelace",
+        })
+      )
+      .mockReturnValueOnce(
+        createParticipant({
+          id: "part-grace",
+          user_id: "user-grace",
+          scm_user_id: "1002",
+          scm_login: "grace",
+          scm_name: "Grace Hopper",
+        })
+      );
+
+    await h.queue.processMessageQueue();
+    await h.queue.processMessageQueue();
+
+    expect(h.wsManager.send.mock.calls.map(([, command]) => command)).toEqual([
+      expect.objectContaining({
+        author: {
+          userId: "user-ada",
+          gitIdentity: {
+            mode: "attributed-user",
+            name: "Ada Lovelace",
+            email: "1001+ada@users.noreply.github.com",
+          },
+        },
+      }),
+      expect.objectContaining({
+        author: {
+          userId: "user-grace",
+          gitIdentity: {
+            mode: "attributed-user",
+            name: "Grace Hopper",
+            email: "1002+grace@users.noreply.github.com",
+          },
+        },
+      }),
+    ]);
+  });
+
   it("notifies the integration after a prompt is dispatched to the sandbox", async () => {
     const h = buildQueue();
     const sandboxWs = { readyState: 1 } as WebSocket;
@@ -513,7 +594,7 @@ describe("SessionMessageQueue", () => {
   });
 
   describe("enqueuePromptFromApi", () => {
-    it("creates participant with authorDisplayName when new", async () => {
+    it("creates participant with the enriched identity name when new", async () => {
       const h = buildQueue();
       h.participantService.getByUserId.mockReturnValue(null as unknown as ParticipantRow);
 
@@ -521,13 +602,21 @@ describe("SessionMessageQueue", () => {
         content: "Fix bug",
         authorId: "github:1001",
         source: "github-bot",
-        authorDisplayName: "Octo Cat",
+        scmEnrichment: {
+          userId: "1001",
+          login: "octocat",
+          name: "Octo Cat",
+          email: "1001+octocat@users.noreply.github.com",
+          accessTokenEncrypted: null,
+          refreshTokenEncrypted: null,
+          tokenExpiresAt: null,
+        },
       });
 
       expect(h.participantService.create).toHaveBeenCalledWith("github:1001", "Octo Cat");
     });
 
-    it("uses authorId as display name when authorDisplayName is missing", async () => {
+    it("uses authorId as display name when identity enrichment is missing", async () => {
       const h = buildQueue();
       h.participantService.getByUserId.mockReturnValue(null as unknown as ParticipantRow);
 
@@ -540,24 +629,26 @@ describe("SessionMessageQueue", () => {
       expect(h.participantService.create).toHaveBeenCalledWith("github:1001", "github:1001");
     });
 
-    it("runs COALESCE update when enrichment fields are provided", async () => {
+    it("updates stored SCM identity and tokens after successful enrichment", async () => {
       const h = buildQueue();
 
       await h.queue.enqueuePromptFromApi({
         content: "Fix bug",
         authorId: "github:1001",
         source: "github-bot",
-        authorDisplayName: "Octo Cat",
-        authorEmail: "1001+octocat@users.noreply.github.com",
-        authorLogin: "octocat",
-        scmUserId: "1001",
-        scmAccessTokenEncrypted: "enc-access",
-        scmRefreshTokenEncrypted: "enc-refresh",
-        scmTokenExpiresAt: 9999999,
+        scmEnrichment: {
+          userId: "1001",
+          login: "octocat",
+          name: "Trusted Octo Cat",
+          email: "1001+octocat@users.noreply.github.com",
+          accessTokenEncrypted: "enc-access",
+          refreshTokenEncrypted: "enc-refresh",
+          tokenExpiresAt: 9999999,
+        },
       });
 
       expect(h.repository.updateParticipantCoalesce).toHaveBeenCalledWith("part-1", {
-        scmName: "Octo Cat",
+        scmName: "Trusted Octo Cat",
         scmEmail: "1001+octocat@users.noreply.github.com",
         scmLogin: "octocat",
         scmUserId: "1001",
@@ -565,10 +656,9 @@ describe("SessionMessageQueue", () => {
         scmRefreshTokenEncrypted: "enc-refresh",
         scmTokenExpiresAt: 9999999,
       });
-      expect(h.repository.getParticipantById).toHaveBeenCalledWith("part-1");
     });
 
-    it("skips COALESCE when no enrichment fields are provided", async () => {
+    it("leaves stored enrichment unchanged when no snapshot is provided", async () => {
       const h = buildQueue();
 
       await h.queue.enqueuePromptFromApi({
