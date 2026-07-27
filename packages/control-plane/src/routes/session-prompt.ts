@@ -1,15 +1,22 @@
 import {
   MAX_SESSION_ATTACHMENTS_PER_MESSAGE,
+  callbackContextSchema,
+  sendPromptRequestSchema,
   sessionAttachmentReferencesSchema,
   type CallbackContext,
   type SessionAttachmentReference,
 } from "@open-inspect/shared";
 import { applyIdentityEnforcement, mayAttachCallbackContext } from "../auth/identity-enforcement";
+import { resolveGitHubCredentialAuthority } from "../source-control/github-credential-authority";
 import { SessionIndexStore } from "../db/session-index";
 import { UserStore } from "../db/user-store";
 import { createLogger } from "../logger";
 import { SessionInternalPaths } from "../session/contracts";
-import { parseAuthorId, resolveGitHubEnrichment, type GitHubEnrichment } from "../session/identity";
+import {
+  parseAuthorId,
+  resolveGitHubEnrichmentForRequest,
+  type GitHubEnrichment,
+} from "../session/identity";
 import type { Env } from "../types";
 import { error, parsePattern, type Route } from "./shared";
 import { sessionRoute, type SessionRouteContext } from "./session-route";
@@ -40,30 +47,39 @@ async function handleSessionPrompt(
   const sessionId = match.groups?.id;
   if (!sessionId) return error("Session ID required");
 
-  const body = (await request.json()) as {
-    content: string;
-    source?: string;
-    model?: string;
-    reasoningEffort?: string;
-    attachments?: unknown;
-    callbackContext?: CallbackContext;
-  };
+  let rawBody: unknown;
+  try {
+    rawBody = await request.json();
+  } catch {
+    return error("Invalid JSON body", 400);
+  }
 
-  if (!body.content) {
+  const enforcement = applyIdentityEnforcement(ctx, "prompt", rawBody);
+  if (enforcement.rejection) return enforcement.rejection;
+
+  const bodyResult = sendPromptRequestSchema.safeParse(rawBody);
+  if (!bodyResult.success) {
     return error("content is required");
   }
-  const enforcement = applyIdentityEnforcement(ctx, "prompt", body);
-  if (enforcement.rejection) return enforcement.rejection;
+  const body = bodyResult.data;
 
   const attachments = validateAttachments(body.attachments);
   if (attachments instanceof Response) return attachments;
+
+  let callbackContext: CallbackContext | undefined;
+  if (mayAttachCallbackContext(ctx) && body.callbackContext !== undefined) {
+    const callbackContextResult = callbackContextSchema.safeParse(body.callbackContext);
+    if (!callbackContextResult.success) {
+      return error("Invalid callbackContext", 400);
+    }
+    callbackContext = callbackContextResult.data;
+  }
 
   // The author comes from the verified principal (user → canonical id, bot →
   // asserted actor); an actorless bot prompt is system-initiated and stays
   // anonymous. callbackContext is a completion notification channel — only
   // the bots that own callbacks may attach one.
   const authorId = enforcement.enforced.participantUserId ?? "anonymous";
-  const callbackContext = mayAttachCallbackContext(ctx) ? body.callbackContext : undefined;
   if (callbackContext === undefined && body.callbackContext !== undefined) {
     logger.warn("Dropped callbackContext from unauthorized principal", {
       event: "identity.callback_context_dropped",
@@ -85,7 +101,14 @@ async function handleSessionPrompt(
         userId = (await userStore.getUserById(authorId))?.id;
       }
       if (userId) {
-        enrichment = (await resolveGitHubEnrichment(env, ctx.db, userStore, userId)) ?? undefined;
+        enrichment =
+          (await resolveGitHubEnrichmentForRequest(
+            env,
+            ctx.db,
+            userStore,
+            userId,
+            await resolveGitHubCredentialAuthority(ctx, request.headers)
+          )) ?? undefined;
       }
     } catch (e) {
       logger.warn("Failed to enrich prompt with GitHub identity", {
