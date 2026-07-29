@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { cleanD1Tables } from "./cleanup";
 import { initSession, queryDO, seedEvents } from "./helpers";
+import { installFailFastModalFetch } from "./mock-modal-fetch";
 import type { SpawnContext, ChildSessionDetail } from "@open-inspect/shared";
 
 const originalFetch = globalThis.fetch;
@@ -56,6 +57,9 @@ describe("DO internal sub-session routes", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    // Restore the suite-wide fail-fast Modal mock so later test files do not
+    // re-open real outbound *.modal.run calls after this file's success stub.
+    installFailFastModalFetch();
   });
 
   describe("GET /internal/spawn-context", () => {

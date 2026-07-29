@@ -4,6 +4,7 @@ import { IntegrationSettingsStore } from "../../src/db/integration-settings";
 import { SessionIndexStore } from "../../src/db/session-index";
 import { cleanD1Tables } from "./cleanup";
 import { initNamedSession, queryDO, seedSandboxAuth } from "./helpers";
+import { installFailFastModalFetch } from "./mock-modal-fetch";
 
 async function setupSession(opts?: {
   agentNotificationsEnabled?: boolean;
@@ -88,6 +89,8 @@ describe("POST /sessions/:id/slack-notify", () => {
   beforeEach(cleanD1Tables);
   afterEach(() => {
     vi.unstubAllGlobals();
+    // Restore suite-wide Modal fail-fast after per-test Slack fetch stubs.
+    installFailFastModalFetch();
   });
 
   it("returns 401 without sandbox auth", async () => {
