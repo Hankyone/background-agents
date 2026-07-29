@@ -355,7 +355,7 @@ export function collectMessages(
  */
 export async function openClientWs(
   sessionName: string,
-  opts?: { subscribe?: boolean; userId?: string }
+  opts?: { subscribe?: boolean; userId?: string; canonicalUserId?: string }
 ) {
   const response = await SELF.fetch(`https://test.local/sessions/${sessionName}/ws`, {
     headers: { Upgrade: "websocket" },
@@ -375,7 +375,10 @@ export async function openClientWs(
   const tokenRes = await stub.fetch("http://internal/internal/ws-token", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ userId: opts.userId ?? "user-1" }),
+    body: JSON.stringify({
+      userId: opts.userId ?? "user-1",
+      canonicalUserId: opts.canonicalUserId,
+    }),
   });
   const { token, participantId } = await tokenRes.json<{
     token: string;
