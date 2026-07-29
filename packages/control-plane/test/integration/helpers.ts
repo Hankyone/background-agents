@@ -4,7 +4,10 @@ import type { SandboxStatus } from "../../src/types";
 import type { SessionDO } from "../../src/session/durable-object";
 import { hashToken } from "../../src/auth/crypto";
 
-const DEFAULT_WAIT_FOR_SANDBOX_STATUS_TIMEOUT_MS = 3000;
+// Background warmSandbox used to hit real Modal and usually 404 within ~50ms.
+// Under CI load that can stall; mock-modal-fetch makes it fail instantly, and
+// this budget still covers DO scheduling jitter on busy runners.
+const DEFAULT_WAIT_FOR_SANDBOX_STATUS_TIMEOUT_MS = 10_000;
 const TEST_BROWSER_USER_ID = "11111111111111111111111111111111";
 const TEST_BROWSER_ACCOUNT_ID = "test-browser-account";
 const TEST_BROWSER_PROVIDER_SUBJECT = "583231";

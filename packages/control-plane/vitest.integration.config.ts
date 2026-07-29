@@ -81,7 +81,11 @@ export default defineConfig({
   ],
   test: {
     include: ["test/integration/**/*.test.ts"],
-    setupFiles: ["test/integration/apply-migrations.ts"],
+    setupFiles: [
+      "test/integration/apply-migrations.ts",
+      // Fail-fast mock for *.modal.run so warmSandbox does not hang on real network.
+      "test/integration/mock-modal-fetch.ts",
+    ],
     onUnhandledError(error) {
       // Better Auth implements redirects and invalid-token responses as thrown
       // APIError values. Its handler catches and converts them to HTTP responses,
