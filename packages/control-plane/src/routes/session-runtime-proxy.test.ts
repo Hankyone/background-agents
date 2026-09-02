@@ -1,18 +1,30 @@
 import { describe, expect, it, vi } from "vitest";
 import { SessionInternalPaths } from "../session/contracts";
+import type { PermissionId } from "@open-inspect/shared/rbac";
 import type { RequestContext } from "./shared";
 import type { SqlDatabase } from "../db/sql-database";
 import { sessionRuntimeProxyRoutes } from "./session-runtime-proxy";
 import type { Env } from "../types";
+import { routePathPattern, TEST_BACKGROUND_TASK_CONTEXT } from "../router.test-support";
 
-function createCtx(db: SqlDatabase = {} as SqlDatabase): RequestContext {
+function createCtx(
+  db: SqlDatabase = {} as SqlDatabase,
+  permissions: PermissionId[] = ["sessions.read"]
+): RequestContext {
   return {
     trace_id: "trace-1",
     request_id: "req-1",
     db,
+    executionCtx: TEST_BACKGROUND_TASK_CONTEXT,
     principal: {
       kind: "user",
       userId: "user-1",
+    },
+    authorization: {
+      userId: "user-1",
+      suspendedAt: null,
+      role: { id: "role-1", key: "viewer", name: "Viewer" },
+      permissions,
     },
     metrics: {
       d1Queries: [],
@@ -35,13 +47,88 @@ function createEnv(fetch: (request: Request) => Promise<Response>): Env {
 function getHandler(method: string, path: string) {
   for (const route of sessionRuntimeProxyRoutes) {
     if (route.method !== method) continue;
-    const match = path.match(route.pattern);
-    if (match) return { handler: route.handler, match };
+    const match = path.match(routePathPattern(route.path));
+    if (match) return { handler: route.handler, match, route };
   }
   throw new Error(`No route found for ${method} ${path}`);
 }
 
 describe("session runtime proxy routes", () => {
+  it("forwards sandbox access for users", async () => {
+    const requests: Request[] = [];
+    const fetch = vi.fn(async (request: Request) => {
+      requests.push(request);
+      return Response.json({ sessionId: "session-1" });
+    });
+    const path = "/sessions/session-1/sandbox-access";
+    const { handler, match } = getHandler("GET", path);
+
+    const response = await handler(
+      new Request(`https://test.local${path}`),
+      createEnv(fetch),
+      match,
+      createCtx()
+    );
+
+    expect(response.status).toBe(200);
+    expect(new URL(requests[0].url).pathname).toBe(SessionInternalPaths.sandboxAccess);
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { permissions: ["sessions.read"] as PermissionId[], exposed: false },
+    {
+      permissions: ["sessions.read", "sessions.sandbox_access"] as PermissionId[],
+      exposed: true,
+    },
+  ])("scopes snapshot sandbox locations to sandbox access ($exposed)", async (input) => {
+    const fetch = vi.fn(async () =>
+      Response.json({
+        session: {
+          id: "session-1",
+          title: "Session",
+          repoOwner: "acme",
+          repoName: "web",
+          baseBranch: "main",
+          branchName: "feature",
+          status: "active",
+          sandboxStatus: "ready",
+          messageCount: 0,
+          createdAt: 1,
+          codeServerUrl: "https://code.example",
+          vncUrl: "https://vnc.example",
+          ttydUrl: "https://terminal.example",
+          tunnelUrls: { "3000": "https://app.example" },
+          sandboxDashboardUrl: "https://provider.example",
+        },
+        artifacts: [],
+        promptQueue: [],
+        timeline: { events: [], hasMore: false, cursor: null },
+      })
+    );
+    const path = "/sessions/session-1";
+    const { handler, match } = getHandler("GET", path);
+
+    const response = await handler(
+      new Request(`https://test.local${path}`),
+      createEnv(fetch),
+      match,
+      createCtx({} as SqlDatabase, input.permissions)
+    );
+    const snapshot = (await response.json()) as { session: Record<string, unknown> };
+
+    expect(response.status).toBe(200);
+    if (input.exposed) {
+      expect(snapshot.session).toHaveProperty("codeServerUrl", "https://code.example");
+    } else {
+      expect(snapshot.session).not.toHaveProperty("codeServerUrl");
+      expect(snapshot.session).not.toHaveProperty("vncUrl");
+      expect(snapshot.session).not.toHaveProperty("ttydUrl");
+      expect(snapshot.session).not.toHaveProperty("tunnelUrls");
+      expect(snapshot.session).not.toHaveProperty("sandboxDashboardUrl");
+    }
+  });
+
   it("forwards event query strings through the session runtime dependency", async () => {
     const requests: Request[] = [];
     const fetch = vi.fn(async (request: Request) => {
@@ -63,6 +150,102 @@ describe("session runtime proxy routes", () => {
     expect(new URL(requests[0].url).search).toBe("?limit=10");
   });
 
+  it("forwards sandbox fatal errors to the session runtime", async () => {
+    const requests: Request[] = [];
+    const fetch = vi.fn(async (request: Request) => {
+      requests.push(request);
+      return Response.json({ status: "ok" });
+    });
+    const path = "/sessions/session-1/sandbox-error";
+    const { handler, match, route } = getHandler("POST", path);
+
+    const response = await handler(
+      new Request(`https://test.local${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          Authorization: "Bearer sandbox-token",
+          "X-Sandbox-ID": "sandbox-1",
+        },
+        body: JSON.stringify({ error: "Bridge repeatedly crashed", fatal: true }),
+      }),
+      createEnv(fetch),
+      match,
+      createCtx()
+    );
+
+    expect(response.status).toBe(200);
+    expect(route.authentication.kind).toBe("handler-authenticated");
+    expect(new URL(requests[0].url).pathname).toBe(SessionInternalPaths.sandboxError);
+    expect(requests[0].headers.get("Authorization")).toBe("Bearer sandbox-token");
+    expect(requests[0].headers.get("X-Sandbox-ID")).toBe("sandbox-1");
+    await expect(requests[0].json()).resolves.toEqual({
+      error: "Bridge repeatedly crashed",
+      fatal: true,
+    });
+  });
+
+  it("rejects oversized sandbox errors before forwarding them", async () => {
+    const fetch = vi.fn(async () => Response.json({ status: "ok" }));
+    const path = "/sessions/session-1/sandbox-error";
+    const { handler, match } = getHandler("POST", path);
+
+    const response = await handler(
+      new Request(`https://test.local${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer sandbox-token",
+          "X-Sandbox-ID": "sandbox-1",
+        },
+        body: "x".repeat(2049),
+      }),
+      createEnv(fetch),
+      match,
+      createCtx()
+    );
+
+    expect(response.status).toBe(413);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects missing sandbox credentials before reading or forwarding the body", async () => {
+    const fetch = vi.fn(async () => Response.json({ status: "ok" }));
+    const path = "/sessions/session-1/sandbox-error";
+    const { handler, match } = getHandler("POST", path);
+
+    const response = await handler(
+      new Request(`https://test.local${path}`, { method: "POST", body: "not json" }),
+      createEnv(fetch),
+      match,
+      createCtx()
+    );
+
+    expect(response.status).toBe(401);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects an empty sandbox error before forwarding it", async () => {
+    const fetch = vi.fn(async () => Response.json({ status: "ok" }));
+    const path = "/sessions/session-1/sandbox-error";
+    const { handler, match } = getHandler("POST", path);
+
+    const response = await handler(
+      new Request(`https://test.local${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer sandbox-token",
+          "X-Sandbox-ID": "sandbox-1",
+        },
+      }),
+      createEnv(fetch),
+      match,
+      createCtx()
+    );
+
+    expect(response.status).toBe(400);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("returns deduplicated canonical participant profiles with safe fields only", async () => {
     const fetch = vi.fn(async () =>
       Response.json({
@@ -71,6 +254,7 @@ describe("session runtime proxy routes", () => {
           { id: "p-2", userId: "user-1" },
           { id: "p-3", userId: "deleted-user" },
           { id: "p-4", userId: "slack:U123", canonicalUserId: "user-bot" },
+          { id: "p-5", userId: "user-2", canonicalUserId: null },
         ],
       })
     );
@@ -95,6 +279,14 @@ describe("session runtime proxy routes", () => {
               display_name: "Build Bot",
               email: null,
               avatar_url: "https://avatars.example/bot",
+              created_at: 1,
+              updated_at: 2,
+            },
+            {
+              id: "user-2",
+              display_name: "Grace Hopper",
+              email: null,
+              avatar_url: null,
               created_at: 1,
               updated_at: 2,
             },
@@ -125,10 +317,51 @@ describe("session runtime proxy routes", () => {
           displayName: "Build Bot",
           avatarUrl: "https://avatars.example/bot",
         },
+        "user-2": {
+          userId: "user-2",
+          displayName: "Grace Hopper",
+          avatarUrl: null,
+        },
       },
     });
-    expect(bind).toHaveBeenCalledWith("user-1", "deleted-user", "user-bot");
+    expect(bind).toHaveBeenCalledWith("user-1", "deleted-user", "user-bot", "user-2");
     expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it("returns a bad-gateway error for malformed participant responses", async () => {
+    const fetch = vi.fn(async () =>
+      Response.json({ participants: [{ canonicalUserId: "user-1" }] })
+    );
+    const db = { prepare: vi.fn(), batch: vi.fn() } as unknown as SqlDatabase;
+    const { handler, match } = getHandler("GET", "/sessions/session-1/participant-profiles");
+
+    const response = await handler(
+      new Request("https://test.local/sessions/session-1/participant-profiles"),
+      createEnv(fetch),
+      match,
+      createCtx(db)
+    );
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toEqual({ error: "Invalid participant response" });
+    expect(db.prepare).not.toHaveBeenCalled();
+  });
+
+  it("returns a bad-gateway error when the participant response is not JSON", async () => {
+    const fetch = vi.fn(async () => new Response("not json", { status: 200 }));
+    const db = { prepare: vi.fn(), batch: vi.fn() } as unknown as SqlDatabase;
+    const { handler, match } = getHandler("GET", "/sessions/session-1/participant-profiles");
+
+    const response = await handler(
+      new Request("https://test.local/sessions/session-1/participant-profiles"),
+      createEnv(fetch),
+      match,
+      createCtx(db)
+    );
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toEqual({ error: "Invalid participant response" });
+    expect(db.prepare).not.toHaveBeenCalled();
   });
 
   it("preserves participant runtime errors without querying profiles", async () => {
@@ -171,7 +404,43 @@ describe("session runtime proxy routes", () => {
     expect(requests[0].method).toBe("POST");
     expect(new URL(requests[0].url).pathname).toBe(SessionInternalPaths.updateTitle);
     await expect(requests[0].json()).resolves.toEqual({
-      userId: "user-1",
+      title: "New title",
+    });
+  });
+
+  it("does not forward service actor identity on title updates", async () => {
+    const requests: Request[] = [];
+    const fetch = vi.fn(async (request: Request) => {
+      requests.push(request);
+      return Response.json({ status: "updated" });
+    });
+    const { handler, match } = getHandler("PATCH", "/sessions/session-1/title");
+    const ctx = createCtx();
+    ctx.principal = {
+      kind: "service",
+      service: "slack-bot",
+      actor: {
+        provider: "slack",
+        providerUserId: "U0123",
+        canonicalUserId: "user-1",
+        participantUserId: "slack:U0123",
+      },
+    };
+
+    const response = await handler(
+      new Request("https://test.local/sessions/session-1/title", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "New title" }),
+      }),
+      createEnv(fetch),
+      match,
+      ctx
+    );
+
+    expect(response.status).toBe(200);
+    expect(fetch).toHaveBeenCalledOnce();
+    await expect(requests[0].json()).resolves.toEqual({
       title: "New title",
     });
   });
@@ -228,15 +497,40 @@ describe("session runtime proxy routes", () => {
     await expect(response.json()).resolves.toEqual({ error: "Session not found" });
   });
 
-  it("rejects malformed add-participant JSON without forwarding to the runtime", async () => {
-    const fetch = vi.fn(async () => Response.json({ status: "ok" }));
-    const { handler, match } = getHandler("POST", "/sessions/session-1/participants");
+  it("forwards the draft flag through the create-PR contract", async () => {
+    const requests: Request[] = [];
+    const fetch = vi.fn(async (request: Request) => {
+      requests.push(request);
+      return Response.json({ prNumber: 1, prUrl: "https://example/pr/1", state: "draft" });
+    });
+    const { handler, match } = getHandler("POST", "/sessions/session-1/pr");
 
     const response = await handler(
-      new Request("https://test.local/sessions/session-1/participants", {
+      new Request("https://test.local/sessions/session-1/pr", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{",
+        body: JSON.stringify({ title: "T", body: "B", draft: true }),
+      }),
+      createEnv(fetch),
+      match,
+      createCtx()
+    );
+
+    expect(response.status).toBe(200);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(new URL(requests[0].url).pathname).toBe(SessionInternalPaths.createPr);
+    await expect(requests[0].json()).resolves.toMatchObject({ title: "T", body: "B", draft: true });
+  });
+
+  it("rejects a non-boolean draft without forwarding to the runtime", async () => {
+    const fetch = vi.fn(async () => Response.json({ status: "ok" }));
+    const { handler, match } = getHandler("POST", "/sessions/session-1/pr");
+
+    const response = await handler(
+      new Request("https://test.local/sessions/session-1/pr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "T", body: "B", draft: "yes" }),
       }),
       createEnv(fetch),
       match,
@@ -244,7 +538,7 @@ describe("session runtime proxy routes", () => {
     );
 
     expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toEqual({ error: "Invalid JSON body" });
+    await expect(response.json()).resolves.toEqual({ error: "draft must be a boolean" });
     expect(fetch).not.toHaveBeenCalled();
   });
 

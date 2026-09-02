@@ -1,14 +1,17 @@
 import { UserAuthConfigurationError } from "../auth/user/runtime";
 import { createLogger } from "../logger";
-import { error, json, parsePattern, type Route } from "./shared";
+import {
+  defineRoutes,
+  error,
+  json,
+  NO_AUTHORIZATION,
+  SCM_AGNOSTIC_WEB_SERVICE_ROUTE,
+  type Route,
+} from "./shared";
 
 const logger = createLogger("sign-in-providers");
 
 const handleSignInProviders: Route["handler"] = async (_request, _env, _match, ctx) => {
-  if (ctx.principal?.kind !== "service" || ctx.principal.service !== "web") {
-    return error("Unauthorized", 401);
-  }
-
   try {
     if (!ctx.getUserAuthRuntime) {
       throw new UserAuthConfigurationError("User authentication runtime is unavailable");
@@ -32,10 +35,11 @@ const handleSignInProviders: Route["handler"] = async (_request, _env, _match, c
   }
 };
 
-export const signInProviderRoutes: Route[] = [
+export const signInProviderRoutes: Route[] = defineRoutes(SCM_AGNOSTIC_WEB_SERVICE_ROUTE, [
   {
     method: "GET",
-    pattern: parsePattern("/internal/auth/sign-in-providers"),
+    path: "/internal/auth/sign-in-providers",
+    authorization: NO_AUTHORIZATION,
     handler: handleSignInProviders,
   },
-];
+]);

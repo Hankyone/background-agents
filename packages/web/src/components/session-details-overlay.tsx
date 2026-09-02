@@ -37,6 +37,7 @@ export function SessionDetailsOverlay({
   sessionId,
   sessionState,
   participants,
+  presenceSynced,
   events,
   artifacts,
   terminalOpen,
@@ -46,6 +47,7 @@ export function SessionDetailsOverlay({
   diffLoading,
   selectedDiff,
   onOpenDiff,
+  capabilities,
 }: SessionDetailsOverlayProps) {
   const [sheetDragY, setSheetDragY] = useState(0);
   const sheetDragYRef = useRef(0);
@@ -164,6 +166,7 @@ export function SessionDetailsOverlay({
       sessionId={sessionId}
       sessionState={sessionState}
       participants={participants}
+      presenceSynced={presenceSynced}
       events={events}
       artifacts={artifacts}
       terminalOpen={terminalOpen}
@@ -173,6 +176,7 @@ export function SessionDetailsOverlay({
       diffLoading={diffLoading}
       selectedDiff={selectedDiff}
       onOpenDiff={onOpenDiff}
+      capabilities={capabilities}
     />
   );
 

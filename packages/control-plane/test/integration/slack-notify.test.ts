@@ -3,7 +3,7 @@ import { SELF, env } from "cloudflare:test";
 import { IntegrationSettingsStore } from "../../src/db/integration-settings";
 import { SessionIndexStore } from "../../src/db/session-index";
 import { cleanD1Tables } from "./cleanup";
-import { initNamedSession, queryDO, seedSandboxAuth } from "./helpers";
+import { initNamedSessionDO, queryDO, seedSandboxAuth } from "./helpers";
 import { installFailFastModalFetch } from "./mock-modal-fetch";
 
 async function setupSession(opts?: {
@@ -14,7 +14,7 @@ async function setupSession(opts?: {
   userId?: string;
 }) {
   const sessionName = `sess-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-  const { stub } = await initNamedSession(sessionName, {
+  const { stub } = await initNamedSessionDO(sessionName, {
     repoOwner: "acme",
     repoName: "web-app",
     userId: opts?.userId ?? "user-1",

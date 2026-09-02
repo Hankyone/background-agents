@@ -13,6 +13,7 @@ import { createLogger } from "../logger";
 import type { CorrelationContext } from "../logger";
 import { buildSessionConfig, toRepositoryConfigPayload } from "./sandbox-env";
 import type { SessionRepositoryInfo } from "./provider";
+import { withRequestDeadline } from "./request-deadline";
 
 const log = createLogger("modal-client");
 
@@ -21,6 +22,11 @@ const MODAL_APP_NAME = "open-inspect";
 
 // Modal's default environment name; unrelated to the git branch named "main".
 const DEFAULT_MODAL_ENVIRONMENT = "main";
+
+export const MODAL_SANDBOX_START_REQUEST_DEADLINE_MS = 60_000;
+// Allows Modal's provider-side snapshot timeout to settle before the client deadline.
+export const MODAL_SNAPSHOT_REQUEST_DEADLINE_MS = 310_000;
+export const MODAL_CLEANUP_REQUEST_DEADLINE_MS = 60_000;
 
 const modalErrorResponseSchema = z.object({
   success: z.literal(false),
@@ -35,10 +41,11 @@ const createSandboxModalResponseSchema = z.discriminatedUnion("success", [
     data: z.object({
       sandbox_id: z.string(),
       modal_object_id: z.string().nullable().optional(),
-      status: z.string(),
       created_at: z.number(),
       code_server_url: z.string().nullable().optional(),
       code_server_password: z.string().nullable().optional(),
+      vnc_url: z.string().nullable().optional(),
+      vnc_password: z.string().nullable().optional(),
       ttyd_url: z.string().nullable().optional(),
       tunnel_urls: modalTunnelUrlsSchema.nullable().optional(),
     }),
@@ -55,6 +62,8 @@ const restoreSandboxModalResponseSchema = z.discriminatedUnion("success", [
         modal_object_id: z.string().nullable().optional(),
         code_server_url: z.string().nullable().optional(),
         code_server_password: z.string().nullable().optional(),
+        vnc_url: z.string().nullable().optional(),
+        vnc_password: z.string().nullable().optional(),
         ttyd_url: z.string().nullable().optional(),
         tunnel_urls: modalTunnelUrlsSchema.nullable().optional(),
       })
@@ -71,6 +80,28 @@ const snapshotSandboxModalResponseSchema = z.discriminatedUnion("success", [
         image_id: z.string(),
       })
       .optional(),
+  }),
+  modalErrorResponseSchema,
+]);
+
+const createImageBuildSandboxModalResponseSchema = z.discriminatedUnion("success", [
+  z.object({
+    success: z.literal(true),
+    data: z.object({
+      // Non-empty: the previous hand-rolled check rejected a blank id.
+      provider_session_id: z.string().min(1),
+    }),
+  }),
+  modalErrorResponseSchema,
+]);
+
+/**
+ * Image-build operations (start/terminate) only signal success or failure; their
+ * `data` payload is never read, so it is deliberately left unvalidated.
+ */
+const imageBuildOperationModalResponseSchema = z.discriminatedUnion("success", [
+  z.object({
+    success: z.literal(true),
   }),
   modalErrorResponseSchema,
 ]);
@@ -121,7 +152,6 @@ export interface CreateSandboxRequest {
   repoName: string | null;
   controlPlaneUrl: string;
   sandboxAuthToken: string;
-  snapshotId?: string;
   opencodeSessionId?: string;
   provider?: string;
   model?: string;
@@ -131,19 +161,22 @@ export interface CreateSandboxRequest {
   timeoutSeconds?: number;
   branch?: string | null;
   codeServerEnabled?: boolean;
+  vncEnabled?: boolean;
   agentSlackNotifyEnabled?: boolean;
   mcpServers?: McpServerConfig[];
   sandboxSettings?: SandboxSettings;
   repositories?: SessionRepositoryInfo[];
+  signal?: AbortSignal;
 }
 
 export interface CreateSandboxResponse {
   sandboxId: string;
   modalObjectId?: string; // Modal's internal object ID for snapshot API
-  status: string;
   createdAt: number;
   codeServerUrl?: string;
   codeServerPassword?: string;
+  vncUrl?: string;
+  vncPassword?: string;
   ttydUrl?: string;
   tunnelUrls?: Record<string, string>;
 }
@@ -162,10 +195,12 @@ export interface RestoreSandboxRequest {
   timeoutSeconds?: number;
   branch?: string | null;
   codeServerEnabled?: boolean;
+  vncEnabled?: boolean;
   agentSlackNotifyEnabled?: boolean;
   mcpServers?: McpServerConfig[];
   sandboxSettings?: SandboxSettings;
   repositories?: SessionRepositoryInfo[];
+  signal?: AbortSignal;
 }
 
 export interface RestoreSandboxResponse {
@@ -175,6 +210,8 @@ export interface RestoreSandboxResponse {
   error?: string;
   codeServerUrl?: string;
   codeServerPassword?: string;
+  vncUrl?: string;
+  vncPassword?: string;
   ttydUrl?: string;
   tunnelUrls?: Record<string, string>;
 }
@@ -182,7 +219,6 @@ export interface RestoreSandboxResponse {
 export interface SnapshotSandboxRequest {
   providerObjectId: string;
   sessionId: string;
-  reason: string;
   signal?: AbortSignal;
 }
 
@@ -209,10 +245,13 @@ export interface CreateImageBuildSandboxRequest {
   cloneToken?: string;
   cloneHost?: string;
   cloneUsername?: string;
+  callbackUrl: string;
+  failureCallbackUrl: string;
   userEnvVars?: Record<string, string>;
   buildExecutionTimeoutSeconds: number;
   /** Provider-session lifetime, including deferred Queue finalization headroom. */
-  providerSessionTimeoutSeconds?: number;
+  providerSessionTimeoutSeconds: number;
+  signal?: AbortSignal;
 }
 
 export interface CreateImageBuildSandboxResponse {
@@ -222,9 +261,8 @@ export interface CreateImageBuildSandboxResponse {
 export interface StartImageBuildSandboxRequest {
   buildId: string;
   providerSessionId: string;
-  callbackUrl: string;
-  failureCallbackUrl: string;
   callbackToken: string;
+  signal?: AbortSignal;
 }
 
 export interface TerminateImageBuildSandboxRequest {
@@ -232,22 +270,6 @@ export interface TerminateImageBuildSandboxRequest {
   providerSessionId: string;
   reason: string;
   signal?: AbortSignal;
-}
-
-export interface DeleteProviderImageRequest {
-  providerImageId: string;
-  signal?: AbortSignal;
-}
-
-export interface DeleteProviderImageResponse {
-  providerImageId: string;
-  deleted: boolean;
-}
-
-interface ModalApiResponse<T> {
-  success: boolean;
-  data?: T;
-  error?: string;
 }
 
 /**
@@ -277,8 +299,34 @@ export class ModalClient {
   private createImageBuildSandboxUrl: string;
   private startImageBuildSandboxUrl: string;
   private terminateImageBuildSandboxUrl: string;
-  private deleteProviderImageUrl: string;
   private secret: string;
+
+  private async postJson<T>(
+    url: string,
+    endpoint: string,
+    deadlineMs: number,
+    body: unknown,
+    schema: z.ZodType<T>,
+    correlation: CorrelationContext | undefined,
+    callerSignal: AbortSignal | undefined,
+    onResponse: (status: number) => void
+  ): Promise<T> {
+    const headers = await this.getPostHeaders(correlation);
+    return withRequestDeadline("Modal", endpoint, deadlineMs, callerSignal, async (signal) => {
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        signal,
+        body: JSON.stringify(body),
+      });
+      onResponse(response.status);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new ModalApiError(`Modal API error: ${response.status} ${text}`, response.status);
+      }
+      return parseModalApiResponse(schema, await response.json());
+    });
+  }
 
   constructor(secret: string, workspace: string, environmentWebSuffix?: string) {
     if (!secret) {
@@ -296,7 +344,6 @@ export class ModalClient {
     this.createImageBuildSandboxUrl = `${baseUrl}-api-create-build-sandbox.modal.run`;
     this.startImageBuildSandboxUrl = `${baseUrl}-api-start-build-sandbox.modal.run`;
     this.terminateImageBuildSandboxUrl = `${baseUrl}-api-terminate-build-sandbox.modal.run`;
-    this.deleteProviderImageUrl = `${baseUrl}-api-delete-provider-image.modal.run`;
   }
 
   /**
@@ -328,18 +375,17 @@ export class ModalClient {
     let outcome: "success" | "error" = "error";
 
     try {
-      const headers = await this.getPostHeaders(correlation);
-      const response = await fetch(this.createSandboxUrl, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
+      const result = await this.postJson(
+        this.createSandboxUrl,
+        endpoint,
+        MODAL_SANDBOX_START_REQUEST_DEADLINE_MS,
+        {
           session_id: request.sessionId,
           sandbox_id: request.sandboxId || null, // Use control-plane-generated ID
           repo_owner: request.repoOwner,
           repo_name: request.repoName,
           control_plane_url: request.controlPlaneUrl,
           sandbox_auth_token: request.sandboxAuthToken,
-          snapshot_id: request.snapshotId || null,
           opencode_session_id: request.opencodeSessionId || null,
           provider: request.provider || "anthropic",
           model: request.model || "claude-sonnet-4-6",
@@ -349,6 +395,7 @@ export class ModalClient {
           timeout_seconds: request.timeoutSeconds || null,
           branch: request.branch || null,
           code_server_enabled: request.codeServerEnabled ?? false,
+          vnc_enabled: request.vncEnabled ?? false,
           agent_slack_notify_enabled: request.agentSlackNotifyEnabled ?? false,
           mcp_servers: request.mcpServers || null,
           sandbox_settings: request.sandboxSettings ?? null,
@@ -358,17 +405,12 @@ export class ModalClient {
           repositories: request.repositories?.length
             ? request.repositories.map(toRepositoryConfigPayload)
             : null,
-        }),
-      });
-
-      httpStatus = response.status;
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new ModalApiError(`Modal API error: ${response.status} ${text}`, response.status);
-      }
-
-      const result = parseModalApiResponse(createSandboxModalResponseSchema, await response.json());
+        },
+        createSandboxModalResponseSchema,
+        correlation,
+        request.signal,
+        (status) => (httpStatus = status)
+      );
 
       if (!result.success) {
         throw new Error(`Modal API error: ${result.error || "Unknown error"}`);
@@ -378,10 +420,11 @@ export class ModalClient {
       return {
         sandboxId: result.data.sandbox_id,
         modalObjectId: result.data.modal_object_id ?? undefined,
-        status: result.data.status,
         createdAt: result.data.created_at,
         codeServerUrl: result.data.code_server_url ?? undefined,
         codeServerPassword: result.data.code_server_password ?? undefined,
+        vncUrl: result.data.vnc_url ?? undefined,
+        vncPassword: result.data.vnc_password ?? undefined,
         ttydUrl: result.data.ttyd_url ?? undefined,
         tunnelUrls: result.data.tunnel_urls ?? undefined,
       };
@@ -413,11 +456,11 @@ export class ModalClient {
     let outcome: "success" | "error" = "error";
 
     try {
-      const headers = await this.getPostHeaders(correlation);
-      const response = await fetch(this.restoreSandboxUrl, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
+      const result = await this.postJson(
+        this.restoreSandboxUrl,
+        endpoint,
+        MODAL_SANDBOX_START_REQUEST_DEADLINE_MS,
+        {
           snapshot_image_id: request.snapshotImageId,
           session_config: buildSessionConfig(request),
           sandbox_id: request.sandboxId,
@@ -426,21 +469,14 @@ export class ModalClient {
           user_env_vars: request.userEnvVars || null,
           timeout_seconds: request.timeoutSeconds || null,
           code_server_enabled: request.codeServerEnabled ?? false,
+          vnc_enabled: request.vncEnabled ?? false,
           agent_slack_notify_enabled: request.agentSlackNotifyEnabled ?? false,
           sandbox_settings: request.sandboxSettings ?? null,
-        }),
-      });
-
-      httpStatus = response.status;
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new ModalApiError(`Modal API error: ${response.status} ${text}`, response.status);
-      }
-
-      const result = parseModalApiResponse(
+        },
         restoreSandboxModalResponseSchema,
-        await response.json()
+        correlation,
+        request.signal,
+        (status) => (httpStatus = status)
       );
 
       if (!result.success) {
@@ -454,6 +490,8 @@ export class ModalClient {
         modalObjectId: result.data?.modal_object_id ?? undefined,
         codeServerUrl: result.data?.code_server_url ?? undefined,
         codeServerPassword: result.data?.code_server_password ?? undefined,
+        vncUrl: result.data?.vnc_url ?? undefined,
+        vncPassword: result.data?.vnc_password ?? undefined,
         ttydUrl: result.data?.ttyd_url ?? undefined,
         tunnelUrls: result.data?.tunnel_urls ?? undefined,
       };
@@ -485,28 +523,17 @@ export class ModalClient {
     let outcome: "success" | "error" = "error";
 
     try {
-      const headers = await this.getPostHeaders(correlation);
-      const response = await fetch(this.snapshotSandboxUrl, {
-        method: "POST",
-        headers,
-        signal: request.signal,
-        body: JSON.stringify({
+      const result = await this.postJson(
+        this.snapshotSandboxUrl,
+        endpoint,
+        MODAL_SNAPSHOT_REQUEST_DEADLINE_MS,
+        {
           sandbox_id: request.providerObjectId,
-          session_id: request.sessionId,
-          reason: request.reason,
-        }),
-      });
-
-      httpStatus = response.status;
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new ModalApiError(`Modal API error: ${response.status} ${text}`, response.status);
-      }
-
-      const result = parseModalApiResponse(
+        },
         snapshotSandboxModalResponseSchema,
-        await response.json()
+        correlation,
+        request.signal,
+        (status) => (httpStatus = status)
       );
       if (!result.success) {
         return { success: false, error: result.error || "Unknown snapshot error" };
@@ -546,26 +573,18 @@ export class ModalClient {
     let outcome: "success" | "error" = "error";
 
     try {
-      const headers = await this.getPostHeaders(correlation);
-      const response = await fetch(this.snapshotBuildSandboxUrl, {
-        method: "POST",
-        headers,
-        signal: request.signal,
-        body: JSON.stringify({
+      const result = await this.postJson(
+        this.snapshotBuildSandboxUrl,
+        endpoint,
+        MODAL_SNAPSHOT_REQUEST_DEADLINE_MS,
+        {
           build_id: request.buildId,
           provider_session_id: request.providerSessionId,
-        }),
-      });
-
-      httpStatus = response.status;
-      if (!response.ok) {
-        const text = await response.text();
-        throw new ModalApiError(`Modal API error: ${response.status} ${text}`, response.status);
-      }
-
-      const result = parseModalApiResponse(
+        },
         snapshotSandboxModalResponseSchema,
-        await response.json()
+        correlation,
+        request.signal,
+        (status) => (httpStatus = status)
       );
       if (!result.success) {
         return { success: false, error: result.error || "Unknown snapshot error" };
@@ -601,11 +620,11 @@ export class ModalClient {
     let outcome: "success" | "error" = "error";
 
     try {
-      const headers = await this.getPostHeaders(correlation);
-      const response = await fetch(this.createImageBuildSandboxUrl, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
+      const result = await this.postJson(
+        this.createImageBuildSandboxUrl,
+        endpoint,
+        MODAL_SANDBOX_START_REQUEST_DEADLINE_MS,
+        {
           scope_kind: request.scopeKind,
           scope_id: request.scopeId,
           build_id: request.buildId,
@@ -613,24 +632,19 @@ export class ModalClient {
           clone_token: request.cloneToken,
           clone_host: request.cloneHost,
           clone_username: request.cloneUsername,
+          callback_url: request.callbackUrl,
+          failure_callback_url: request.failureCallbackUrl,
           user_env_vars: request.userEnvVars,
           build_execution_timeout_seconds: request.buildExecutionTimeoutSeconds,
-          build_timeout_seconds: request.providerSessionTimeoutSeconds ?? null,
-        }),
-      });
+          provider_session_timeout_seconds: request.providerSessionTimeoutSeconds,
+        },
+        createImageBuildSandboxModalResponseSchema,
+        correlation,
+        request.signal,
+        (status) => (httpStatus = status)
+      );
 
-      httpStatus = response.status;
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new ModalApiError(`Modal API error: ${response.status} ${text}`, response.status);
-      }
-
-      const result = (await response.json()) as ModalApiResponse<{
-        provider_session_id: string;
-      }>;
-
-      if (!result.success || !result.data?.provider_session_id) {
+      if (result.success === false) {
         throw new Error(`Modal API error: ${result.error || "Unknown error"}`);
       }
 
@@ -661,12 +675,11 @@ export class ModalClient {
     await this.postImageBuildOperation(
       this.startImageBuildSandboxUrl,
       "startImageBuildSandbox",
+      MODAL_SANDBOX_START_REQUEST_DEADLINE_MS,
       request,
       {
         build_id: request.buildId,
         provider_session_id: request.providerSessionId,
-        callback_url: request.callbackUrl,
-        failure_callback_url: request.failureCallbackUrl,
         callback_token: request.callbackToken,
       },
       correlation
@@ -680,6 +693,7 @@ export class ModalClient {
     await this.postImageBuildOperation(
       this.terminateImageBuildSandboxUrl,
       "terminateImageBuildSandbox",
+      MODAL_CLEANUP_REQUEST_DEADLINE_MS,
       request,
       {
         build_id: request.buildId,
@@ -693,6 +707,7 @@ export class ModalClient {
   private async postImageBuildOperation(
     url: string,
     endpoint: string,
+    deadlineMs: number,
     request: { buildId: string; providerSessionId: string; signal?: AbortSignal },
     body: Record<string, unknown>,
     correlation?: CorrelationContext
@@ -701,21 +716,17 @@ export class ModalClient {
     let httpStatus: number | undefined;
     let outcome: "success" | "error" = "error";
     try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: await this.getPostHeaders(correlation),
-        signal: request.signal,
-        body: JSON.stringify(body),
-      });
-      httpStatus = response.status;
-      if (!response.ok) {
-        throw new ModalApiError(
-          `Modal API error: ${response.status} ${await response.text()}`,
-          response.status
-        );
-      }
-      const result = (await response.json()) as ModalApiResponse<Record<string, unknown>>;
-      if (!result.success) {
+      const result = await this.postJson(
+        url,
+        endpoint,
+        deadlineMs,
+        body,
+        imageBuildOperationModalResponseSchema,
+        correlation,
+        request.signal,
+        (status) => (httpStatus = status)
+      );
+      if (result.success === false) {
         throw new Error(`Modal API error: ${result.error || "Unknown error"}`);
       }
       outcome = "success";
@@ -725,64 +736,6 @@ export class ModalClient {
         endpoint,
         build_id: request.buildId,
         sandbox_id: request.providerSessionId,
-        trace_id: correlation?.trace_id,
-        request_id: correlation?.request_id,
-        http_status: httpStatus,
-        duration_ms: Date.now() - startTime,
-        outcome,
-      });
-    }
-  }
-
-  /**
-   * Delete a provider image (best-effort).
-   */
-  async deleteProviderImage(
-    request: DeleteProviderImageRequest,
-    correlation?: CorrelationContext
-  ): Promise<DeleteProviderImageResponse> {
-    const startTime = Date.now();
-    const endpoint = "deleteProviderImage";
-    let httpStatus: number | undefined;
-    let outcome: "success" | "error" = "error";
-
-    try {
-      const headers = await this.getPostHeaders(correlation);
-      const response = await fetch(this.deleteProviderImageUrl, {
-        method: "POST",
-        headers,
-        signal: request.signal,
-        body: JSON.stringify({
-          provider_image_id: request.providerImageId,
-        }),
-      });
-
-      httpStatus = response.status;
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new ModalApiError(`Modal API error: ${response.status} ${text}`, response.status);
-      }
-
-      const result = (await response.json()) as ModalApiResponse<{
-        provider_image_id: string;
-        deleted: boolean;
-      }>;
-
-      if (!result.success || !result.data) {
-        throw new Error(`Modal API error: ${result.error || "Unknown error"}`);
-      }
-
-      outcome = "success";
-      return {
-        providerImageId: result.data.provider_image_id,
-        deleted: result.data.deleted,
-      };
-    } finally {
-      log.info("modal.request", {
-        event: "modal.request",
-        endpoint,
-        provider_image_id: request.providerImageId,
         trace_id: correlation?.trace_id,
         request_id: correlation?.request_id,
         http_status: httpStatus,

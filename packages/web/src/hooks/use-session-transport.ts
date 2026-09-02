@@ -1,9 +1,20 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { serverMessageSchema } from "@open-inspect/shared/types/server-messages";
-import type { ServerMessage } from "@open-inspect/shared/types/server-messages";
 import { browserApiFetch } from "@/lib/browser-api-fetch";
+import {
+  serverMessageSchema,
+  type ServerMessage,
+} from "@open-inspect/shared/types/server-messages";
+import {
+  WS_CLOSE_AUTHORIZATION_REVOKED,
+  WS_CLOSE_INTERNAL_ERROR,
+} from "@open-inspect/shared/types/websocket";
+
+function parseWsMessage(raw: unknown): ServerMessage | null {
+  const result = serverMessageSchema.safeParse(raw);
+  return result.success ? result.data : null;
+}
 
 // WebSocket URL (should come from env in production)
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8787";
@@ -11,16 +22,12 @@ const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8787";
 // WebSocket close codes
 const WS_CLOSE_AUTH_REQUIRED = 4001;
 const WS_CLOSE_SESSION_EXPIRED = 4002;
+const WS_CLOSE_INVALID_MESSAGE = 4004;
 
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY_MS = 1000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 const PING_INTERVAL_MS = 30000;
-
-function parseWsMessage(raw: unknown): ServerMessage | null {
-  const result = serverMessageSchema.safeParse(raw);
-  return result.success ? result.data : null;
-}
 
 function reconnectDelayMs(attemptsSoFar: number): number {
   return Math.min(RECONNECT_BASE_DELAY_MS * Math.pow(2, attemptsSoFar), MAX_RECONNECT_DELAY_MS);
@@ -29,7 +36,9 @@ function reconnectDelayMs(attemptsSoFar: number): number {
 /** What a close event calls for, decided as data; the caller applies effects. */
 type CloseDirective =
   | { action: "auth_required" }
+  | { action: "refresh_authorization" }
   | { action: "session_expired" }
+  | { action: "authorization_revoked"; delayMs?: number }
   | { action: "retry"; delayMs: number }
   | { action: "give_up" }
   | { action: "none" };
@@ -41,16 +50,22 @@ function closeDirective(
   if (event.code === WS_CLOSE_AUTH_REQUIRED) {
     return { action: "auth_required" };
   }
+  if (event.code === WS_CLOSE_AUTHORIZATION_REVOKED) {
+    return { action: "refresh_authorization" };
+  }
   if (event.code === WS_CLOSE_SESSION_EXPIRED) {
     return { action: "session_expired" };
   }
-  if (event.wasClean) {
-    return { action: "none" };
+  if (
+    !event.wasClean ||
+    event.code === WS_CLOSE_INVALID_MESSAGE ||
+    event.code === WS_CLOSE_INTERNAL_ERROR
+  ) {
+    return attemptsSoFar < MAX_RECONNECT_ATTEMPTS
+      ? { action: "retry", delayMs: reconnectDelayMs(attemptsSoFar) }
+      : { action: "give_up" };
   }
-  if (attemptsSoFar < MAX_RECONNECT_ATTEMPTS) {
-    return { action: "retry", delayMs: reconnectDelayMs(attemptsSoFar) };
-  }
-  return { action: "give_up" };
+  return { action: "none" };
 }
 
 export interface SessionTransportHandlers {
@@ -71,6 +86,8 @@ export interface UseSessionTransportReturn {
   send: (payload: Record<string, unknown>) => void;
   /** Drop the connection and token, then connect fresh. */
   reconnect: () => void;
+  /** Mark synchronization complete so future network retries start fresh. */
+  markHealthy: () => void;
 }
 
 /**
@@ -81,7 +98,8 @@ export interface UseSessionTransportReturn {
  */
 export function useSessionTransport(
   sessionId: string,
-  handlers: SessionTransportHandlers
+  handlers: SessionTransportHandlers,
+  enabled = true
 ): UseSessionTransportReturn {
   const wsRef = useRef<WebSocket | null>(null);
   const mountedRef = useRef(true);
@@ -171,9 +189,7 @@ export function useSessionTransport(
     connectingEpochRef.current = null;
     setConnected(true);
     setConnecting(false);
-    reconnectAttempts.current = 0;
 
-    // Subscribe to session with the auth token
     ws.send(
       JSON.stringify({
         type: "subscribe",
@@ -186,11 +202,17 @@ export function useSessionTransport(
   const handleSocketMessage = useCallback((ws: WebSocket, event: MessageEvent) => {
     if (wsRef.current !== ws) return;
     try {
-      const data = parseWsMessage(JSON.parse(event.data));
-      if (!data) return;
+      const raw: unknown = JSON.parse(event.data);
+      const data = parseWsMessage(raw);
+      if (!data) {
+        console.error("Received invalid WebSocket message");
+        ws.close(WS_CLOSE_INVALID_MESSAGE, "Invalid server message");
+        return;
+      }
       handlersRef.current.onMessage(data);
     } catch (error) {
       console.error("Failed to parse WebSocket message:", error);
+      ws.close(WS_CLOSE_INVALID_MESSAGE, "Invalid server message");
     }
   }, []);
 
@@ -220,10 +242,34 @@ export function useSessionTransport(
         wsTokenRef.current = null;
         return;
 
+      case "refresh_authorization":
+        if (!mountedRef.current) return;
+        wsTokenRef.current = null;
+        reconnectAttempts.current = 0;
+        setAuthError(null);
+        setConnectionError(null);
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (mountedRef.current) retry();
+        }, 0);
+        return;
+
       case "session_expired":
         // e.g. after server hibernation
         setConnectionError("Session expired. Please reconnect.");
         wsTokenRef.current = null;
+        return;
+
+      case "authorization_revoked":
+        wsTokenRef.current = null;
+        if (!mountedRef.current) return;
+        if (directive.delayMs === undefined) {
+          setConnectionError("Authorization could not be refreshed. Please try reconnecting.");
+          return;
+        }
+        reconnectAttempts.current++;
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (mountedRef.current) retry();
+        }, directive.delayMs);
         return;
 
       case "retry":
@@ -315,9 +361,14 @@ export function useSessionTransport(
   }, []);
 
   const reconnect = useCallback(() => {
+    if (!enabled) return;
     // A connect() still awaiting its token must not open a second socket
     // alongside the one this call creates.
     invalidateInFlightConnect();
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
     const discarded = wsRef.current;
     if (discarded) {
       wsRef.current = null;
@@ -332,29 +383,51 @@ export function useSessionTransport(
     setAuthError(null);
     setConnectionError(null);
     connect();
-  }, [connect, invalidateInFlightConnect]);
+  }, [connect, enabled, invalidateInFlightConnect]);
 
-  // Connect on mount
+  const markHealthy = useCallback(() => {
+    reconnectAttempts.current = 0;
+  }, []);
+
+  // Track the actual component lifetime separately from capability changes.
   useEffect(() => {
     mountedRef.current = true;
-    connect();
-
     return () => {
       mountedRef.current = false;
+    };
+  }, []);
+
+  // Connect while read transport is allowed. Cleanup is also the explicit
+  // enabled -> disabled transition: invalidate pending work, notify the
+  // protocol layer, and reset all transport state before a later re-enable.
+  useEffect(() => {
+    if (enabled) connect();
+
+    return () => {
+      const discarded = wsRef.current;
+      const hadActiveAttempt = discarded !== null || connectingEpochRef.current !== null;
       invalidateInFlightConnect();
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
       }
-      const discarded = wsRef.current;
       if (discarded) {
         wsRef.current = null;
         discarded.close();
       }
+      wsTokenRef.current = null;
+      reconnectAttempts.current = 0;
+      setConnected(false);
+      setConnecting(false);
+      setAuthError(null);
+      setConnectionError(null);
+      if (hadActiveAttempt) handlersRef.current.onClose?.();
     };
-  }, [connect, invalidateInFlightConnect]);
+  }, [connect, enabled, invalidateInFlightConnect]);
 
   // Ping periodically to keep connection alive.
   useEffect(() => {
+    if (!enabled) return;
     const pingInterval = setInterval(() => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: "ping" }));
@@ -362,7 +435,16 @@ export function useSessionTransport(
     }, PING_INTERVAL_MS);
 
     return () => clearInterval(pingInterval);
-  }, []);
+  }, [enabled]);
 
-  return { connected, connecting, authError, connectionError, isOpen, send, reconnect };
+  return {
+    connected,
+    connecting,
+    authError,
+    connectionError,
+    isOpen,
+    send,
+    reconnect,
+    markHealthy,
+  };
 }

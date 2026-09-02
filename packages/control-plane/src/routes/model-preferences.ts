@@ -8,11 +8,14 @@ import { createLogger } from "../logger";
 import type { Env } from "../types";
 import {
   type Route,
+  GITHUB_USER_OR_SERVICE_ROUTE,
+  defineRoutes,
   type RequestContext,
-  parsePattern,
   json,
   error,
   parseJsonBody,
+  activeGlobal,
+  requirePermission,
 } from "./shared";
 
 const logger = createLogger("router:model-preferences");
@@ -103,15 +106,19 @@ async function handleSetModelPreferences(
   }
 }
 
-export const modelPreferencesRoutes: Route[] = [
+export const modelPreferencesRoutes: Route[] = defineRoutes(GITHUB_USER_OR_SERVICE_ROUTE, [
   {
     method: "GET",
-    pattern: parsePattern("/model-preferences"),
+    path: "/model-preferences",
+    authorization: activeGlobal({
+      actorlessGrants: [{ service: "slack-bot" }],
+    }),
     handler: handleGetModelPreferences,
   },
   {
     method: "PUT",
-    pattern: parsePattern("/model-preferences"),
+    path: "/model-preferences",
+    authorization: requirePermission("models.preferences.manage"),
     handler: handleSetModelPreferences,
   },
-];
+]);

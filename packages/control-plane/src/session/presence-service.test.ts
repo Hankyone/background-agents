@@ -24,6 +24,7 @@ function createMockClient(overrides?: Partial<ClientInfo>): ClientInfo {
     status: "active",
     lastSeen: 1000,
     clientId: "client-1",
+    authorizationExpiresAt: Date.now() + 300_000,
     ws: {} as WebSocket,
     ...overrides,
   };
@@ -35,7 +36,7 @@ function createTestHarness() {
 
   const deps: PresenceServiceDeps = {
     getAuthenticatedClients: vi.fn(() => clients.values()),
-    messenger: { broadcast: vi.fn(), sendToSandbox: vi.fn(() => true) },
+    messenger: { broadcast: vi.fn(), sendToSandbox: vi.fn(async () => {}) },
     send: vi.fn(() => true),
     getSandboxSocket: vi.fn(() => null),
     isSpawning: vi.fn(() => false),

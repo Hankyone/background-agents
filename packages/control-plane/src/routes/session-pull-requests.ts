@@ -1,6 +1,12 @@
 import { SessionInternalPaths } from "../session/contracts";
 import type { Env } from "../types";
-import { error, parsePattern, type Route } from "./shared";
+import {
+  defineRoutes,
+  error,
+  GITHUB_USER_OR_SERVICE_ROUTE,
+  requirePermission,
+  type Route,
+} from "./shared";
 import { sessionRoute, type SessionRouteContext } from "./session-route";
 
 /**
@@ -23,10 +29,11 @@ async function handleRefreshPullRequests(
   });
 }
 
-export const sessionPullRequestRoutes: Route[] = [
+export const sessionPullRequestRoutes: Route[] = defineRoutes(GITHUB_USER_OR_SERVICE_ROUTE, [
   sessionRoute({
     method: "POST",
-    pattern: parsePattern("/sessions/:id/pull-requests/refresh"),
+    path: "/sessions/:id/pull-requests/refresh",
+    authorization: requirePermission("sessions.lifecycle"),
     handler: handleRefreshPullRequests,
   }),
-];
+]);

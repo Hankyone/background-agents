@@ -13,9 +13,13 @@ import {
   error,
   json,
   parseJsonBody,
-  parsePattern,
   type RequestContext,
   type Route,
+  defineRoute,
+  GITHUB_USER_OR_SERVICE_ROUTE,
+  SCM_AGNOSTIC_SANDBOX_ROUTE,
+  NO_AUTHORIZATION,
+  requirePermission,
 } from "./shared";
 
 const MAX_SIGNING_PAYLOAD_BYTES = 1024 * 1024;
@@ -209,29 +213,34 @@ async function handlePostSandboxCommitSigning(
 }
 
 export const commitSigningRoutes: Route[] = [
-  {
+  defineRoute(GITHUB_USER_OR_SERVICE_ROUTE, {
     method: "GET",
-    pattern: parsePattern("/commit-signing"),
+    path: "/commit-signing",
+    authorization: requirePermission("integrations.read"),
     handler: handleGetCommitSigning,
-  },
-  {
+  }),
+  defineRoute(GITHUB_USER_OR_SERVICE_ROUTE, {
     method: "PUT",
-    pattern: parsePattern("/commit-signing"),
+    path: "/commit-signing",
+    authorization: requirePermission("commit_signing.manage"),
     handler: handlePutCommitSigning,
-  },
-  {
+  }),
+  defineRoute(GITHUB_USER_OR_SERVICE_ROUTE, {
     method: "DELETE",
-    pattern: parsePattern("/commit-signing"),
+    path: "/commit-signing",
+    authorization: requirePermission("commit_signing.manage"),
     handler: handleDeleteCommitSigning,
-  },
-  {
+  }),
+  defineRoute(SCM_AGNOSTIC_SANDBOX_ROUTE, {
     method: "GET",
-    pattern: parsePattern("/sessions/:id/commit-signing"),
+    path: "/sessions/:id/commit-signing",
+    authorization: NO_AUTHORIZATION,
     handler: handleGetSandboxCommitSigning,
-  },
-  {
+  }),
+  defineRoute(SCM_AGNOSTIC_SANDBOX_ROUTE, {
     method: "POST",
-    pattern: parsePattern("/sessions/:id/commit-signing"),
+    path: "/sessions/:id/commit-signing",
+    authorization: NO_AUTHORIZATION,
     handler: handlePostSandboxCommitSigning,
-  },
+  }),
 ];

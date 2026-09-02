@@ -16,12 +16,18 @@ import { createLogger } from "../logger";
 import {
   type Route,
   type RequestContext,
-  parsePattern,
+  GITHUB_USER_OR_SERVICE_ROUTE,
+  defineRoutes,
   json,
   error,
   parseJsonBody,
   resolveRepoOrError,
+  requirePermission,
 } from "./shared";
+import {
+  environmentSecretsImportBodySchema,
+  secretsRequestBodySchema,
+} from "./secret-request-schemas";
 import type { Env } from "../types";
 
 const logger = createLogger("router:environment-secrets");
@@ -125,11 +131,13 @@ async function handleSetEnvironmentSecrets(
   const environment = await store.getById(id);
   if (!environment) return error("Environment not found", 404);
 
-  const body = await parseJsonBody<{ secrets?: Record<string, string> }>(request);
-  if (body instanceof Response) return body;
-  if (!body?.secrets || typeof body.secrets !== "object") {
+  const rawBody = await parseJsonBody<unknown>(request);
+  if (rawBody instanceof Response) return rawBody;
+  const parsedBody = secretsRequestBodySchema.safeParse(rawBody);
+  if (!parsedBody.success) {
     return error("Request body must include secrets object", 400);
   }
+  const body = parsedBody.data;
 
   const secretsStore = new EnvironmentSecretsStore(ctx.db, config.key);
   try {
@@ -231,22 +239,18 @@ async function handleImportEnvironmentSecrets(
   const environment = await store.getById(id);
   if (!environment) return error("Environment not found", 404);
 
-  const body = await parseJsonBody<{ repoOwner?: string; repoName?: string; keys?: unknown }>(
-    request
-  );
-  if (body instanceof Response) return body;
-  if (!body?.repoOwner || !body?.repoName) {
+  const rawBody = await parseJsonBody<unknown>(request);
+  if (rawBody instanceof Response) return rawBody;
+  const parsedBody = environmentSecretsImportBodySchema.safeParse(rawBody);
+  if (!parsedBody.success) {
+    const issue = parsedBody.error.issues[0];
+    if (issue?.path[0] === "keys") return error("keys must be an array of strings", 400);
     return error("repoOwner and repoName are required", 400);
   }
-  if (
-    body.keys !== undefined &&
-    (!Array.isArray(body.keys) || body.keys.some((k) => typeof k !== "string"))
-  ) {
-    return error("keys must be an array of strings", 400);
-  }
+  const body = parsedBody.data;
 
-  const srcOwner = body.repoOwner.trim().toLowerCase();
-  const srcName = body.repoName.trim().toLowerCase();
+  const srcOwner = body.repoOwner;
+  const srcName = body.repoName;
 
   // Authorization: the source repo must be one of the environment's repositories.
   const envRepos = await store.getRepositoriesForEnvironment(id);
@@ -263,7 +267,7 @@ async function handleImportEnvironmentSecrets(
 
   const secretsStore = new EnvironmentSecretsStore(ctx.db, config.key);
   try {
-    const result = await secretsStore.importFromRepo(id, repoId, body.keys as string[] | undefined);
+    const result = await secretsStore.importFromRepo(id, repoId, body.keys);
     logger.info("environment.secrets_imported", {
       event: "environment.secrets_imported",
       environment_id: id,
@@ -296,25 +300,29 @@ async function handleImportEnvironmentSecrets(
   }
 }
 
-export const environmentSecretsRoutes: Route[] = [
+export const environmentSecretsRoutes: Route[] = defineRoutes(GITHUB_USER_OR_SERVICE_ROUTE, [
   {
     method: "GET",
-    pattern: parsePattern("/environments/:id/secrets"),
+    path: "/environments/:id/secrets",
+    authorization: requirePermission("environments.secrets.manage"),
     handler: handleListEnvironmentSecrets,
   },
   {
     method: "PUT",
-    pattern: parsePattern("/environments/:id/secrets"),
+    path: "/environments/:id/secrets",
+    authorization: requirePermission("environments.secrets.manage"),
     handler: handleSetEnvironmentSecrets,
   },
   {
     method: "POST",
-    pattern: parsePattern("/environments/:id/secrets/import"),
+    path: "/environments/:id/secrets/import",
+    authorization: requirePermission("environments.secrets.manage"),
     handler: handleImportEnvironmentSecrets,
   },
   {
     method: "DELETE",
-    pattern: parsePattern("/environments/:id/secrets/:key"),
+    path: "/environments/:id/secrets/:key",
+    authorization: requirePermission("environments.secrets.manage"),
     handler: handleDeleteEnvironmentSecret,
   },
-];
+]);

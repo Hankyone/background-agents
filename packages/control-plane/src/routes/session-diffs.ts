@@ -6,7 +6,14 @@ import {
   sessionDiffUploadSchema,
 } from "@open-inspect/shared/types/session-diffs";
 import { SessionInternalPaths } from "../session/contracts";
-import { error, parsePattern, type Route } from "./shared";
+import {
+  defineRoute,
+  error,
+  SCM_AGNOSTIC_SANDBOX_FALLBACK_ROUTE,
+  SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  requirePermission,
+  type Route,
+} from "./shared";
 import { sessionRoute, type SessionRouteContext } from "./session-route";
 import type { Env } from "../types";
 
@@ -181,29 +188,49 @@ async function handleDiffRetry(
  * sandbox token; the Session DO validates that token before these handlers run.
  */
 export const sessionDiffRoutes: Route[] = [
-  sessionRoute({
-    method: "GET",
-    pattern: parsePattern("/sessions/:id/diff"),
-    handler: handleDiffState,
-  }),
-  sessionRoute({
-    method: "PUT",
-    pattern: parsePattern("/sessions/:id/diff"),
-    handler: handleDiffUpload,
-  }),
-  sessionRoute({
-    method: "POST",
-    pattern: parsePattern("/sessions/:id/diff/failure"),
-    handler: handleDiffFailure,
-  }),
-  sessionRoute({
-    method: "GET",
-    pattern: parsePattern("/sessions/:id/diff/:revisionId/files/:fileId"),
-    handler: handleDiffFile,
-  }),
-  sessionRoute({
-    method: "POST",
-    pattern: parsePattern("/sessions/:id/diff/retry"),
-    handler: handleDiffRetry,
-  }),
+  defineRoute(
+    SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+    sessionRoute({
+      method: "GET",
+      path: "/sessions/:id/diff",
+      authorization: requirePermission("sessions.read"),
+      handler: handleDiffState,
+    })
+  ),
+  defineRoute(
+    SCM_AGNOSTIC_SANDBOX_FALLBACK_ROUTE,
+    sessionRoute({
+      method: "PUT",
+      path: "/sessions/:id/diff",
+      authorization: requirePermission("sessions.collaborate"),
+      handler: handleDiffUpload,
+    })
+  ),
+  defineRoute(
+    SCM_AGNOSTIC_SANDBOX_FALLBACK_ROUTE,
+    sessionRoute({
+      method: "POST",
+      path: "/sessions/:id/diff/failure",
+      authorization: requirePermission("sessions.collaborate"),
+      handler: handleDiffFailure,
+    })
+  ),
+  defineRoute(
+    SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+    sessionRoute({
+      method: "GET",
+      path: "/sessions/:id/diff/:revisionId/files/:fileId",
+      authorization: requirePermission("sessions.read"),
+      handler: handleDiffFile,
+    })
+  ),
+  defineRoute(
+    SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+    sessionRoute({
+      method: "POST",
+      path: "/sessions/:id/diff/retry",
+      authorization: requirePermission("sessions.lifecycle"),
+      handler: handleDiffRetry,
+    })
+  ),
 ];

@@ -12,20 +12,14 @@ import { environmentScope, getRow, seedEnvironment } from "./image-build-helpers
 describe("image build scheduler integration", () => {
   beforeEach(cleanD1Tables);
 
-  it("routes the image-build cron to maintenance instead of the automation Durable Object", async () => {
-    const schedulerNamespace = {
-      idFromName: vi.fn(() => {
-        throw new Error("automation scheduler should not run");
-      }),
-    };
-
-    await worker.scheduled(
-      { cron: IMAGE_BUILD_SCHEDULER_CRON } as ScheduledEvent,
-      { DB: env.DB, SCHEDULER: schedulerNamespace } as unknown as Env,
-      createExecutionContext()
-    );
-
-    expect(schedulerNamespace.idFromName).not.toHaveBeenCalled();
+  it("routes the image-build cron to maintenance instead of the automation scheduler", async () => {
+    await expect(
+      worker.scheduled(
+        { cron: IMAGE_BUILD_SCHEDULER_CRON } as ScheduledEvent,
+        { DB: env.DB } as unknown as Env,
+        createExecutionContext()
+      )
+    ).resolves.toBeUndefined();
   });
 
   it("republishes an old accepted completion without stale-failing it in the same tick", async () => {
@@ -50,7 +44,7 @@ describe("image build scheduler integration", () => {
       completionHash,
       repositoryShas: [{ repoOwner: "acme", repoName: "web", baseSha: "abc123" }],
       runtimeVersion: "v53-runtime",
-      buildDurationMs: 1_000,
+      buildDurationSeconds: 1,
       now: callbackTime,
     });
     await env.DB.prepare("UPDATE image_builds SET created_at = 1 WHERE id = ?")
@@ -58,13 +52,7 @@ describe("image build scheduler integration", () => {
       .run();
 
     const send = vi.fn(async () => undefined);
-    const workflow = {
-      cleanupImages: vi.fn(async () => ({
-        deletedFailed: 0,
-        reapedFailed: 0,
-        reapedSuperseded: 0,
-      })),
-    } as unknown as ImageBuildWorkflow;
+    const workflow = {} as unknown as ImageBuildWorkflow;
     const scheduler = new ImageBuildScheduler(
       { IMAGE_BUILD_FINALIZATION_QUEUE: { send } } as unknown as Env,
       env.DB,
@@ -113,19 +101,13 @@ describe("image build scheduler integration", () => {
         completionHash,
         repositoryShas: [{ repoOwner: "acme", repoName: "web", baseSha: "abc123" }],
         runtimeVersion: "v53-runtime",
-        buildDurationMs: 1_000,
+        buildDurationSeconds: 1,
         now: index + 1,
       });
     }
 
     const send = vi.fn(async () => undefined);
-    const workflow = {
-      cleanupImages: vi.fn(async () => ({
-        deletedFailed: 0,
-        reapedFailed: 0,
-        reapedSuperseded: 0,
-      })),
-    } as unknown as ImageBuildWorkflow;
+    const workflow = {} as unknown as ImageBuildWorkflow;
     const scheduler = new ImageBuildScheduler(
       { IMAGE_BUILD_FINALIZATION_QUEUE: { send } } as unknown as Env,
       env.DB,
@@ -158,13 +140,7 @@ describe("image build scheduler integration", () => {
     }
 
     const cleanupFailedBuild = vi.fn(async () => undefined);
-    const workflow = {
-      cleanupImages: vi.fn(async () => ({
-        deletedFailed: 0,
-        reapedFailed: 0,
-        reapedSuperseded: 0,
-      })),
-    } as unknown as ImageBuildWorkflow;
+    const workflow = {} as unknown as ImageBuildWorkflow;
     const scheduler = new ImageBuildScheduler(
       {} as Env,
       env.DB,

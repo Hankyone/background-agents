@@ -2,39 +2,7 @@
  * Type definitions for Open-Inspect Control Plane.
  */
 
-import type {
-  ArtifactType,
-  MessageSource,
-  MessageStatus,
-  ParticipantRole,
-  SessionStatus,
-} from "@open-inspect/shared";
-import { z } from "zod";
 import type { ImageBuildFinalizationJob } from "./image-builds/finalization-job";
-
-export type {
-  ArtifactType,
-  ClientMessage,
-  CreateSessionRequest,
-  CreateSessionResponse,
-  EventResponse,
-  EventType,
-  GitSyncStatus,
-  ListEventsResponse,
-  MessageSource,
-  MessageStatus,
-  ParticipantRole,
-  ParticipantPresence,
-  SessionAttachmentReference,
-  ResolvedSessionAttachment,
-  SpawnSource,
-  SandboxEvent,
-  SandboxStatus,
-  ServerMessage,
-  SessionRepositoryState,
-  SessionState,
-  SessionStatus,
-} from "@open-inspect/shared";
 
 // Environment bindings
 export interface Env {
@@ -48,8 +16,9 @@ export interface Env {
   SLACK_BOT?: Fetcher; // Optional - only if slack-bot is deployed
   LINEAR_BOT?: Fetcher; // Optional - only if linear-bot is deployed
 
-  // Durable Objects
-  SCHEDULER?: DurableObjectNamespace; // SchedulerDO for automation engine
+  // GitHub Autofix queue bindings used for read-only metrics.
+  AUTOFIX_QUEUE?: Queue<unknown>;
+  AUTOFIX_DLQ?: Queue<unknown>;
 
   // D1 database
   DB: D1Database;
@@ -67,6 +36,7 @@ export interface Env {
   GOOGLE_CLIENT_SECRET?: string;
   BROWSER_AUTH_SECRET?: string;
   TOKEN_ENCRYPTION_KEY: string;
+  PROVIDER_ACCOUNTS_ENCRYPTION_KEY: string;
   REPO_SECRETS_ENCRYPTION_KEY?: string;
   MODAL_TOKEN_ID?: string;
   MODAL_TOKEN_SECRET?: string;
@@ -97,6 +67,7 @@ export interface Env {
   // Variables
   DEPLOYMENT_NAME: string;
   APP_NAME?: string; // Display name for user-visible UI, PR footers, and HTTP User-Agent headers
+  GITHUB_BOT_USERNAME: string; // GitHub App bot login used for self-origin checks
   SCM_PROVIDER?: string; // Source control provider for this deployment (default: github)
   WORKER_URL?: string; // Base URL for the worker (for callbacks)
   WEB_APP_URL?: string; // Base URL for the web app (for PR links)
@@ -140,7 +111,7 @@ export interface Env {
   LOG_LEVEL?: string; // "debug" | "info" | "warn" | "error" (default: "info")
 }
 
-// Client info (stored in DO memory)
+/** Authenticated client state stored in Durable Object memory. */
 export interface ClientInfo {
   participantId: string;
   userId: string;
@@ -149,76 +120,8 @@ export interface ClientInfo {
   status: "active" | "idle" | "away";
   lastSeen: number;
   clientId: string;
+  /** Wall-clock time when this connection's authorization lease expires. */
+  authorizationExpiresAt: number;
   ws: WebSocket;
-  lastFetchHistoryAt?: number;
+  lastFetchHistoryAtMs?: number;
 }
-
-export interface SessionResponse {
-  id: string;
-  title: string | null;
-  repoOwner: string;
-  repoName: string;
-  baseBranch: string;
-  branchName: string | null;
-  baseSha: string | null;
-  currentSha: string | null;
-  opencodeSessionId: string | null;
-  status: SessionStatus;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface ListSessionsResponse {
-  sessions: SessionResponse[];
-  total: number;
-  hasMore: boolean;
-}
-
-export interface MessageResponse {
-  id: string;
-  authorId: string;
-  content: string;
-  source: MessageSource;
-  status: MessageStatus;
-  createdAt: number;
-  startedAt: number | null;
-  completedAt: number | null;
-}
-
-export interface ArtifactResponse {
-  id: string;
-  type: ArtifactType;
-  url: string | null;
-  metadata: Record<string, unknown> | null;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface ParticipantResponse {
-  id: string;
-  userId: string;
-  canonicalUserId?: string | null;
-  scmLogin: string | null;
-  scmName: string | null;
-  role: ParticipantRole;
-  joinedAt: number;
-}
-
-// GitHub OAuth types
-export interface GitHubUser {
-  id: number;
-  login: string;
-  name: string | null;
-  email: string | null;
-  avatar_url: string;
-}
-
-export const githubTokenResponseSchema = z.object({
-  access_token: z.string(),
-  token_type: z.string(),
-  scope: z.string(),
-  refresh_token: z.string().optional(),
-  expires_in: z.number().optional(),
-});
-
-export type GitHubTokenResponse = z.infer<typeof githubTokenResponseSchema>;

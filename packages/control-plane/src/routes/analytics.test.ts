@@ -4,6 +4,7 @@ import { HUMAN_SPAWN_SOURCES } from "../db/analytics-store";
 import type { RequestContext } from "./shared";
 import type { SqlDatabase } from "../db/sql-database";
 import type { Env } from "../types";
+import { routePathPattern, TEST_BACKGROUND_TASK_CONTEXT } from "../router.test-support";
 
 const FIXED_NOW = 1_700_000_000_000;
 
@@ -11,6 +12,10 @@ const mockStore = {
   getSummary: vi.fn(),
   getTimeseries: vi.fn(),
   getBreakdown: vi.fn(),
+};
+
+const mockDashboardStore = {
+  get: vi.fn(),
 };
 
 vi.mock("../db/analytics-store", async (importOriginal) => {
@@ -23,11 +28,17 @@ vi.mock("../db/analytics-store", async (importOriginal) => {
   };
 });
 
+vi.mock("../db/analytics-dashboard-store", () => ({
+  AnalyticsDashboardStore: vi.fn().mockImplementation(function () {
+    return mockDashboardStore;
+  }),
+}));
+
 function getHandler(method: string, path: string) {
   const pathname = new URL(`https://test.local${path}`).pathname;
   for (const route of analyticsRoutes) {
-    if (route.method === method && route.pattern.test(pathname)) {
-      const match = pathname.match(route.pattern)!;
+    if (route.method === method && routePathPattern(route.path).test(pathname)) {
+      const match = pathname.match(routePathPattern(route.path))!;
       return { handler: route.handler, match };
     }
   }
@@ -46,6 +57,7 @@ function createCtx(): RequestContext {
     trace_id: "trace-1",
     request_id: "req-1",
     db: {} as SqlDatabase,
+    executionCtx: TEST_BACKGROUND_TASK_CONTEXT,
     metrics: {
       d1Queries: [],
       spans: {},
@@ -70,6 +82,29 @@ describe("analytics route handlers", () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
     vi.setSystemTime(FIXED_NOW);
+  });
+
+  describe("GET /analytics/dashboard", () => {
+    it("anchors one shared dashboard window", async () => {
+      mockDashboardStore.get.mockResolvedValue({ generatedAt: FIXED_NOW });
+
+      const response = await callRoute("GET", "/analytics/dashboard?days=14");
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ generatedAt: FIXED_NOW });
+      expect(mockDashboardStore.get).toHaveBeenCalledWith({
+        days: 14,
+        startAt: FIXED_NOW - 14 * 24 * 60 * 60 * 1000,
+        endAt: FIXED_NOW,
+      });
+    });
+
+    it("rejects invalid ranges before querying", async () => {
+      const response = await callRoute("GET", "/analytics/dashboard?days=31");
+
+      expect(response.status).toBe(400);
+      expect(mockDashboardStore.get).not.toHaveBeenCalled();
+    });
   });
 
   afterEach(() => {

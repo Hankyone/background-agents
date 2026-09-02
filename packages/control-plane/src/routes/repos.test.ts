@@ -1,11 +1,26 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createTestBackgroundTasks } from "../background-tasks.test-support";
 import type { SqlDatabase } from "../db/sql-database";
 import type { Env } from "../types";
 import { reposRoutes } from "./repos";
+import type * as SharedRoutes from "./shared";
 import type { RequestContext } from "./shared";
+import { matchRoute, TEST_BACKGROUND_TASK_CONTEXT } from "../router.test-support";
 
-const { mockCacheDelete, mockLogger, mockUpsert } = vi.hoisted(() => ({
+const {
+  mockCacheDelete,
+  mockCacheGet,
+  mockCachePut,
+  mockGetBatch,
+  mockListRepositories,
+  mockLogger,
+  mockUpsert,
+} = vi.hoisted(() => ({
   mockCacheDelete: vi.fn(),
+  mockCacheGet: vi.fn(),
+  mockCachePut: vi.fn(),
+  mockGetBatch: vi.fn(),
+  mockListRepositories: vi.fn(),
   mockLogger: {
     debug: vi.fn(),
     info: vi.fn(),
@@ -17,12 +32,16 @@ const { mockCacheDelete, mockLogger, mockUpsert } = vi.hoisted(() => ({
 
 vi.mock("../db/repo-metadata", () => ({
   RepoMetadataStore: vi.fn().mockImplementation(function () {
-    return { upsert: mockUpsert };
+    return { upsert: mockUpsert, getBatch: mockGetBatch };
   }),
 }));
 
 vi.mock("@open-inspect/shared/cache-store", () => ({
-  createKvCacheStore: vi.fn(() => ({ delete: mockCacheDelete })),
+  createKvCacheStore: vi.fn(() => ({
+    delete: mockCacheDelete,
+    get: mockCacheGet,
+    put: mockCachePut,
+  })),
 }));
 
 vi.mock("../logger", () => ({
@@ -35,6 +54,7 @@ function createContext(): RequestContext {
     request_id: "request-1",
     principal: { kind: "user", userId: "user-1" },
     db: {} as SqlDatabase,
+    executionCtx: TEST_BACKGROUND_TASK_CONTEXT,
     metrics: {
       d1Queries: [],
       spans: {},
@@ -44,13 +64,74 @@ function createContext(): RequestContext {
   };
 }
 
-function getUpdateHandler(path: string) {
-  const route = reposRoutes.find((candidate) => candidate.method === "PUT");
-  if (!route) throw new Error("No repository metadata update route found");
-  const match = path.match(route.pattern);
-  if (!match) throw new Error(`Update route did not match ${path}`);
-  return { handler: route.handler, match };
+vi.mock("./shared", async () => {
+  const actual = await vi.importActual<typeof SharedRoutes>("./shared");
+  return {
+    ...actual,
+    createRouteSourceControlProvider: vi.fn(() => ({
+      listRepositories: mockListRepositories,
+    })),
+  };
+});
+
+function getListHandler() {
+  const matched = matchRoute(reposRoutes, "GET", "/repos");
+  if (!matched) throw new Error("No repository list route found");
+  return { handler: matched.route.handler, match: matched.match };
 }
+
+function getUpdateHandler(path: string) {
+  const matched = matchRoute(reposRoutes, "PUT", path);
+  if (!matched) throw new Error(`Update route did not match ${path}`);
+  return { handler: matched.route.handler, match: matched.match };
+}
+
+describe("repository list route", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCacheGet.mockResolvedValue(null);
+    mockCachePut.mockResolvedValue(undefined);
+    mockGetBatch.mockResolvedValue(new Map());
+    mockListRepositories.mockResolvedValue([
+      {
+        id: 1,
+        owner: "acme",
+        name: "widgets",
+        fullName: "acme/widgets",
+        description: null,
+        private: true,
+        archived: false,
+        defaultBranch: "main",
+      },
+    ]);
+  });
+
+  it("keeps the cold-cache refresh alive when the client disconnects", async () => {
+    // A cold cache is populated synchronously. The web proxy aborts at
+    // CONTROL_PLANE_FETCH_TIMEOUT_MS, which cancels the worker — so unless the
+    // refresh is registered with waitUntil, the KV write never lands and every
+    // later request repeats the same slow path against an empty cache.
+    const backgroundTasks = createTestBackgroundTasks();
+    const { handler, match } = getListHandler();
+    const ctx = createContext();
+
+    const response = await handler(
+      new Request("https://test.local/repos"),
+      { REPOS_CACHE: {} as KVNamespace } as Env,
+      match,
+      {
+        ...ctx,
+        executionCtx: backgroundTasks,
+      }
+    );
+
+    expect(response.status).toBe(200);
+    expect(mockCachePut).toHaveBeenCalledTimes(1);
+    expect(backgroundTasks.submissions).toHaveLength(1);
+    await backgroundTasks.settle();
+    expect(backgroundTasks.failures).toEqual([]);
+  });
+});
 
 describe("repository metadata routes", () => {
   beforeEach(() => {
@@ -129,5 +210,67 @@ describe("repository metadata routes", () => {
       error: updateError,
     });
     expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed metadata before persistence", async () => {
+    const path = "/repos/acme/widget/metadata";
+    const { handler, match } = getUpdateHandler(path);
+
+    const response = await handler(
+      new Request(`https://test.local${path}`, {
+        method: "PUT",
+        body: JSON.stringify({ aliases: ["api", 42] }),
+      }),
+      { REPOS_CACHE: {} as KVNamespace } as Env,
+      match,
+      createContext()
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "Invalid repository metadata" });
+    expect(mockUpsert).not.toHaveBeenCalled();
+    expect(mockCacheDelete).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed JSON with the same 400 as an invalid object", async () => {
+    const path = "/repos/acme/widget/metadata";
+    const { handler, match } = getUpdateHandler(path);
+
+    const response = await handler(
+      new Request(`https://test.local${path}`, { method: "PUT", body: "{" }),
+      { REPOS_CACHE: {} as KVNamespace } as Env,
+      match,
+      createContext()
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "Invalid repository metadata" });
+    expect(mockUpsert).not.toHaveBeenCalled();
+    expect(mockCacheDelete).not.toHaveBeenCalled();
+  });
+
+  it("persists only schema fields and drops unknown keys", async () => {
+    const path = "/repos/acme/widget/metadata";
+    const { handler, match } = getUpdateHandler(path);
+
+    const response = await handler(
+      new Request(`https://test.local${path}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          description: "Updated description",
+          keywords: ["billing"],
+          notAField: "dropped",
+        }),
+      }),
+      { REPOS_CACHE: {} as KVNamespace } as Env,
+      match,
+      createContext()
+    );
+
+    expect(response.status).toBe(200);
+    expect(mockUpsert).toHaveBeenCalledWith("acme", "widget", {
+      description: "Updated description",
+      keywords: ["billing"],
+    });
   });
 });

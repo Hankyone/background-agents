@@ -2,8 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { UserStore } from "./db/user-store";
 import { resolveGitHubEnrichmentForRequest } from "./session/identity";
-import { handleRequest } from "./router";
-import { signedServiceRequest, TEST_SERVICE_SECRETS } from "./router.test-support";
+import {
+  handleRequest,
+  signedServiceRequest,
+  TEST_BACKGROUND_TASK_CONTEXT,
+  TEST_SERVICE_SECRETS,
+} from "./router.test-support";
 
 vi.mock("./db/user-store", () => ({
   UserStore: vi.fn(),
@@ -54,8 +58,17 @@ function userPromptRequest(body: Record<string, unknown>): Promise<Request> {
 function createEnv(sessionFetch: ReturnType<typeof vi.fn>): Record<string, unknown> {
   const statement = {
     bind: vi.fn(() => statement),
-    first: vi.fn(async () => null),
-    all: vi.fn(async () => ({ results: [] })),
+    first: vi.fn(async () => ({
+      user_id: "user-1",
+      suspended_at: null,
+      assigned: 1,
+      role_id: "role_builtin_administrator",
+      role_key: "administrator",
+      role_name: "Administrator",
+    })),
+    all: vi.fn(async () => ({
+      results: [{ permission_id: "sessions.collaborate" }],
+    })),
     run: vi.fn(async () => ({ meta: { changes: 0 } })),
   };
   return {
@@ -109,7 +122,8 @@ describe("session prompt identity enrichment", () => {
     });
     const response = await handleRequest(
       await userPromptRequest({ content: "Fix the bug" }),
-      createEnv(sessionFetch) as never
+      createEnv(sessionFetch) as never,
+      TEST_BACKGROUND_TASK_CONTEXT
     );
 
     expect(response.status).toBe(200);
@@ -132,7 +146,8 @@ describe("session prompt identity enrichment", () => {
     });
     const response = await handleRequest(
       await userPromptRequest({ content: "Fix the bug" }),
-      createEnv(sessionFetch) as never
+      createEnv(sessionFetch) as never,
+      TEST_BACKGROUND_TASK_CONTEXT
     );
 
     expect(response.status).toBe(200);
@@ -154,7 +169,8 @@ describe("session prompt identity enrichment", () => {
     });
     const response = await handleRequest(
       await userPromptRequest({ content: "Fix the bug" }),
-      createEnv(sessionFetch) as never
+      createEnv(sessionFetch) as never,
+      TEST_BACKGROUND_TASK_CONTEXT
     );
 
     expect(response.status).toBe(200);
@@ -165,7 +181,8 @@ describe("session prompt identity enrichment", () => {
     const sessionFetch = vi.fn(async () => Response.json({ status: "queued" }));
     const response = await handleRequest(
       await userPromptRequest({ content: "Fix the bug", authorId: "someone-else" }),
-      createEnv(sessionFetch) as never
+      createEnv(sessionFetch) as never,
+      TEST_BACKGROUND_TASK_CONTEXT
     );
 
     expect(response.status).toBe(400);

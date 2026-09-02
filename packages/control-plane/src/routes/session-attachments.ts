@@ -8,7 +8,7 @@
  *
  * GET streams the file back. It is HMAC-authenticated for the web app's proxy
  * route and sandbox-token-authenticated so the bridge can hydrate attachments
- * before prompting OpenCode (see SANDBOX_AUTH_ROUTES in router.ts).
+ * before prompting OpenCode (see the sandbox-fallback policies in routes/shared.ts).
  *
  * Every stored object is registered as an attachment record in the session DO,
  * which enforces per-session quotas and prunes records never referenced by a
@@ -16,8 +16,11 @@
  * deletes them from storage.
  */
 
-import { readBodyCapped } from "@open-inspect/shared";
-import { sessionAttachmentIdSchema } from "@open-inspect/shared/types/session-attachments";
+import { readBodyCapped } from "@open-inspect/shared/http-body";
+import {
+  sessionAttachmentIdSchema,
+  type SessionAttachmentUploadResponse,
+} from "@open-inspect/shared/types/session-attachments";
 import { generateId } from "../auth/crypto";
 import { createLogger } from "../logger";
 import {
@@ -41,7 +44,15 @@ import {
   createRangeNotSatisfiableResponse,
   createStoredObjectResponse,
 } from "./responses/stored-object-response";
-import { error, json, parsePattern, type Route } from "./shared";
+import {
+  defineRoute,
+  error,
+  GITHUB_SANDBOX_FALLBACK_ROUTE,
+  GITHUB_USER_OR_SERVICE_ROUTE,
+  json,
+  requirePermission,
+  type Route,
+} from "./shared";
 import { sessionRoute, type SessionRouteContext } from "./session-route";
 
 const logger = createLogger("router:session-attachments");
@@ -160,7 +171,12 @@ async function handleAttachmentPost(
     trace_id: ctx.trace_id,
   });
 
-  return json({ attachmentId, mimeType: detected.mimeType }, 201);
+  // Typed against the shared schema its clients parse with, so dropping or
+  // renaming a field here fails the build rather than the upload.
+  return json(
+    { attachmentId, mimeType: detected.mimeType } satisfies SessionAttachmentUploadResponse,
+    201
+  );
 }
 
 async function handleAttachmentGet(
@@ -222,14 +238,22 @@ async function handleAttachmentGet(
 }
 
 export const sessionAttachmentRoutes: Route[] = [
-  sessionRoute({
-    method: "POST",
-    pattern: parsePattern("/sessions/:id/attachments"),
-    handler: handleAttachmentPost,
-  }),
-  sessionRoute({
-    method: "GET",
-    pattern: parsePattern("/sessions/:id/attachments/:attachmentId"),
-    handler: handleAttachmentGet,
-  }),
+  defineRoute(
+    GITHUB_USER_OR_SERVICE_ROUTE,
+    sessionRoute({
+      method: "POST",
+      path: "/sessions/:id/attachments",
+      authorization: requirePermission("sessions.collaborate"),
+      handler: handleAttachmentPost,
+    })
+  ),
+  defineRoute(
+    GITHUB_SANDBOX_FALLBACK_ROUTE,
+    sessionRoute({
+      method: "GET",
+      path: "/sessions/:id/attachments/:attachmentId",
+      authorization: requirePermission("sessions.read"),
+      handler: handleAttachmentGet,
+    })
+  ),
 ];

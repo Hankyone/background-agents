@@ -1,8 +1,12 @@
 import type { RepositoryRef, RepositoryPair } from "@open-inspect/shared/types/repositories";
 import { getValidModelOrDefault, isValidReasoningEffort } from "@open-inspect/shared/models";
+import type { CreateSessionResponse } from "@open-inspect/shared/types/session-api";
 import { generateId } from "../auth/crypto";
 import { resolveGitHubCredentialAuthority } from "../source-control/github-credential-authority";
-import { applyIdentityEnforcement, resolveCanonicalUserId } from "../auth/identity-enforcement";
+import {
+  applyIdentityEnforcement,
+  requireAdmittedCanonicalUserId,
+} from "../routing/identity-enforcement";
 import { resolveEnvironmentTarget, resolveSessionRepositories } from "../repos/resolve";
 import { resolveScmProviderFromEnv } from "../source-control";
 import { EnvironmentStore } from "../db/environments";
@@ -12,7 +16,11 @@ import { parseCreateSessionInput } from "../session/create-session-input";
 import { initializeSession, type SessionInitInput } from "../session/initialize";
 import { resolveGitHubEnrichmentForRequest } from "../session/identity";
 import { resolveSessionScopedSettings } from "../session/integration-settings-resolution";
-import type { CreateSessionResponse, Env } from "../types";
+import { resolveManagedSkills, SkillResolutionError } from "../session/skill-resolution";
+import type { Env } from "../types";
+import { resolveSessionProviderAuth } from "../session/provider-account-resolution";
+import { ProviderAccountSelectionPolicyError } from "../model-provider-accounts/selection-policy";
+import { authorizeSessionTarget } from "./session-target-authorization";
 import {
   normalizeOptionalRepositoryPair,
   RepositoryPairValidationError,
@@ -20,10 +28,13 @@ import {
 import {
   error,
   json,
-  parsePattern,
   resolveRepoOrError,
   type RequestContext,
   type Route,
+  GITHUB_USER_OR_SERVICE_ROUTE,
+  defineRoutes,
+  requirePermission,
+  type ServiceActorClaimsResult,
 } from "./shared";
 
 const logger = createLogger("router:session-create");
@@ -31,6 +42,28 @@ const INVALID_SESSION_REQUEST_BODY_ERROR = "Invalid session request body";
 
 // Defense in depth on top of schema validation — matches git ref charsets.
 const BRANCH_NAME_PATTERN = /^[\w.\-/]+$/;
+
+async function extractSessionActorProfileClaims(
+  request: Request,
+  ctx: RequestContext
+): Promise<ServiceActorClaimsResult> {
+  const parsed = await parseCreateSessionInput(request);
+  if (!parsed.ok) return { kind: "rejected", response: error(parsed.message, 400) };
+
+  // Keep the admission-time claim view aligned with the handler's raw-body
+  // identity guard; the same rejection ends admission before enrollment.
+  const enforcement = applyIdentityEnforcement(ctx, "session-create", parsed.raw);
+  if (enforcement.rejection) return { kind: "rejected", response: enforcement.rejection };
+
+  return {
+    kind: "claims",
+    claims: {
+      displayName: parsed.input.actorDisplayName,
+      email: parsed.input.actorEmail,
+      avatarUrl: parsed.input.actorAvatarUrl,
+    },
+  };
+}
 
 async function handleCreateSession(
   request: Request,
@@ -58,6 +91,12 @@ async function handleCreateSession(
     }
     throw e;
   }
+
+  const targetAuthorizationError = authorizeSessionTarget(ctx, {
+    environmentId: body.environmentId,
+    hasRepository: Boolean(repositoryContext || body.repositories),
+  });
+  if (targetAuthorizationError) return targetAuthorizationError;
 
   // Validate branch names if provided (defense in depth)
   if (body.branch && !BRANCH_NAME_PATTERN.test(body.branch)) {
@@ -111,16 +150,13 @@ async function handleCreateSession(
   const participantUserId = enforced.participantUserId;
   const spawnSource = enforced.spawnSource ?? undefined;
 
-  // Resolve canonical user model ID (for D1 session index) from the verified
-  // principal, failing closed; body display fields stay cosmetic.
+  // Admission finalized the canonical subject before RBAC. The handler may
+  // consume only that exact subject; it must never perform late identity
+  // selection from body profile fields.
   const userStore = new UserStore(ctx.db);
-  const resolution = await resolveCanonicalUserId(userStore, ctx, enforced, {
-    displayName: body.actorDisplayName,
-    email: body.actorEmail,
-    avatarUrl: body.actorAvatarUrl,
-  });
+  const resolution = requireAdmittedCanonicalUserId(ctx, enforced);
   if (resolution instanceof Response) return resolution;
-  const resolvedUserId = resolution.userId;
+  const resolvedUserId = resolution;
 
   const githubDeployment = resolveScmProviderFromEnv(env.SCM_PROVIDER) === "github";
   let scmLogin = body.scmLogin;
@@ -174,13 +210,39 @@ async function handleCreateSession(
   // two are the same repo by the row-0-mirrors-scalars invariant. Launching
   // from a saved environment layers its overrides on top (design §13.5).
   const scopeMembers = repositories ?? (repoOwner && repoName ? [{ repoOwner, repoName }] : []);
-  const { codeServerEnabled, sandboxSettings } = await resolveSessionScopedSettings(
+  const { codeServerEnabled, vncEnabled, sandboxSettings } = await resolveSessionScopedSettings(
     ctx.db,
     scopeMembers,
     environmentId
   );
 
   const sessionId = generateId();
+  let providerAuth;
+  try {
+    providerAuth = await resolveSessionProviderAuth(ctx.db, {
+      explicit: body.providerSelections,
+      unattended: spawnSource !== undefined && spawnSource !== "user",
+    });
+  } catch (e) {
+    if (e instanceof ProviderAccountSelectionPolicyError) return error(e.message, e.status);
+    throw e;
+  }
+
+  let managedSkillsManifest;
+  try {
+    managedSkillsManifest = await resolveManagedSkills(
+      ctx.db,
+      {
+        repositories: scopeMembers,
+        environmentId,
+      },
+      body.skillSelection ?? { mode: "all" },
+      resolvedUserId
+    );
+  } catch (e) {
+    if (e instanceof SkillResolutionError) return error(e.message, e.status);
+    throw e;
+  }
 
   const input: SessionInitInput = {
     sessionId,
@@ -204,8 +266,11 @@ async function handleCreateSession(
     scmRefreshTokenEncrypted,
     scmTokenExpiresAt,
     codeServerEnabled,
+    vncEnabled,
     sandboxSettings,
     spawnSource,
+    managedSkillsManifest,
+    providerAuth,
   };
 
   try {
@@ -227,10 +292,12 @@ async function handleCreateSession(
   return json(result, 201);
 }
 
-export const sessionCreateRoutes: Route[] = [
+export const sessionCreateRoutes: Route[] = defineRoutes(GITHUB_USER_OR_SERVICE_ROUTE, [
   {
     method: "POST",
-    pattern: parsePattern("/sessions"),
+    path: "/sessions",
+    authorization: requirePermission("sessions.create"),
+    serviceActorClaims: extractSessionActorProfileClaims,
     handler: handleCreateSession,
   },
-];
+]);

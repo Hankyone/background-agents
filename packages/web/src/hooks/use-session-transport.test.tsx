@@ -110,18 +110,83 @@ describe("useSessionTransport", () => {
     expect(result.current.isOpen()).toBe(true);
   });
 
-  it("forwards schema-valid messages to onMessage and drops the rest", async () => {
+  it("does not fetch a token or open a socket when transport is disabled", async () => {
+    const { result } = renderHook(() =>
+      useSessionTransport("session-1", { onMessage, onClose }, false)
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(result.current.connected).toBe(false);
+    expect(result.current.connecting).toBe(false);
+
+    act(() => result.current.reconnect());
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("resets transport state across enabled to disabled to enabled", async () => {
+    const rendered = renderHook(
+      ({ enabled }) => useSessionTransport("session-1", { onMessage, onClose }, enabled),
+      { initialProps: { enabled: true } }
+    );
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    act(() => FakeWebSocket.instances[0].open());
+    await waitFor(() => expect(rendered.result.current.connected).toBe(true));
+
+    rendered.rerender({ enabled: false });
+
+    await waitFor(() => {
+      expect(rendered.result.current.connected).toBe(false);
+      expect(rendered.result.current.connecting).toBe(false);
+    });
+    expect(rendered.result.current.isOpen()).toBe(false);
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    rendered.rerender({ enabled: true });
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    act(() => FakeWebSocket.instances[1].open());
+    await waitFor(() => expect(rendered.result.current.connected).toBe(true));
+  });
+
+  it("forwards schema-valid messages to onMessage", async () => {
     const { socket } = await openSocket();
 
     act(() => {
       socket.receive({ type: "pong", timestamp: 5 });
-      socket.receiveRaw(JSON.stringify({ type: "not_a_message" }));
-      socket.receiveRaw("not json");
     });
 
     expect(onMessage).toHaveBeenCalledTimes(1);
     expect(onMessage).toHaveBeenCalledWith({ type: "pong", timestamp: 5 });
   });
+
+  it.each([JSON.stringify({ type: "not_a_message" }), "not json"])(
+    "reconnects after an invalid server message: %s",
+    async (payload) => {
+      vi.useFakeTimers();
+      const rendered = renderTransport();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const socket = FakeWebSocket.instances[0];
+      act(() => {
+        socket.open();
+        socket.receiveRaw(payload);
+      });
+
+      expect(onMessage).not.toHaveBeenCalled();
+      expect(onClose).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      rendered.unmount();
+    }
+  );
 
   it("surfaces an auth error when the token endpoint returns 401 and opens no socket", async () => {
     fetchMock.mockResolvedValue(new Response("unauthorized", { status: 401 }));
@@ -173,6 +238,57 @@ describe("useSessionTransport", () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
+  it("fetches a fresh credential and reconnects after authorization revocation", async () => {
+    vi.useFakeTimers();
+    fetchMock
+      .mockResolvedValueOnce(Response.json({ token: "original-token" }))
+      .mockResolvedValueOnce(Response.json({ token: "refreshed-token" }));
+    const rendered = renderTransport();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const original = FakeWebSocket.instances[0];
+    act(() => {
+      original.open();
+      original.serverClose(4010, true);
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const replacement = FakeWebSocket.instances[1];
+    act(() => replacement.open());
+    expect(replacement.sentMessages).toEqual([
+      expect.objectContaining({ token: "refreshed-token" }),
+    ]);
+    rendered.unmount();
+  });
+
+  it("retries a clean transient server failure with the cached credential", async () => {
+    vi.useFakeTimers();
+    const rendered = renderTransport();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    act(() => {
+      FakeWebSocket.instances[0].open();
+      FakeWebSocket.instances[0].serverClose(1011, true);
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    act(() => FakeWebSocket.instances[1].open());
+    expect(FakeWebSocket.instances[1].sentMessages).toEqual([
+      expect.objectContaining({ token: "ws-token" }),
+    ]);
+    rendered.unmount();
+  });
+
   it("reconnects with backoff after an unclean close and reuses the cached token", async () => {
     vi.useFakeTimers();
     const rendered = renderTransport();
@@ -208,8 +324,7 @@ describe("useSessionTransport", () => {
       await vi.advanceTimersByTimeAsync(0);
     });
 
-    // Never open the sockets: a successful open resets the attempt counter,
-    // so exhaustion only happens on repeated failed connection attempts.
+    // Never mark the sockets healthy, so repeated failures exhaust the budget.
     for (let attempt = 0; attempt < 6; attempt++) {
       const socket = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
       act(() => {
@@ -225,6 +340,44 @@ describe("useSessionTransport", () => {
       "Connection lost. Please check your network and try reconnecting."
     );
 
+    rendered.unmount();
+  });
+
+  it("resets retry backoff only after synchronization is healthy", async () => {
+    vi.useFakeTimers();
+    const rendered = renderTransport();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    act(() => {
+      FakeWebSocket.instances[0].open();
+      FakeWebSocket.instances[0].serverClose(1006);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    act(() => {
+      FakeWebSocket.instances[1].open();
+      FakeWebSocket.instances[1].serverClose(1006);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(FakeWebSocket.instances).toHaveLength(3);
+
+    act(() => {
+      FakeWebSocket.instances[2].open();
+      rendered.result.current.markHealthy();
+      FakeWebSocket.instances[2].serverClose(1006);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(FakeWebSocket.instances).toHaveLength(4);
     rendered.unmount();
   });
 
