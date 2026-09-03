@@ -5,7 +5,7 @@
  * and parameterized paths.
  */
 
-import type { RouteCatalogEntry } from "../routing/hono-env";
+import type { RouteModule } from "../routing/hono-env";
 import { webhookRoutes } from "../webhooks";
 import { analyticsRoutes } from "./analytics";
 import { auditEventRoutes } from "./audit-events";
@@ -27,64 +27,54 @@ import { reposRoutes } from "./repos";
 import { scmSettingsRoutes } from "./scm-settings";
 import { secretsRoutes } from "./secrets";
 import { sessionRoutes } from "./sessions";
-import { handleSlackNotify } from "./slack-notify";
+import { slackNotifyRoutes } from "./slack-notify";
 import { signInProviderRoutes } from "./sign-in-providers";
 import { skillRoutes } from "./skills";
-import { defineRoute, GITHUB_SANDBOX_FALLBACK_ROUTE, requirePermission } from "./shared";
 
-/**
- * Registration order is the precedence order. A Hono sub-app is mounted where
- * it appears; a legacy route is registered through the catalog adapter.
- */
-export const catalog: RouteCatalogEntry[] = [
+/** Registration order is the precedence order: each module is mounted where it appears. */
+export const catalog: readonly RouteModule[] = [
   healthRoutes,
 
-  ...browserAuthRoutes,
+  browserAuthRoutes,
   signInProviderRoutes,
 
-  // Session management
-  ...sessionRoutes,
-  // Agent-initiated Slack notification (sandbox-authenticated)
-  defineRoute(GITHUB_SANDBOX_FALLBACK_ROUTE, {
-    method: "POST",
-    path: "/sessions/:id/slack-notify",
-    authorization: requirePermission("sessions.collaborate"),
-    handler: handleSlackNotify,
-  }),
+  // Session management, then the agent-initiated Slack notification
+  sessionRoutes,
+  slackNotifyRoutes,
 
   // Repository management
-  ...reposRoutes,
+  reposRoutes,
 
   // Secrets
-  ...secretsRoutes,
+  secretsRoutes,
 
   // Environments (Phase-2 session target; internal-HMAC only, web BFF proxied)
-  ...environmentRoutes,
-  ...environmentSecretsRoutes,
+  environmentRoutes,
+  environmentSecretsRoutes,
 
   // Image builds (scope-generic)
-  ...imageBuildRoutes,
+  imageBuildRoutes,
 
   // Model preferences
   modelPreferencesRoutes,
 
   // Subscription provider account management and sandbox access broker
-  ...modelProviderAccountRoutes,
+  modelProviderAccountRoutes,
 
   // Integration settings
-  ...integrationSettingsRoutes,
+  integrationSettingsRoutes,
 
   // Deployment-wide commit signing identity
-  ...commitSigningRoutes,
+  commitSigningRoutes,
 
   // SCM (source-control) settings
-  ...scmSettingsRoutes,
+  scmSettingsRoutes,
 
   // Automations
-  ...automationRoutes,
+  automationRoutes,
 
   // MCP servers
-  ...mcpServerRoutes,
+  mcpServerRoutes,
 
   // Analytics
   analyticsRoutes,
@@ -93,17 +83,17 @@ export const catalog: RouteCatalogEntry[] = [
   auditEventRoutes,
 
   // Pull request feedback Autofix activity
-  ...autofixRoutes,
+  autofixRoutes,
 
   // Installation-wide managed skills and personal profiles
-  ...skillRoutes,
+  skillRoutes,
 
   // Personal keyboard shortcuts
   keyboardShortcutRoutes,
 
   // Workspace roles, members, and current-user authorization
-  ...rbacRoutes,
+  rbacRoutes,
 
   // Webhooks (public routes — auth handled per-route)
-  ...webhookRoutes,
+  webhookRoutes,
 ];

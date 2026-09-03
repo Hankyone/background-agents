@@ -2,16 +2,25 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { HttpError, json } from "../http/responses";
 import { TEST_SERVICE_SECRETS } from "../router.test-support";
 import { createTestBackgroundTasks } from "../background-tasks.test-support";
-import { defineRoute, NO_AUTHORIZATION, type Route } from "../routes/shared";
+import { NO_AUTHORIZATION } from "../routes/shared";
+import type { RequestContext } from "../http/request-context";
 import type { Env } from "../types";
 import { Hono } from "hono";
-import { admit } from "./admit";
-import { createControlPlaneApp, type ControlPlaneHonoEnv, type ControlPlaneHost } from "./hono-app";
+import { admit, type AdmissionPolicy, dispatch } from "./admit";
+import {
+  createControlPlaneApp,
+  type ControlPlaneHonoEnv,
+  type ControlPlaneHost,
+  type RouteModule,
+} from "./hono-app";
 
 const PUBLIC = { authentication: { kind: "public" }, supportedScmProviders: "all" } as const;
 
-function publicRoute(path: string, handler: Route["handler"]): Route {
-  return defineRoute(PUBLIC, { method: "GET", path, authorization: NO_AUTHORIZATION, handler });
+/** A module with one public GET route, for lifecycle tests. */
+function publicRoute(path: string, handler: () => Promise<Response>): RouteModule {
+  const module = new Hono<ControlPlaneHonoEnv>();
+  module.get(path, admit({ ...PUBLIC, authorization: NO_AUTHORIZATION }), handler);
+  return module;
 }
 
 const tasks = createTestBackgroundTasks();
@@ -110,17 +119,23 @@ describe("control-plane Hono app lifecycle", () => {
 
   it("finalizes a failure inside admission with the route's response policy", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
-    const route: Route = {
-      ...publicRoute("/sessions/:id/tunnel-urls", async () => json({ ok: true })),
-      authentication: {
-        kind: "sandbox",
-        getSessionId: () => {
-          throw new Error("identity lookup failed");
+    const module = new Hono<ControlPlaneHonoEnv>();
+    module.get(
+      "/sessions/:id/tunnel-urls",
+      admit({
+        authentication: {
+          kind: "sandbox",
+          getSessionId: () => {
+            throw new Error("identity lookup failed");
+          },
         },
-      },
-      cacheControl: "no-store",
-    };
-    const app = createControlPlaneApp([route], host);
+        supportedScmProviders: "all",
+        authorization: NO_AUTHORIZATION,
+        cacheControl: "no-store",
+      }),
+      () => json({ ok: true })
+    );
+    const app = createControlPlaneApp([module], host);
 
     const response = await app.fetch(new Request("https://cp.test/sessions/s-1/tunnel-urls"), env);
     expect(response.status).toBe(500);
@@ -157,6 +172,48 @@ describe("control-plane Hono app lifecycle", () => {
     });
     expect(body.requestId).toBe(response.headers.get("x-request-id"));
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
+
+  it("hands a dispatched handler the admitted request, Hono's parameters, and the context", async () => {
+    const module = new Hono<ControlPlaneHonoEnv>();
+    const handler = vi.fn(
+      async (request: Request, _env: Env, params: { id: string }, ctx: RequestContext) =>
+        json({ id: params.id, url: request.url, requestId: ctx.request_id })
+    );
+    module.get("/module/:id", admit({ ...PUBLIC, authorization: NO_AUTHORIZATION }), (c) =>
+      dispatch(c, handler)
+    );
+    const app = createControlPlaneApp([module], host);
+
+    const response = await app.fetch(new Request("https://cp.test/module/m%2D1?x=1"), env);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ id: "m-1", url: "https://cp.test/module/m%2D1?x=1" });
+    expect(body.requestId).toBe(response.headers.get("x-request-id"));
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a parameter Hono could not decode before admission or the handler run", async () => {
+    const handler = vi.fn(async () => json({ ok: true }));
+    const module = new Hono<ControlPlaneHonoEnv>();
+    module.get("/module/:id", admit({ ...PUBLIC, authorization: NO_AUTHORIZATION }), (c) =>
+      dispatch(c, handler)
+    );
+    const app = createControlPlaneApp([module], host);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const response = await app.fetch(new Request("https://cp.test/module/%E0%A4%A"), env);
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "Invalid path encoding" });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(response.headers.get("x-request-id")).toBeTruthy();
+    expect(handler).not.toHaveBeenCalled();
+    expect(loggedEvents(log).map((event) => event.http_status)).toEqual([400]);
+
+    // A well-formed escape still reaches the handler decoded.
+    const decoded = await app.fetch(new Request("https://cp.test/module/%2541"), env);
+    expect(decoded.status).toBe(200);
+    expect(handler).toHaveBeenCalledOnce();
   });
 
   it("refuses a module whose route does not begin with admit(), before any request can run", () => {
@@ -200,18 +257,12 @@ describe("control-plane Hono app lifecycle", () => {
   });
 
   it("refuses to build a principal-less route that requires authorization", () => {
-    const route = {
-      ...publicRoute("/broken", async () => json({})),
+    const policy = {
+      ...PUBLIC,
       authorization: { kind: "authenticated", auditAllowed: false },
-    } as Route;
-    expect(() => createControlPlaneApp([route], host)).toThrow(
+    } as AdmissionPolicy;
+    expect(() => admit(policy)).toThrow(
       "Route without a verified principal cannot require authorization"
     );
-  });
-
-  it("refuses a route path outside the literal-or-parameter grammar", () => {
-    expect(() =>
-      createControlPlaneApp([publicRoute("/files/*", async () => json({}))], host)
-    ).toThrow("outside the supported grammar");
   });
 });
