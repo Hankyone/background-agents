@@ -8,6 +8,7 @@
  * - Enabled-scope and status queries
  */
 
+import { bodyIssue, parseBody } from "./body";
 import { Hono } from "hono";
 import { admit, dispatch } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
@@ -48,10 +49,10 @@ import {
   SCM_AGNOSTIC_HANDLER_AUTHENTICATED_ROUTE,
   error,
   json,
-  parseJsonBody,
   NO_AUTHORIZATION,
   requirePermission,
 } from "./shared";
+import { parseQuery } from "./query";
 
 const logger = createLogger("router:image-builds");
 const MAX_CALLBACK_BODY_BYTES = 16 * 1024;
@@ -69,7 +70,7 @@ const buildCompleteBodySchema = z.object({
   provider_session_id: z.string().min(1),
   repository_shas: z.array(repositoryShaEntrySchema).min(1),
   runtime_version: z.string().refine((value) => parseRuntimeVersionNumber(value) !== null, {
-    message: "must start with v<number>",
+    error: "must start with v<number>",
   }),
   // Must stay finite: Infinity would be canonicalized to null by
   // JSON.stringify inside the completion hash and the persisted row. Capped
@@ -163,11 +164,7 @@ function parseCallbackBody<Schema extends z.ZodType>(
   body: unknown
 ): z.infer<Schema> | Response {
   const parsed = schema.safeParse(body);
-  if (parsed.success) return parsed.data;
-
-  const issue = parsed.error.issues[0];
-  const path = issue.path.join(".");
-  return error(path ? `${path}: ${issue.message}` : issue.message, 400);
+  return parsed.success ? parsed.data : error(bodyIssue(parsed.error), 400);
 }
 
 /**
@@ -177,6 +174,7 @@ function parseCallbackBody<Schema extends z.ZodType>(
 async function handleBuildComplete(
   request: Request,
   env: Env,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   const body = await readCallbackBody(request);
@@ -212,6 +210,7 @@ async function handleBuildComplete(
 async function handleBuildFailed(
   request: Request,
   env: Env,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   const body = await readCallbackBody(request);
@@ -279,7 +278,6 @@ async function handleTriggerEnvironmentBuild(
   if (providerError) return providerError;
 
   const environmentId = params.id;
-  if (!environmentId) return error("Environment ID required", 400);
 
   return triggerBuildForScope(env, { kind: "environment", id: environmentId }, ctx);
 }
@@ -323,13 +321,12 @@ async function handleToggleRepoImageBuilds(
   if (repository instanceof Response) return repository;
   const { owner, name } = repository;
 
-  const rawBody = await parseJsonBody<unknown>(request);
-  if (rawBody instanceof Response) return rawBody;
-  const parsedBody = toggleRepoImageBuildsBodySchema.safeParse(rawBody);
-  if (!parsedBody.success) {
-    return error("enabled must be a boolean", 400);
-  }
-  const body = parsedBody.data;
+  const body = await parseBody(
+    request,
+    toggleRepoImageBuildsBodySchema,
+    "enabled must be a boolean"
+  );
+  if (body instanceof Response) return body;
 
   const scope = repoImageBuildScope(owner, name);
 
@@ -373,18 +370,28 @@ async function handleToggleRepoImageBuilds(
   return json({ ok: true, enabled: body.enabled });
 }
 
+const SCOPE_KIND_ERROR = "scope_kind must be 'repo' or 'environment'";
+
+/** A scope is either wholly absent or a `scope_kind` with a non-empty `scope_id`. */
+const scopeQuerySchema = z
+  .object({
+    scope_kind: z.enum(["repo", "environment"], { error: SCOPE_KIND_ERROR }).optional(),
+    scope_id: z.string().optional(),
+  })
+  .superRefine((query, context) => {
+    if (query.scope_kind === undefined && query.scope_id === undefined) return;
+    if (query.scope_kind === undefined) {
+      context.addIssue({ code: "custom", message: SCOPE_KIND_ERROR });
+    } else if (!query.scope_id) {
+      context.addIssue({ code: "custom", message: "scope_id is required with scope_kind" });
+    }
+  });
+
 function parseScopeParams(request: Request): ImageBuildScope | null | Response {
-  const params = new URL(request.url).searchParams;
-  const scopeKind = params.get("scope_kind");
-  const scopeId = params.get("scope_id");
-  if (scopeKind === null && scopeId === null) return null;
-  if (scopeKind !== "repo" && scopeKind !== "environment") {
-    return error("scope_kind must be 'repo' or 'environment'", 400);
-  }
-  if (!scopeId) {
-    return error("scope_id is required with scope_kind", 400);
-  }
-  return { kind: scopeKind, id: scopeId };
+  const query = parseQuery(request, scopeQuerySchema);
+  if (query instanceof Response) return query;
+  if (query.scope_kind === undefined || query.scope_id === undefined) return null;
+  return { kind: query.scope_kind, id: query.scope_id };
 }
 
 async function readStatusRows(
@@ -405,7 +412,12 @@ async function readStatusRows(
  * `ImageBuildRecordView`, so no storage encoding, callback token, or provider
  * id reaches a client.
  */
-async function handleGetStatus(request: Request, env: Env, ctx: RequestContext): Promise<Response> {
+async function handleGetStatus(
+  request: Request,
+  env: Env,
+  _params: object,
+  ctx: RequestContext
+): Promise<Response> {
   const providerError = requireImageBuilds(env);
   if (providerError) return providerError;
 
@@ -433,6 +445,7 @@ async function handleGetStatus(request: Request, env: Env, ctx: RequestContext):
 async function handleGetEnabledUnits(
   _request: Request,
   env: Env,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   const providerError = requireImageBuilds(env);
@@ -466,6 +479,7 @@ async function handleGetEnabledUnits(
 async function handleGetEnabledRepos(
   _request: Request,
   env: Env,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   const providerError = requireImageBuilds(env);
@@ -499,10 +513,10 @@ const IMAGE_BUILDS_READ = admit({
 export const imageBuildRoutes = new Hono<ControlPlaneHonoEnv>();
 
 imageBuildRoutes.post("/image-builds/build-complete", BUILD_CALLBACK, (c) =>
-  handleBuildComplete(c.var.admitted.request, c.env, c.var.admitted.ctx)
+  dispatch(c, handleBuildComplete)
 );
 imageBuildRoutes.post("/image-builds/build-failed", BUILD_CALLBACK, (c) =>
-  handleBuildFailed(c.var.admitted.request, c.env, c.var.admitted.ctx)
+  dispatch(c, handleBuildFailed)
 );
 imageBuildRoutes.post(
   "/image-builds/trigger/environment/:id",
@@ -519,11 +533,11 @@ imageBuildRoutes.put("/image-builds/toggle/repo/:owner/:name", REPO_IMAGES_MANAG
   dispatch(c, handleToggleRepoImageBuilds)
 );
 imageBuildRoutes.get("/image-builds/status", IMAGE_BUILDS_READ, (c) =>
-  handleGetStatus(c.var.admitted.request, c.env, c.var.admitted.ctx)
+  dispatch(c, handleGetStatus)
 );
 imageBuildRoutes.get("/image-builds/enabled", IMAGE_BUILDS_READ, (c) =>
-  handleGetEnabledUnits(c.var.admitted.request, c.env, c.var.admitted.ctx)
+  dispatch(c, handleGetEnabledUnits)
 );
 imageBuildRoutes.get("/image-builds/enabled-repos", IMAGE_BUILDS_READ, (c) =>
-  handleGetEnabledRepos(c.var.admitted.request, c.env, c.var.admitted.ctx)
+  dispatch(c, handleGetEnabledRepos)
 );
