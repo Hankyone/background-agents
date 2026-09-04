@@ -133,6 +133,7 @@ import { createSessionRuntimeClientForTrace } from "./runtime-client";
 import { SessionTitleService } from "./title-service";
 import { parseArtifactMetadata } from "./artifact-metadata";
 import { AuthorizationError, AuthorizationService } from "../authorization/service";
+import type { SessionWebSocket } from "../platform-ports";
 
 /**
  * Timeout for WebSocket authentication (in milliseconds).
@@ -150,7 +151,7 @@ const WS_AUTH_TIMEOUT_MS = 30000; // 30 seconds
  */
 export interface SessionRuntime {
   readonly log: Logger;
-  readonly server: SessionServer<WebSocket, ClientInfo>;
+  readonly server: SessionServer<SessionWebSocket, ClientInfo>;
   /** Admission of WebSocket upgrades; the host completes the handshake and attaches its socket. */
   readonly upgrades: SessionUpgradeAdmission;
   readonly alarms: {
@@ -169,6 +170,7 @@ export interface SessionRuntime {
  */
 export interface SessionComponents {
   sandboxRepository: SandboxRepository;
+  wsManager: SessionWebSocketManager;
   /**
    * Assignable — the setter swaps the underlying cell for tests. Substitution
    * swaps operations only: the provider NAME was captured at construction and
@@ -770,11 +772,12 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
     nowMs: () => Date.now(),
     monotonicNowMs: () => performance.now(),
   };
-  const sockets: SocketRegistry<WebSocket, ClientInfo> = {
+  const sockets: SocketRegistry<SessionWebSocket, ClientInfo> = {
     classify: (ws) => wsManager.classify(ws),
     send: (ws, message) => wsManager.send(ws, message),
     getClient: (ws) => connectionAuthenticator.getClientInfo(ws),
     close: (ws, code, reason) => wsManager.close(ws, code, reason),
+    isActiveSandbox: (ws) => wsManager.isActiveSandboxSocket(ws),
     clearSandboxIfMatch: (ws) => wsManager.clearSandboxSocketIfMatch(ws),
     removeClient: (ws) => wsManager.removeClient(ws),
     hasParticipant: (participantId) =>
@@ -797,7 +800,7 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
     broadcast: (message) => messenger.broadcast(message),
   };
 
-  const server = new SessionServer<WebSocket, ClientInfo>({
+  const server = new SessionServer<SessionWebSocket, ClientInfo>({
     http: new SessionHttpDispatcher({ log, routes, clock }),
     messages: new SessionMessageRouter({
       log,
@@ -825,6 +828,7 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
 
   const components: SessionComponents = {
     sandboxRepository,
+    wsManager,
     // Accessor pair over the local cell: production reads never go through
     // this property; the setter is the live-DO integration seam.
     get sourceControlProvider() {

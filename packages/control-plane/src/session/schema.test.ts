@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { applyMigrations, initSchema, MIGRATIONS, SCHEMA_SQL } from "./schema";
 import type { SqlResult, SqlStorage } from "./sql-storage";
-import { createNodeSqlStorage } from "../../test/conformance/node-sqlite-storage";
+import { createNodeSqlStorage } from "../node/sqlite-storage";
 
 /**
  * Create a mock SqlStorage that tracks calls and supports per-query data.
@@ -271,6 +271,13 @@ describe("applyMigrations", () => {
         "ws_client_mapping ADD COLUMN authorization_expires_at INTEGER NOT NULL DEFAULT 0"
       ),
     ]);
+  });
+
+  it("adds sandbox.active_socket_id for fresh and migrated DOs", () => {
+    expect(SCHEMA_SQL).toContain("active_socket_id TEXT");
+
+    const migration = MIGRATIONS.find((entry) => entry.id === 48);
+    expect(migration?.run).toBe("ALTER TABLE sandbox ADD COLUMN active_socket_id TEXT");
   });
 
   it("keeps repository context consistent at the session table boundary", () => {
