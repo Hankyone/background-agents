@@ -195,3 +195,12 @@ jobs:
           if [ -n "${BOT_USERNAME:-}" ]; then
             gh pr comment "$PUSH_BLOCKED_BRANCH" --body "@${BOT_USERNAME} please sync this fork with upstream \`$UPSTREAM_BRANCH\` at \`$upstream_sha\`, preserving our Cloudflare web-hosting and upstream-sync customizations. This handoff exists because GitHub Actions could not push upstream workflow-file changes with the default token."
           fi
+
+      # GitHub disables scheduled workflows after 60 days without repository activity.
+      # While a conflict PR waits, this workflow makes no commits, so re-enable it on
+      # every run to reset that clock. Uses GITHUB_TOKEN because it has actions: write.
+      - name: Keep this workflow enabled
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/sync-upstream.yml/enable"
