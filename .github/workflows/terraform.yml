@@ -473,29 +473,6 @@ jobs:
             -backend-config="endpoints={s3=\"https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com\"}"
         working-directory: ${{ env.TF_WORKING_DIR }}
 
-      - name: Clear custom domain DNS records
-        run: |
-          if [ "$WEB_PLATFORM" != "cloudflare" ] || [ -z "$CUSTOM_DOMAIN" ]; then
-            exit 0
-          fi
-
-          records="$(curl -fsS \
-            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?name=$CUSTOM_DOMAIN" \
-            | jq -r '.result[] | select(.type == "A" or .type == "AAAA" or .type == "CNAME") | .id')"
-
-          for record_id in $records; do
-            curl -fsS -X DELETE \
-              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$record_id" \
-              >/dev/null
-          done
-        env:
-          WEB_PLATFORM: ${{ vars.WEB_PLATFORM || secrets.WEB_PLATFORM }}
-          CUSTOM_DOMAIN: ${{ vars.CLOUDFLARE_CUSTOM_DOMAIN || secrets.CLOUDFLARE_CUSTOM_DOMAIN || secrets.CUSTOM_DOMAIN }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID || secrets.CLOUDFLARE_ZONE_ID }}
-
       - name: Stage SchedulerDO deletion migration
         run: |
           set -euo pipefail
