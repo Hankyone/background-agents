@@ -1,6 +1,8 @@
 import type { NextRequest } from "next/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("server-only", () => ({}));
+
 import type * as SandboxProviderModuleNamespace from "@/lib/sandbox-provider";
 
 type SandboxProviderModule = typeof SandboxProviderModuleNamespace;
@@ -41,7 +43,14 @@ const routes = [
   },
   {
     name: "PUT /api/image-builds/repo/[owner]/[name]/toggle",
-    call: () => toggleBuild({ json: async () => ({ enabled: true }) } as NextRequest, params),
+    call: () =>
+      toggleBuild(
+        {
+          cookies: { getAll: () => [{ name: "openinspect.session_token", value: "test-session" }] },
+          json: async () => ({ enabled: true }),
+        } as NextRequest,
+        params
+      ),
   },
 ];
 
@@ -85,6 +94,7 @@ describe.each(routes)("$name", ({ call }) => {
 
     expect(response.status).toBe(200);
     expect(controlPlaneUserFetch).toHaveBeenCalled();
+    expect(getServerAuthSession).not.toHaveBeenCalled();
   });
 });
 
@@ -182,6 +192,52 @@ describe("GET /api/image-builds feed", () => {
     });
   });
 
+  it("serves the deployment's admission state alongside the toggles", async () => {
+    vi.mocked(controlPlaneUserFetch).mockImplementation(async (path: string) => {
+      if (path === "/image-builds/enabled") {
+        return Response.json({
+          units: [],
+          admission: { open: false, reason: "daytona_prebuilds_disabled" },
+        });
+      }
+      if (path === "/image-builds/enabled-repos") return Response.json({ repos: [] });
+      return Response.json({ images: [] });
+    });
+
+    const response = await getFeed();
+
+    await expect(response.json()).resolves.toMatchObject({
+      admission: { open: false, reason: "daytona_prebuilds_disabled" },
+    });
+  });
+
+  it("drops rows another provider built", async () => {
+    const otherProviderRow = {
+      id: "build-old",
+      scopeKind: "repo",
+      scopeId: "acme/web",
+      provider: "daytona",
+      status: "ready",
+      repositoriesFingerprint: "fp-repo",
+      repositoryShas: [],
+      runtimeVersion: "60",
+      buildDurationSeconds: 10,
+      errorMessage: null,
+      createdAt: 1700000000000,
+    };
+    vi.mocked(controlPlaneUserFetch).mockImplementation(async (path: string) => {
+      if (path === "/image-builds/enabled") return Response.json({ units: [] });
+      if (path === "/image-builds/enabled-repos") return Response.json({ repos: [] });
+      return Response.json({ images: [otherProviderRow] });
+    });
+
+    const response = await getFeed();
+
+    // The deployment runs on modal here; a retained Daytona row is history,
+    // not a prebuild this deployment can boot.
+    await expect(response.json()).resolves.toMatchObject({ images: [] });
+  });
+
   it("filters superseded rows at the fetch boundary", async () => {
     vi.mocked(controlPlaneUserFetch).mockImplementation(async (path: string) => {
       if (path === "/image-builds/enabled") return Response.json({ units: [] });
@@ -268,7 +324,13 @@ describe("proxied control-plane paths", () => {
   });
 
   it("toggle puts to the unified repo toggle route", async () => {
-    await toggleBuild({ json: async () => ({ enabled: true }) } as NextRequest, params);
+    await toggleBuild(
+      {
+        cookies: { getAll: () => [{ name: "openinspect.session_token", value: "test-session" }] },
+        json: async () => ({ enabled: true }),
+      } as NextRequest,
+      params
+    );
 
     expect(controlPlaneUserFetch).toHaveBeenCalledWith("/image-builds/toggle/repo/acme/web", {
       method: "PUT",
@@ -277,9 +339,15 @@ describe("proxied control-plane paths", () => {
   });
 
   it("toggle preserves nested namespace owners as one encoded route segment", async () => {
-    await toggleBuild({ json: async () => ({ enabled: false }) } as NextRequest, {
-      params: Promise.resolve({ owner: "group/subgroup", name: "web" }),
-    });
+    await toggleBuild(
+      {
+        cookies: { getAll: () => [{ name: "openinspect.session_token", value: "test-session" }] },
+        json: async () => ({ enabled: false }),
+      } as NextRequest,
+      {
+        params: Promise.resolve({ owner: "group/subgroup", name: "web" }),
+      }
+    );
 
     expect(controlPlaneUserFetch).toHaveBeenCalledWith(
       "/image-builds/toggle/repo/group%2Fsubgroup/web",

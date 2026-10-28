@@ -10,8 +10,17 @@ export {
   slackChannelLabel,
   SLACK_TEXT_MAX_LENGTH,
 } from "./normalizer";
-export type { SlackMessageInput, SlackChannelMeta } from "./normalizer";
-export { slackConditions, REGEX_PATTERN_MAX_LENGTH, ALLOWED_REGEX_FLAGS } from "./conditions";
+export type { SlackMessageAuthor, SlackMessageInput, SlackChannelMeta } from "./normalizer";
+export {
+  slackConditions,
+  hasValidSlackChannelCondition,
+  hasSlackActorIncludeList,
+  normalizeSlackChannelConditions,
+  parseSlackChannelCondition,
+  REGEX_PATTERN_MAX_LENGTH,
+  ALLOWED_REGEX_FLAGS,
+} from "./conditions";
+export type { SlackChannelConditionParseResult } from "./conditions";
 
 export const slackSource: TriggerSourceDefinition = {
   source: "slack",

@@ -1,15 +1,21 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket as NodeWebSocket } from "ws";
 import { NO_AUTHORIZATION } from "../routes/shared";
 import { admit } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
+import { PersistedAlarmDeadlineStore } from "../session/alarm/scheduler";
+import { CACHE_STORE_FILE } from "./cache-database";
 import { DEFAULT_MIGRATIONS_DIR, type NodeHostSettings } from "./config";
+import { HOST_STATE_FILE } from "./crash-recovery";
+import { openHostAlarmIndex } from "./host-alarm-index";
 import { GLOBAL_STORE_FILE, startNodeHost, type NodeHost, type NodeHostOptions } from "./host";
+import { JOB_STORE_FILE } from "./job-store";
 import type { HealthReport } from "./http-server";
+import { openSessionStore } from "./session-store";
 
 const KEY = Buffer.alloc(32, 7).toString("base64");
 
@@ -24,8 +30,34 @@ const CONFIG = {
 
 const OBJECT_STORAGE = { bucket: "media", region: "us-east-1" };
 
+/** A public route that writes to the cache, so the cache file has a WAL to close. */
+function cacheWritingRoute(): Hono<ControlPlaneHonoEnv>[] {
+  const routes = new Hono<ControlPlaneHonoEnv>();
+  routes.get(
+    "/cache-write",
+    admit({
+      authentication: { kind: "public" },
+      supportedScmProviders: "all",
+      authorization: NO_AUTHORIZATION,
+    }),
+    async (c) => {
+      await c.env.REPOS_CACHE.put("host-test", "written");
+      return Response.json({ written: true });
+    }
+  );
+  return [routes];
+}
+
 /** A public route that answers once `release` is called, for shutdown against work in flight. */
-function blockingRoute(): { routes: Hono<ControlPlaneHonoEnv>[]; release: () => void } {
+function blockingRoute(): {
+  routes: Hono<ControlPlaneHonoEnv>[];
+  entered: Promise<void>;
+  release: () => void;
+} {
+  let markEntered!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    markEntered = resolve;
+  });
   let release!: () => void;
   const held = new Promise<void>((resolve) => {
     release = resolve;
@@ -39,11 +71,12 @@ function blockingRoute(): { routes: Hono<ControlPlaneHonoEnv>[]; release: () => 
       authorization: NO_AUTHORIZATION,
     }),
     async () => {
+      markEntered();
       await held;
       return Response.json({ released: true });
     }
   );
-  return { routes: [routes], release };
+  return { routes: [routes], entered, release };
 }
 
 describe("startNodeHost", () => {
@@ -69,6 +102,12 @@ describe("startNodeHost", () => {
     });
   };
 
+  const marker = (): { indexedThroughMs: number; cleanShutdown: boolean } =>
+    JSON.parse(readFileSync(join(dataDir, HOST_STATE_FILE), "utf8")) as {
+      indexedThroughMs: number;
+      cleanShutdown: boolean;
+    };
+
   afterEach(async () => {
     await host?.shutdown();
     host = null;
@@ -89,8 +128,10 @@ describe("startNodeHost", () => {
       sessions_resident: 0,
       alarm_clock: "running",
       cron: "running",
+      jobs: { poller: "running", pending: 0, running: 0, dead: 0, oldestRunnableLagMs: null },
     });
     expect(report.migrations_applied).toBeGreaterThan(0);
+    expect(existsSync(join(dataDir, JOB_STORE_FILE))).toBe(true);
 
     const missing = await fetch(`${base}/no-such-route`);
     expect(missing.status).toBe(404);
@@ -113,6 +154,19 @@ describe("startNodeHost", () => {
     expect(await rejection("/sessions/unknown/events")).toBe("Unexpected server response: 400");
   });
 
+  it("closes the cache database on a normal shutdown, not only on a failed boot", async () => {
+    host = await start({ routes: cacheWritingRoute() });
+    await fetch(`http://127.0.0.1:${host.address.port}/cache-write`);
+    // An open connection holds its write-ahead log; a closed one checkpoints
+    // and removes it, so the sidecar file is the observable for the close.
+    expect(existsSync(join(dataDir, `${CACHE_STORE_FILE}-wal`))).toBe(true);
+
+    await host.shutdown();
+    host = null;
+
+    expect(existsSync(join(dataDir, `${CACHE_STORE_FILE}-wal`))).toBe(false);
+  });
+
   it("reports draining once a shutdown begins and stops listening when it ends", async () => {
     host = await start();
     const base = `http://127.0.0.1:${host.address.port}`;
@@ -126,15 +180,12 @@ describe("startNodeHost", () => {
   });
 
   it("waits for a request in flight before closing the stores, and answers it", async () => {
-    const { routes, release } = blockingRoute();
+    const { routes, entered, release } = blockingRoute();
     host = await start({ routes });
     const base = `http://127.0.0.1:${host.address.port}`;
 
     const blocked = fetch(`${base}/block`);
-    await vi.waitFor(async () => {
-      // The request has reached the handler once a second one is admitted behind it.
-      expect((await fetch(`${base}/healthz`)).status).toBe(200);
-    });
+    await entered;
     const stopping = host.shutdown();
     await new Promise((resolve) => setTimeout(resolve, 50));
     // Not closed underneath the handler: the shutdown is still waiting.
@@ -170,9 +221,44 @@ describe("startNodeHost", () => {
     const report = await host.shutdown();
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(150);
     expect(report).toEqual({ clean: false, abandoned: ["http_requests:1"] });
+    // No clean marker: the handler that outlived the budget could still have
+    // armed a deadline, so the next boot goes looking for it.
+    expect(marker()).toMatchObject({ cleanShutdown: false });
     // The connection was cut at the end; the peer sees no answer.
     await expect(blocked).rejects.toThrow();
     host = null;
+  });
+
+  it("marks a stop that abandoned nothing as clean", async () => {
+    host = await start();
+    // Running, the marker says nothing about a clean stop.
+    expect(marker()).toMatchObject({ cleanShutdown: false });
+
+    await host.shutdown();
+    host = null;
+
+    expect(marker()).toEqual({ indexedThroughMs: expect.any(Number), cleanShutdown: true });
+  });
+
+  it("arms a deadline a previous process left only in the session file", async () => {
+    dataDir = mkdtempSync(join(tmpdir(), "node-host-"));
+    // The session committed its deadline and the process died before the row
+    // reached the index. Far enough out that the clock only arms a timer.
+    const deadline = Date.now() + 60 * 60 * 1000;
+    const session = openSessionStore({ dataDir, sessionId: "stranded" });
+    new PersistedAlarmDeadlineStore(session.storage.sql).setPending(deadline);
+    session.close();
+
+    host = await start();
+    await host.shutdown();
+    host = null;
+
+    const index = openHostAlarmIndex(dataDir);
+    try {
+      expect(index.get("stranded")).toBe(deadline);
+    } finally {
+      index.close();
+    }
   });
 
   it("fails to boot on a malformed encryption key with the Worker's message, leaving nothing open", async () => {

@@ -1,12 +1,7 @@
-import {
-  DEFAULT_ENABLED_MODELS,
-  MODEL_OPTIONS,
-  normalizeValidModels,
-} from "@open-inspect/shared/models";
+import { MODEL_OPTIONS, normalizeValidModels, type ValidModel } from "@open-inspect/shared/models";
 import type { Env } from "../types";
 import { signedControlPlaneFetch } from "../internal-auth";
 import type { ModelOption } from "./slack-types";
-import { getSlackSettings } from "../slack-settings";
 
 const ALL_MODELS = MODEL_OPTIONS.flatMap((group) =>
   group.models.map((model) => ({
@@ -15,45 +10,46 @@ const ALL_MODELS = MODEL_OPTIONS.flatMap((group) =>
   }))
 );
 
+export const MODEL_PREFERENCES_UNAVAILABLE_MESSAGE =
+  "Model preferences are temporarily unavailable. Please try again.";
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function getDefaultModelOptions(): ModelOption[] {
-  const defaultSet = new Set<string>(DEFAULT_ENABLED_MODELS);
-  const defaultOptions = ALL_MODELS.filter((model) => defaultSet.has(model.value));
-  return defaultOptions.length > 0 ? defaultOptions : ALL_MODELS;
-}
-
-export async function getAvailableModels(env: Env, traceId?: string): Promise<ModelOption[]> {
-  try {
-    const url = "https://internal/model-preferences";
-    const response = await signedControlPlaneFetch(env, { method: "GET", url, traceId });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (
-        isObject(data) &&
-        Array.isArray(data.enabledModels) &&
-        data.enabledModels.every((id): id is string => typeof id === "string")
-      ) {
-        const enabledSet = new Set(normalizeValidModels(data.enabledModels));
-        const enabledModels = ALL_MODELS.filter((model) => enabledSet.has(model.value));
-        if (enabledModels.length > 0) {
-          return enabledModels;
-        }
-      }
-    }
-  } catch {
-    // Fall through to defaults
-  }
-
-  return getDefaultModelOptions();
-}
-
-export async function getSlackDefaultModel(
+export async function getAuthoritativeModels(
   env: Env,
   traceId?: string
-): Promise<string | undefined> {
-  return (await getSlackSettings(env, traceId)).defaultModel;
+): Promise<ValidModel[] | null> {
+  try {
+    const response = await signedControlPlaneFetch(env, {
+      method: "GET",
+      url: "https://internal/model-preferences?strict=true",
+      traceId,
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    if (
+      !isObject(data) ||
+      !Array.isArray(data.enabledModels) ||
+      !data.enabledModels.every((id): id is string => typeof id === "string")
+    ) {
+      return null;
+    }
+    const enabledModels = normalizeValidModels(data.enabledModels);
+    return enabledModels.length > 0 ? enabledModels : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Null means enablement is unknown, not that a configured model is disabled. */
+export async function getAvailableModels(
+  env: Env,
+  traceId?: string
+): Promise<ModelOption[] | null> {
+  const enabledModels = await getAuthoritativeModels(env, traceId);
+  if (!enabledModels) return null;
+  const enabledSet = new Set<ValidModel>(enabledModels);
+  return ALL_MODELS.filter((model) => enabledSet.has(model.value));
 }

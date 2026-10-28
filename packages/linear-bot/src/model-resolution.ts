@@ -4,9 +4,17 @@
 
 import type { TeamRepoMapping, StaticTargetConfig } from "./types";
 import {
-  getDefaultReasoningEffort,
+  DEFAULT_HARNESS,
+  getHarnessReasoningConfig,
+  HARNESS_IDS,
+  isValidHarnessReasoningEffort,
+  type HarnessId,
+} from "@open-inspect/shared/harnesses";
+import {
   getValidModelOrDefault,
-  isValidReasoningEffort,
+  isValidModel,
+  normalizeModelId,
+  type ValidModel,
 } from "@open-inspect/shared/models";
 
 /**
@@ -30,41 +38,39 @@ export function resolveStaticTarget(
   );
 }
 
-const MODEL_LABEL_MAP: Record<string, string> = {
+const MODEL_LABEL_ALIASES = {
   haiku: "anthropic/claude-haiku-4-5",
   sonnet: "anthropic/claude-sonnet-4-5",
   opus: "anthropic/claude-opus-4-5",
-  "opus-4-6": "anthropic/claude-opus-4-6",
-  "opus-4-7": "anthropic/claude-opus-4-7",
-  "opus-4-8": "anthropic/claude-opus-4-8",
-  "opus-5": "anthropic/claude-opus-5",
-  "sonnet-5": "anthropic/claude-sonnet-5",
-  fable: "anthropic/claude-fable-5",
-  "fable-5": "anthropic/claude-fable-5",
-  "gpt-5.4": "openai/gpt-5.4",
-  "gpt-5.5": "openai/gpt-5.5",
-  "gpt-5.6-sol": "openai/gpt-5.6-sol",
-  "gpt-5.6-terra": "openai/gpt-5.6-terra",
-  "gpt-5.6-luna": "openai/gpt-5.6-luna",
-  "gpt-5.3-codex": "openai/gpt-5.3-codex",
-};
+  fable: "anthropic/claude-fable-5-1",
+} satisfies Record<string, ValidModel>;
 
 /**
  * Extract model override from issue labels (e.g., "model:opus" → "anthropic/claude-opus-4-5").
  */
-export function extractModelFromLabels(labels: Array<{ name: string }>): string | null {
+export function extractModelFromLabels(labels: Array<{ name: string }>): ValidModel | null {
   for (const label of labels) {
     const match = label.name.match(/^model:(.+)$/i);
     if (match) {
       const key = match[1].toLowerCase();
-      if (MODEL_LABEL_MAP[key]) return MODEL_LABEL_MAP[key];
+      const alias = MODEL_LABEL_ALIASES[key as keyof typeof MODEL_LABEL_ALIASES];
+      if (alias) return alias;
+
+      const candidate =
+        key.startsWith("gpt-") || key.startsWith("claude-") || key.includes("/")
+          ? key
+          : `claude-${key}`;
+      const normalized = normalizeModelId(candidate);
+      if (isValidModel(normalized)) return normalized;
     }
   }
   return null;
 }
 
-export interface ResolveSessionModelInput {
+export interface ResolveSessionAgentInput {
   envDefaultModel: string;
+  /** Configured harness preference; absent means the built-in harness. */
+  configHarness?: HarnessId;
   configModel: string | null;
   configReasoningEffort: string | null;
   allowUserPreferenceOverride: boolean;
@@ -74,7 +80,13 @@ export interface ResolveSessionModelInput {
   labelModel?: string | null;
 }
 
-export function resolveSessionModelSettings(input: ResolveSessionModelInput): {
+/**
+ * Resolve the model (label → user preference → config → env default), its
+ * reasoning effort, and the configured harness. Compatibility is checked by
+ * the webhook handler before session creation.
+ */
+export function resolveSessionAgentSettings(input: ResolveSessionAgentInput): {
+  harness: HarnessId;
   model: string;
   reasoningEffort: string | undefined;
 } {
@@ -92,23 +104,41 @@ export function resolveSessionModelSettings(input: ResolveSessionModelInput): {
   }
 
   const normalizedModel = getValidModelOrDefault(model);
+  const harness = input.configHarness ?? DEFAULT_HARNESS;
+  return {
+    harness,
+    model: normalizedModel,
+    reasoningEffort: resolveReasoningEffort(input, harness, normalizedModel, modelSource),
+  };
+}
 
+function resolveReasoningEffort(
+  input: ResolveSessionAgentInput,
+  harness: HarnessId,
+  model: string,
+  modelSource: "config" | "env" | "user" | "label"
+): string | undefined {
   if (
     input.allowUserPreferenceOverride &&
     input.userReasoningEffort &&
-    isValidReasoningEffort(normalizedModel, input.userReasoningEffort)
+    isValidHarnessReasoningEffort(harness, model, input.userReasoningEffort)
   ) {
-    return { model: normalizedModel, reasoningEffort: input.userReasoningEffort };
+    return input.userReasoningEffort;
   }
 
+  // Preserve a recognized configured effort for launch admission to validate
+  // against the resolved harness; discard malformed or retired values.
+  const configuredEffort = input.configReasoningEffort;
   if (
     modelSource !== "user" &&
     modelSource !== "label" &&
-    input.configReasoningEffort &&
-    isValidReasoningEffort(normalizedModel, input.configReasoningEffort)
+    configuredEffort &&
+    HARNESS_IDS.some((candidate) =>
+      isValidHarnessReasoningEffort(candidate, model, configuredEffort)
+    )
   ) {
-    return { model: normalizedModel, reasoningEffort: input.configReasoningEffort };
+    return configuredEffort;
   }
 
-  return { model: normalizedModel, reasoningEffort: getDefaultReasoningEffort(normalizedModel) };
+  return getHarnessReasoningConfig(harness, model)?.default;
 }

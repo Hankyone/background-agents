@@ -8,7 +8,7 @@
 # are in the context:
 #   docker build -f packages/control-plane/Dockerfile -t open-inspect-control-plane .
 
-FROM node:22-slim AS build
+FROM node:24-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY packages/shared/package.json packages/shared/
@@ -26,7 +26,15 @@ RUN npm run build -w @open-inspect/shared \
 
 FROM litestream/litestream:0.3.13 AS litestream
 
-FROM node:22-slim
+# Debian's trust store, built here so the runtime image gets the bundle without
+# the toolchain that generates it: ca-certificates pulls in openssl and libssl3,
+# which nothing at runtime uses.
+FROM node:24-slim AS certs
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM node:24-slim
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=8787 \
@@ -34,6 +42,14 @@ ENV NODE_ENV=production \
 # The bundle and the migrations sit where they sit in the repository, so the
 # host's default migrations path resolves without MIGRATIONS_DIR being set.
 WORKDIR /app
+# node:24-slim carries no CA bundle, and Node does not need one: it verifies
+# against the roots compiled into it. Litestream is a Go binary and uses the
+# system store, so without this it cannot verify any TLS endpoint -- which
+# means the restore-on-empty-volume path fails against real S3 and works only
+# against a plain-http local object store, the one case the compose stack and
+# the smoke cover. Taken from the stage above rather than from the litestream
+# image, whose own bundle is frozen at that pinned tag.
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=litestream /usr/local/bin/litestream /usr/local/bin/litestream
 COPY --from=build /app/packages/control-plane/dist/node/main.js packages/control-plane/dist/node/main.js
 COPY terraform/d1/migrations/ terraform/d1/migrations/

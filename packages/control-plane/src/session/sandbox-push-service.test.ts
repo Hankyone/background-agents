@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import type { SandboxPushAdmission } from "../sandbox/lifecycle/manager";
 import type { GitPushSpec } from "../source-control";
 import { SandboxPushService } from "./sandbox-push-service";
-import type { SessionWebSocketManager } from "./websocket-manager";
+import type { SandboxCommandTarget, SessionWebSocketManager } from "./websocket-manager";
 
 function createPushSpec(repoOwner: string, repoName: string, targetBranch: string): GitPushSpec {
   return {
@@ -15,10 +16,14 @@ function createPushSpec(repoOwner: string, repoName: string, targetBranch: strin
   };
 }
 
-function createService() {
+function createService(admission: () => SandboxPushAdmission = () => "unmanaged") {
   const sandboxWs = { readyState: WebSocket.OPEN } as WebSocket;
   const wsManager = {
-    getSandboxSocket: vi.fn(() => sandboxWs),
+    getSandboxSocket: vi.fn(() => sandboxWs as WebSocket | null),
+    getSandboxCommandTarget: vi.fn((): SandboxCommandTarget => ({
+      kind: "dispatch",
+      socket: sandboxWs,
+    })),
     send: vi.fn(() => true),
   };
   const log = {
@@ -28,11 +33,111 @@ function createService() {
     error: vi.fn(),
     child: vi.fn(),
   };
-  const service = new SandboxPushService(log, wsManager as unknown as SessionWebSocketManager);
+  const service = new SandboxPushService(
+    log,
+    wsManager as unknown as SessionWebSocketManager,
+    admission
+  );
   return { service, wsManager, log };
 }
 
 describe("SandboxPushService", () => {
+  it("assumes a manual push when no sandbox is attached at all", async () => {
+    const h = createService();
+    h.wsManager.getSandboxSocket.mockReturnValue(null);
+    h.wsManager.getSandboxCommandTarget.mockReturnValue({ kind: "unavailable" });
+
+    const result = await h.service.pushBranchToRemote(createPushSpec("acme", "web", "feature/x"));
+
+    expect(result).toEqual({ success: true });
+    expect(h.wsManager.send).not.toHaveBeenCalled();
+    expect(h.log.info).toHaveBeenCalledWith(
+      "No sandbox connected, assuming branch was pushed manually"
+    );
+  });
+
+  it("rejects a saved managed sandbox instead of assuming a manual push", async () => {
+    const h = createService(() => "start_required");
+    h.wsManager.getSandboxCommandTarget.mockReturnValue({ kind: "unavailable" });
+
+    const result = await h.service.pushBranchToRemote(createPushSpec("acme", "web", "feature/x"));
+
+    expect(result).toEqual({
+      success: false,
+      error: "Sandbox must be started before pushing; retry once ready",
+    });
+    expect(h.wsManager.send).not.toHaveBeenCalled();
+  });
+
+  it.each(["confirmed", "legacy"] as const)(
+    "does not fake a %s managed push while its ready runtime is disconnected",
+    async (lifecyclePolicy) => {
+      const h = createService(() => "ready");
+      h.wsManager.getSandboxCommandTarget.mockReturnValue({ kind: "unavailable" });
+
+      const result = await h.service.pushBranchToRemote(
+        createPushSpec("acme", "web", `feature/${lifecyclePolicy}`)
+      );
+
+      expect(result).toEqual({
+        success: false,
+        error: "Sandbox is disconnected; retry once it is ready",
+      });
+      expect(h.wsManager.send).not.toHaveBeenCalled();
+    }
+  );
+
+  it("pushes through an acknowledged live managed sandbox", async () => {
+    const h = createService(() => "ready");
+
+    const pushing = h.service.pushBranchToRemote(createPushSpec("acme", "web", "feature/live"));
+    h.service.settlePush({
+      type: "push_complete",
+      branchName: "feature/live",
+      repoOwner: "acme",
+      repoName: "web",
+      timestamp: 1_000,
+    });
+
+    await expect(pushing).resolves.toEqual({ success: true });
+    expect(h.wsManager.send).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ type: "push" })
+    );
+  });
+
+  it.each([
+    ["held", "Sandbox graceful shutdown is in progress; push is held"],
+    ["start_required", "Sandbox must be started before pushing; retry once ready"],
+  ] as const)("rejects %s admission before socket fallback", async (admission, error) => {
+    const h = createService(() => admission);
+    h.wsManager.getSandboxCommandTarget.mockReturnValue({ kind: "unavailable" });
+
+    const result = await h.service.pushBranchToRemote(
+      createPushSpec("acme", "web", `feature/${admission}`)
+    );
+
+    expect(result).toEqual({ success: false, error });
+    expect(h.wsManager.getSandboxCommandTarget).not.toHaveBeenCalled();
+    expect(h.wsManager.send).not.toHaveBeenCalled();
+  });
+
+  it("refuses, rather than fakes, a push while the attached sandbox is still booting", async () => {
+    // A bridge attached ahead of its boot has no repository to push from. The
+    // manual-push assumption would let a PR be opened on a branch that was
+    // never pushed; the caller must retry once the sandbox is ready.
+    const h = createService();
+    h.wsManager.getSandboxCommandTarget.mockReturnValue({ kind: "booting", phase: null });
+
+    const result = await h.service.pushBranchToRemote(createPushSpec("acme", "web", "feature/x"));
+
+    expect(result).toEqual({
+      success: false,
+      error: "Sandbox is still starting; retry once it is ready",
+    });
+    expect(h.wsManager.send).not.toHaveBeenCalled();
+  });
+
   it("fails a push immediately when the command cannot be delivered", async () => {
     vi.useFakeTimers();
     try {
@@ -70,6 +175,102 @@ describe("SandboxPushService", () => {
   });
 
   describe("resolver keying", () => {
+    it("rejects a same-key concurrent push after the sandbox disconnects", async () => {
+      const h = createService();
+      const pushSpec = createPushSpec("acme", "web", "feature/test");
+      const firstResult = vi.fn();
+      const first = h.service.pushBranchToRemote(pushSpec).then(firstResult);
+
+      try {
+        h.wsManager.getSandboxCommandTarget.mockReturnValue({ kind: "unavailable" });
+
+        await expect(h.service.pushBranchToRemote(pushSpec)).resolves.toEqual({
+          success: false,
+          error: expect.stringContaining("Push already in flight"),
+        });
+        expect(h.wsManager.send).toHaveBeenCalledTimes(1);
+        expect(firstResult).not.toHaveBeenCalled();
+      } finally {
+        h.service.settlePush({
+          type: "push_complete",
+          branchName: pushSpec.targetBranch,
+          repoOwner: pushSpec.repoOwner,
+          repoName: pushSpec.repoName,
+          timestamp: 1000,
+        });
+        await first;
+      }
+
+      expect(firstResult).toHaveBeenCalledWith({ success: true });
+    });
+
+    it.each(["push_complete", "push_error", "timeout"] as const)(
+      "rejects a same-key concurrent push and preserves the first caller through %s",
+      async (outcome) => {
+        vi.useFakeTimers();
+        try {
+          const h = createService();
+          const pushSpec = createPushSpec("acme", "web", "feature/test");
+          const firstResult = vi.fn();
+          const secondResult = vi.fn();
+          const first = h.service.pushBranchToRemote(pushSpec).then(firstResult);
+          const second = h.service.pushBranchToRemote(pushSpec).then(secondResult);
+          await vi.advanceTimersByTimeAsync(0);
+
+          expect(secondResult).toHaveBeenCalledWith({
+            success: false,
+            error: expect.stringContaining("Push already in flight"),
+          });
+          expect(firstResult).not.toHaveBeenCalled();
+          expect(h.wsManager.send).toHaveBeenCalledTimes(1);
+          expect(vi.getTimerCount()).toBe(1);
+
+          if (outcome === "timeout") {
+            await vi.runAllTimersAsync();
+          } else {
+            h.service.settlePush({
+              ...(outcome === "push_error"
+                ? { type: outcome, error: "remote rejected" }
+                : { type: outcome }),
+              branchName: pushSpec.targetBranch,
+              repoOwner: pushSpec.repoOwner,
+              repoName: pushSpec.repoName,
+              timestamp: 1000,
+            });
+          }
+          await Promise.all([first, second]);
+
+          expect(firstResult).toHaveBeenCalledWith(
+            outcome === "push_complete"
+              ? { success: true }
+              : {
+                  success: false,
+                  error: expect.stringContaining(
+                    outcome === "timeout" ? "Push operation timed out" : "remote rejected"
+                  ),
+                }
+          );
+          expect(vi.getTimerCount()).toBe(0);
+
+          // Completion, failure, and timeout must all release the key for retry.
+          const retry = h.service.pushBranchToRemote(pushSpec);
+          expect(h.wsManager.send).toHaveBeenCalledTimes(2);
+          h.service.settlePush({
+            type: "push_complete",
+            branchName: pushSpec.targetBranch,
+            repoOwner: pushSpec.repoOwner,
+            repoName: pushSpec.repoName,
+            timestamp: 1001,
+          });
+          await expect(retry).resolves.toEqual({ success: true });
+          expect(vi.getTimerCount()).toBe(0);
+        } finally {
+          vi.clearAllTimers();
+          vi.useRealTimers();
+        }
+      }
+    );
+
     it("settles the matching push when two repos push the same branch name", async () => {
       const h = createService();
       const webPush = h.service.pushBranchToRemote(

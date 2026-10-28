@@ -83,6 +83,48 @@ export default defineConfig({
                 expires_in: 3600,
               });
             }
+            if (url.href === "https://platform.claude.com/v1/oauth/token") {
+              const body = JSON.parse(await request.text()) as {
+                code?: string;
+                state?: string;
+                code_verifier?: string;
+                grant_type?: string;
+              };
+              if (body.code === "integration-anthropic-outage") {
+                throw new Error("Anthropic is unreachable in this integration test");
+              }
+              if (body.code === "integration-anthropic-throttled") {
+                return Response.json(
+                  { error: "rate_limit_error", error_description: "Slow down" },
+                  { status: 429 }
+                );
+              }
+              if (
+                body.grant_type !== "authorization_code" ||
+                body.code !== "integration-anthropic-code" ||
+                !body.state ||
+                !body.code_verifier
+              ) {
+                return Response.json(
+                  { error: "invalid_grant", error_description: "Unknown integration code" },
+                  { status: 400 }
+                );
+              }
+              return Response.json({
+                token_type: "Bearer",
+                access_token: "sk-ant-oat01-integration",
+                refresh_token: "integration-anthropic-refresh-must-not-persist",
+                refresh_token_expires_in: 2_511_418,
+                expires_in: 31_536_000,
+                scope: "user:inference",
+                token_uuid: "integration-anthropic-token-uuid",
+                organization: { uuid: "integration-anthropic-org", name: "Integration Org" },
+                account: {
+                  uuid: "integration-anthropic-account",
+                  email_address: "owner@example.com",
+                },
+              });
+            }
             if (url.href === "https://auth.x.ai/oauth2/device/code") {
               return Response.json({
                 device_code: "integration-xai-device",
@@ -150,11 +192,7 @@ export default defineConfig({
   ],
   test: {
     include: ["test/integration/**/*.test.ts"],
-    setupFiles: [
-      "test/integration/apply-migrations.ts",
-      // Fail-fast mock for *.modal.run so warmSandbox does not hang on real network.
-      "test/integration/mock-modal-fetch.ts",
-    ],
+    setupFiles: ["test/integration/apply-migrations.ts"],
     onUnhandledError(error) {
       // Better Auth implements redirects and invalid-token responses as thrown
       // APIError values. Its handler catches and converts them to HTTP responses,

@@ -6,10 +6,12 @@
  * the adapters in this directory.
  *
  * Boot: the configuration is validated before any file is touched, then
- * the global store is opened and migrated, the alarm clock and the
- * registry are built, the server listens, and the clock, sweeper, and
- * cron start. Everything acquired is released in reverse order if a later
- * step fails, and owned by the returned host once boot succeeds.
+ * the global store is opened and migrated, the deadlines a previous
+ * process may not have indexed are recovered (crash-recovery.ts), the
+ * alarm clock and the registry are built, the server listens, and the
+ * clock, sweeper, and cron start. Everything acquired is released in
+ * reverse order if a later step fails, and owned by the returned host once
+ * boot succeeds.
  *
  * Shutdown runs one deadline: the health check answers 503 and the clocks
  * stop, the server stops accepting, then everything that can still reach
@@ -17,7 +19,9 @@
  * scheduled runs, alarm deliveries, background tasks), then the registry
  * quiesces every runtime (sockets closed with 1012 so peers reconnect),
  * then the transports are closed, the peers that ignored the close are
- * cut, and the stores are closed. What outlived the budget is reported.
+ * cut, and the stores are closed. What outlived the budget is reported. A
+ * drain that abandoned nothing leaves the clean-shutdown marker the next
+ * boot reads.
  */
 
 import { once } from "node:events";
@@ -25,6 +29,7 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { WebSocketServer } from "ws";
 import { SessionIndexStore } from "../db/session-index";
+import { SqlCacheStore } from "../db/sql-cache-store";
 import type { SqlDatabase } from "../db/sql-database";
 import { requireRepoSecretsEncryptionKey, requireTokenEncryptionKey } from "../env-validation";
 import { createLogger, parseLogLevel, type Logger } from "../logger";
@@ -39,12 +44,15 @@ import { createSessionRuntime, type SessionRuntime } from "../session/components
 import { createSessionRuntimeClient } from "../session/runtime-client";
 import type { Env, EnvConfig, Platform } from "../types";
 import { createNodeBackgroundTasks, settlesWithin } from "./background-tasks";
+import { openNodeCacheDatabase } from "./cache-database";
 import type { NodeHostSettings } from "./config";
+import { markCleanShutdown, recoverSessionDeadlines } from "./crash-recovery";
 import { CronLoop } from "./cron-loop";
 import { HostAlarmClock } from "./host-alarm-clock";
 import { openHostAlarmIndex } from "./host-alarm-index";
 import { createNodeHttpServer, type HealthReport } from "./http-server";
-import { createMemoryCacheStore } from "./memory-cache-store";
+import { NodeJobs } from "./job-queue";
+import { openJobStore } from "./job-store";
 import { ensurePrivateDirectory } from "./private-paths";
 import { createNodeSessionRuntimeDispatch } from "./runtime-client";
 import { createS3ObjectStorage, type S3ObjectStorageConfig } from "./s3-object-storage";
@@ -119,14 +127,53 @@ async function boot(
   const startedAtMs = Date.now();
 
   ensurePrivateDirectory(settings.dataDir);
-  const db = openNodeSqlDatabase(join(settings.dataDir, GLOBAL_STORE_FILE), {
-    migrationsDir: settings.migrationsDir,
-  });
-  acquire(() => db.close());
+
+  // Every file the host holds open, registered once. Boot failure unwinds it
+  // with everything else acquired; a successful shutdown closes it through
+  // `closeStores` below. One registration, so the two paths cannot drift.
+  const stores: Array<() => void> = [];
+  const ownStore = <T extends { close(): void }>(store: T): T => {
+    const close = (): void => store.close();
+    stores.push(close);
+    acquire(close);
+    return store;
+  };
+  const closeStores = (): void => {
+    for (const close of [...stores].reverse()) close();
+  };
+
+  const db = ownStore(
+    openNodeSqlDatabase(join(settings.dataDir, GLOBAL_STORE_FILE), {
+      migrationsDir: settings.migrationsDir,
+    })
+  );
   const migrationsApplied = await countMigrations(db);
 
-  const alarmIndex = openHostAlarmIndex(settings.dataDir);
-  acquire(() => alarmIndex.close());
+  const cacheDb = ownStore(openNodeCacheDatabase(settings.dataDir, log));
+
+  const jobStore = ownStore(openJobStore(settings.dataDir));
+  const jobs = new NodeJobs({ store: jobStore, deps: () => ({ env, db, log }), log });
+
+  const alarmIndex = ownStore(openHostAlarmIndex(settings.dataDir));
+  // Before anything can arm a deadline: a stop that left no clean marker may
+  // have left deadlines in session files that never reached the index.
+  const recovery = recoverSessionDeadlines({
+    dataDir: settings.dataDir,
+    index: alarmIndex,
+    log,
+    nowMs: startedAtMs,
+  });
+  // The same question for the jobs table, and the same moment to ask it: one
+  // host holds this volume, so a claim already on disk was left by a process
+  // that is gone. Returning them here rather than from the poller is what
+  // makes it a boot concern — the poller has no way to tell whose a claim is.
+  const reclaimed = jobStore.recoverAllClaims();
+  if (reclaimed.length > 0) {
+    log.warn("Returning jobs a previous process left claimed", {
+      event: "jobs.claims_recovered",
+      job_ids: reclaimed,
+    });
+  }
   const clock: HostAlarmClock = new HostAlarmClock({
     index: alarmIndex,
     deliver: (sessionId) => registry.deliverScheduledDeadline(sessionId),
@@ -143,8 +190,9 @@ async function boot(
   const platform: Platform = {
     DB: db,
     SESSION: createNodeSessionRuntimeDispatch(registry),
-    REPOS_CACHE: createMemoryCacheStore(),
+    REPOS_CACHE: new SqlCacheStore(cacheDb),
     MEDIA_BUCKET: createS3ObjectStorage(options.objectStorage),
+    JOBS: jobs,
   };
   const env: Env = { ...config, ...platform };
 
@@ -183,6 +231,7 @@ async function boot(
     background_tasks: processTasks.size,
     alarm_clock: clocksRunning ? "running" : "stopped",
     cron: clocksRunning ? "running" : "stopped",
+    jobs: { poller: clocksRunning ? "running" : "stopped", ...jobs.stats() },
   });
   const http = createNodeHttpServer({
     fetch: (request) => Promise.resolve(app.fetch(request, env)),
@@ -206,6 +255,8 @@ async function boot(
   acquire(() => registry.stopSweeper());
   cron.start();
   acquire(() => cron.stop());
+  jobs.start();
+  acquire(() => jobs.stop());
   clocksRunning = true;
   log.info("node_host.listening", {
     event: "node_host.listening",
@@ -213,6 +264,8 @@ async function boot(
     port: address.port,
     data_dir: settings.dataDir,
     migrations_applied: migrationsApplied,
+    previous_stop: recovery.previousStop,
+    deadlines_rearmed: recovery.rearmed,
   });
 
   const shutdown = async (): Promise<ShutdownReport> => {
@@ -229,6 +282,7 @@ async function boot(
     // are drained below.
     cron.stop();
     clock.stop();
+    jobs.stop();
     clocksRunning = false;
     const closed = once(server, "close");
     server.close();
@@ -241,11 +295,16 @@ async function boot(
     const runs = await cron.drain(remaining());
     if (runs > 0) abandoned.push(`scheduled_runs:${runs}`);
     if (!(await settlesWithin([clock.drain()], remaining()))) abandoned.push("alarm_deliveries");
+    if (!(await settlesWithin([jobs.drain()], remaining()))) abandoned.push("job_deliveries");
     const tasks = await processTasks.drain(remaining());
     if (tasks > 0) abandoned.push(`background_tasks:${tasks}`);
 
     // Then the runtimes: sockets closed with 1012, per-session work waited for.
-    await registry.shutdown({ timeoutMs: remaining() });
+    // A runtime forced at the budget is abandoned work like any other: it can
+    // have persisted a deadline without arming it, and only the next boot's
+    // scan would find that.
+    const { forced } = await registry.shutdown({ timeoutMs: remaining() });
+    if (forced.length > 0) abandoned.push(`sessions_forced:${forced.length}`);
 
     // Then the transports. A peer that ignored its close frame is cut, as
     // is any connection still open, so the server's close can complete.
@@ -254,10 +313,16 @@ async function boot(
     server.closeAllConnections();
     await closed;
 
-    alarmIndex.close();
-    db.close();
-
     const report: ShutdownReport = { clean: abandoned.length === 0, abandoned };
+    // Only a drain that abandoned nothing may claim a clean stop: work that
+    // outlived the budget can still arm a deadline the index would then be
+    // missing, and the next boot has to go looking for it.
+    try {
+      if (report.clean) markCleanShutdown(settings.dataDir, Date.now());
+    } finally {
+      closeStores();
+    }
+
     if (report.clean) {
       log.info("node_host.stopped", { event: "node_host.stopped" });
     } else {

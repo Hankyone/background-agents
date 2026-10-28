@@ -2,10 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as AuthenticateModule from "../auth/authenticate";
 import { createTestBackgroundTasks } from "../background-tasks.test-support";
 import type { Env } from "../types";
-import { reposRoutes } from "./repos";
+import { SourceControlProviderError } from "../source-control";
+import { REPOS_CACHE_KEY, reposCacheIdentity, reposRoutes } from "./repos";
 import type * as SharedRoutes from "./shared";
 import {
   createTestRequestHandler,
+  authorizationDatabase,
   ownerAuthorizationDatabase,
   TEST_BACKGROUND_TASK_CONTEXT,
   TEST_SERVICE_SECRETS,
@@ -16,6 +18,7 @@ const {
   mockCacheGet,
   mockCachePut,
   mockGetBatch,
+  mockListBranches,
   mockListRepositories,
   mockLogger,
   mockUpsert,
@@ -24,6 +27,7 @@ const {
   mockCacheGet: vi.fn(),
   mockCachePut: vi.fn(),
   mockGetBatch: vi.fn(),
+  mockListBranches: vi.fn(),
   mockListRepositories: vi.fn(),
   mockLogger: {
     debug: vi.fn(),
@@ -56,6 +60,7 @@ vi.mock("./shared", async () => {
   return {
     ...actual,
     createRouteSourceControlProvider: vi.fn(() => ({
+      listBranches: mockListBranches,
       listRepositories: mockListRepositories,
     })),
   };
@@ -80,12 +85,8 @@ function request(path: string, init?: RequestInit): Request {
   });
 }
 
-function updateMetadata(path: string, body: string): Promise<Response> {
-  return handleRequest(
-    request(path, { method: "PUT", body }),
-    createEnv(),
-    TEST_BACKGROUND_TASK_CONTEXT
-  );
+function updateMetadata(path: string, body: string, env = createEnv()): Promise<Response> {
+  return handleRequest(request(path, { method: "PUT", body }), env, TEST_BACKGROUND_TASK_CONTEXT);
 }
 
 describe("repository list route", () => {
@@ -126,6 +127,224 @@ describe("repository list route", () => {
     expect(backgroundTasks.submissions).toHaveLength(1);
     await backgroundTasks.settle();
     expect(backgroundTasks.failures).toEqual([]);
+  });
+
+  it("fingerprints the effective SCM catalogue identity", async () => {
+    const githubEnv = {
+      ...createEnv(),
+      GITHUB_APP_INSTALLATION_ID: "installation-1",
+    };
+    const otherGitHubEnv = {
+      ...githubEnv,
+      GITHUB_APP_INSTALLATION_ID: "installation-2",
+    };
+    const gitlabEnv = {
+      ...createEnv(),
+      SCM_PROVIDER: "gitlab",
+      GITLAB_NAMESPACE: "acme/platform",
+      GITLAB_ACCESS_TOKEN: "token-1",
+    };
+    const otherGitlabEnv = { ...gitlabEnv, GITLAB_NAMESPACE: "acme/services" };
+    const rotatedGitlabTokenEnv = { ...gitlabEnv, GITLAB_ACCESS_TOKEN: "token-2" };
+
+    const githubIdentity = await reposCacheIdentity(githubEnv);
+    const gitlabIdentity = await reposCacheIdentity(gitlabEnv);
+
+    expect(githubIdentity).toMatch(/^[0-9a-f]{64}$/);
+    expect(githubIdentity).not.toContain("installation-1");
+    await expect(reposCacheIdentity(otherGitHubEnv)).resolves.not.toBe(githubIdentity);
+    expect(gitlabIdentity).not.toBe(githubIdentity);
+    await expect(reposCacheIdentity(otherGitlabEnv)).resolves.not.toBe(gitlabIdentity);
+    await expect(reposCacheIdentity(rotatedGitlabTokenEnv)).resolves.not.toBe(gitlabIdentity);
+  });
+
+  it("stores the SCM identity in the singleton cache entry", async () => {
+    const env = { ...createEnv(), GITHUB_APP_INSTALLATION_ID: "installation-1" };
+    const expectedIdentity = await reposCacheIdentity(env);
+
+    const response = await handleRequest(request("/repos"), env, createTestBackgroundTasks());
+
+    expect(response.status).toBe(200);
+    expect(mockCacheGet).toHaveBeenCalledWith(REPOS_CACHE_KEY, "json");
+    expect(mockCachePut).toHaveBeenCalledWith(REPOS_CACHE_KEY, expect.any(String), {
+      ttlMs: 3_600_000,
+    });
+    const cached = JSON.parse(mockCachePut.mock.calls[0][1]) as { scmIdentity: string };
+    expect(cached.scmIdentity).toBe(expectedIdentity);
+  });
+
+  it("treats a malformed singleton cache entry as a miss", async () => {
+    const env = createEnv();
+    mockCacheGet.mockResolvedValue({
+      repos: [{ id: "not-a-number" }],
+      cachedAt: new Date().toISOString(),
+      scmIdentity: await reposCacheIdentity(env),
+      freshUntil: Date.now() + 60_000,
+    });
+
+    const response = await handleRequest(request("/repos"), env, createTestBackgroundTasks());
+
+    expect(response.status).toBe(200);
+    expect(mockListRepositories).toHaveBeenCalledOnce();
+    await expect(response.json()).resolves.toMatchObject({ cached: false });
+  });
+
+  it("globally invalidates enriched metadata across SCM configuration changes", async () => {
+    let cached: unknown = null;
+    let description = "Original description";
+    mockCacheGet.mockImplementation(async () => cached);
+    mockCachePut.mockImplementation(async (_key, value) => {
+      cached = JSON.parse(value);
+    });
+    mockCacheDelete.mockImplementation(async () => {
+      cached = null;
+    });
+    mockGetBatch.mockImplementation(async () => new Map([["acme/widgets", { description }]]));
+    mockUpsert.mockImplementation(async (_owner, _name, metadata) => {
+      description = metadata.description;
+    });
+    const installationOne = {
+      ...createEnv(),
+      GITHUB_APP_INSTALLATION_ID: "installation-1",
+    };
+    const installationTwo = {
+      ...createEnv(),
+      GITHUB_APP_INSTALLATION_ID: "installation-2",
+    };
+
+    await handleRequest(request("/repos"), installationOne, createTestBackgroundTasks());
+    await handleRequest(request("/repos"), installationTwo, createTestBackgroundTasks());
+    await handleRequest(request("/repos"), installationOne, createTestBackgroundTasks());
+    await updateMetadata(
+      "/repos/acme/widgets/metadata",
+      JSON.stringify({ description: "Updated description" }),
+      installationTwo
+    );
+    const response = await handleRequest(
+      request("/repos"),
+      installationOne,
+      createTestBackgroundTasks()
+    );
+
+    expect(mockCacheDelete).toHaveBeenCalledWith(REPOS_CACHE_KEY);
+    expect(mockListRepositories).toHaveBeenCalledTimes(4);
+    await expect(response.json()).resolves.toMatchObject({
+      cached: false,
+      repos: [{ metadata: { description: "Updated description" } }],
+    });
+  });
+});
+
+describe("repository branch route", () => {
+  const result = {
+    branches: [{ name: "main" }, { name: "feature/widgets" }],
+    cached: false,
+    cachedAt: "2026-01-01T00:00:00.000Z",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.authenticate.mockImplementation(async (request: Request) => ({
+      principal: { kind: "user", userId: "user-1" },
+      request,
+    }));
+    mockListBranches.mockResolvedValue(result);
+  });
+
+  it.each([true, false])("forwards provider branch metadata with cached=%s", async (cached) => {
+    const providerResult = { ...result, cached };
+    mockListBranches.mockResolvedValue(providerResult);
+    const backgroundTasks = createTestBackgroundTasks();
+
+    const response = await handleRequest(
+      request("/repos/Acme/Widgets/branches"),
+      createEnv(),
+      backgroundTasks
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual(providerResult);
+    expect(mockListBranches).toHaveBeenCalledExactlyOnceWith(
+      { owner: "Acme", name: "Widgets" },
+      {
+        backgroundTasks: expect.objectContaining({ submit: expect.any(Function) }),
+        metrics: expect.objectContaining({ time: expect.any(Function) }),
+        traceId: "trace-1",
+      }
+    );
+    expect(mockCacheGet).not.toHaveBeenCalled();
+    expect(mockCachePut).not.toHaveBeenCalled();
+    expect(mockCacheDelete).not.toHaveBeenCalled();
+    expect(backgroundTasks.submissions).toHaveLength(0);
+    expect(mockListBranches.mock.calls[0][1].metrics.spans).toEqual({});
+  });
+
+  it("includes provider-recorded timings in the HTTP request log", async () => {
+    mockListBranches.mockImplementationOnce(async (_repository, { metrics }) => {
+      await metrics.time("kv_read", async () => null);
+      await metrics.time("scm_api", async () => result.branches);
+      return result;
+    });
+
+    const response = await handleRequest(
+      request("/repos/acme/widgets/branches"),
+      createEnv(),
+      createTestBackgroundTasks()
+    );
+
+    expect(response.status).toBe(200);
+    const { spans } = mockListBranches.mock.calls[0][1].metrics;
+    expect(spans).toEqual({ kv_read: expect.any(Number), scm_api: expect.any(Number) });
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      "http.request",
+      expect.objectContaining({ kv_read_ms: spans.kv_read, scm_api_ms: spans.scm_api })
+    );
+  });
+
+  it.each([
+    { failure: new Error("Provider unavailable"), message: "Failed to list branches" },
+    {
+      failure: new SourceControlProviderError("Not configured", "permanent"),
+      message: "SCM provider not configured",
+    },
+    {
+      failure: new SourceControlProviderError("Not found", "permanent", 404),
+      message: "Failed to list branches",
+    },
+  ])("maps provider failures to 500 ($message)", async ({ failure, message }) => {
+    mockListBranches.mockRejectedValue(failure);
+    const backgroundTasks = createTestBackgroundTasks();
+
+    const response = await handleRequest(
+      request("/repos/acme/widgets/branches"),
+      createEnv(),
+      backgroundTasks
+    );
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({ error: message });
+    expect(mockCacheGet).not.toHaveBeenCalled();
+    expect(mockCachePut).not.toHaveBeenCalled();
+    expect(mockCacheDelete).not.toHaveBeenCalled();
+    expect(backgroundTasks.submissions).toHaveLength(0);
+  });
+
+  it("checks route permissions before calling the provider or cache", async () => {
+    const env = { ...createEnv(), DB: authorizationDatabase({ permissions: [] }) };
+    const backgroundTasks = createTestBackgroundTasks();
+
+    const response = await handleRequest(
+      request("/repos/acme/widgets/branches"),
+      env,
+      backgroundTasks
+    );
+
+    expect(response.status).toBe(403);
+    expect(mockListBranches).not.toHaveBeenCalled();
+    expect(mockCacheGet).not.toHaveBeenCalled();
+    expect(mockCachePut).not.toHaveBeenCalled();
+    expect(mockCacheDelete).not.toHaveBeenCalled();
+    expect(backgroundTasks.submissions).toHaveLength(0);
   });
 });
 
@@ -169,7 +388,7 @@ describe("repository metadata routes", () => {
     expect(mockUpsert).toHaveBeenCalledWith("Acme", "Widget", {
       description: "Updated description",
     });
-    expect(mockCacheDelete).toHaveBeenCalledOnce();
+    expect(mockCacheDelete).toHaveBeenCalledWith(REPOS_CACHE_KEY);
     expect(mockLogger.warn).toHaveBeenCalledWith("Failed to invalidate repos cache", {
       trace_id: "trace-1",
       error: cacheError,

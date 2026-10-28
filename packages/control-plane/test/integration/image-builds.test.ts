@@ -24,6 +24,9 @@ import { ImageBuildReaper } from "../../src/image-builds/reaper";
 import { resolveScopeEnabled } from "../../src/image-builds/scope";
 import type { DeleteImageInput, ImageBuildAdapter } from "../../src/image-builds/types";
 import { evaluateImageBuildForSpawn } from "../../src/sandbox/lifecycle/image-selection";
+import { createModalClient } from "../../src/sandbox/client";
+import { ModalSandboxProvider } from "../../src/sandbox/providers/modal-provider";
+import { ModalImageBuildAdapter } from "../../src/image-builds/modal-adapter";
 import { createCloudflareEnv } from "../../src/cloudflare/platform";
 import { cleanD1Tables } from "./cleanup";
 import { serviceFetch } from "./helpers";
@@ -67,7 +70,7 @@ function tokenHeaders(token: string): Record<string, string> {
 }
 
 /**
- * The Vercel/OpenComputer shape: a row whose internal columns all carry real
+ * The Vercel shape: a row whose internal columns all carry real
  * values (Modal rows keep a token hash but never bind a provider session).
  * If a status read leaks columns, this is the row that exposes a live
  * callback-token hash and provider ids.
@@ -406,6 +409,9 @@ describe("Image builds", () => {
             repositoriesFingerprint: await computeRepositoriesFingerprint(repositories),
           },
         ],
+        // The settings surfaces read this to stop offering builds a paused
+        // deployment would refuse.
+        admission: { open: true },
       });
     });
 
@@ -632,6 +638,59 @@ describe("Image builds", () => {
 
     const ctx = { request_id: "req-reap", trace_id: "trace-reap" };
 
+    for (const provider of ["modal", "modal-vm"] as const) {
+      it.each(["failed", "superseded"] as const)(
+        `retains %s ${provider} metadata for deferred cleanup without allowing restore`,
+        async (status) => {
+          const environmentId = await seedEnvironment({ prebuildEnabled: true });
+          const scope = environmentScope(environmentId);
+          const store = new ImageBuildStore(env.DB);
+          await seedImageRow({
+            id: "deferred-cleanup",
+            environmentId,
+            status,
+            provider,
+            providerImageId: "im-retained",
+            createdAt: 1,
+          });
+          await env.DB.prepare(
+            `UPDATE image_builds SET provider_session_id = ?,
+               provider_session_cleanup_pending = 0, error_message = ? WHERE id = ?`
+          )
+            .bind("sb-source", "original build error", "deferred-cleanup")
+            .run();
+          const original = await getRow("deferred-cleanup");
+          const adapter = new ModalImageBuildAdapter(
+            new ModalSandboxProvider(createModalClient("secret", "workspace"), provider, "github")
+          );
+          const factory = { create: () => adapter } as ImageBuildAdapterFactory;
+          const reaper = new ImageBuildReaper(store, factory);
+
+          for (let tick = 0; tick < 2; tick += 1) {
+            await expect(reaper.cleanupImages(86_400_000, ctx)).resolves.toEqual({
+              deletedFailed: 0,
+              reapedFailed: 0,
+              reapedSuperseded: 0,
+            });
+            expect(await getRow("deferred-cleanup")).toEqual(original);
+            expect(await store.getLatestReadyForSpawn(scope, provider)).toBeNull();
+            const pending =
+              status === "failed"
+                ? await store.getFailedImagesWithArtifacts()
+                : await store.getSupersededImages();
+            expect(pending).toEqual([
+              expect.objectContaining({
+                id: "deferred-cleanup",
+                provider,
+                provider_image_id: "im-retained",
+                provider_session_id: "sb-source",
+              }),
+            ]);
+          }
+        }
+      );
+    }
+
     it("reaps failed and superseded artifacts, retains failed rows, deletes aged-out rows", async () => {
       const environmentId = await seedEnvironment();
       const old = Date.now() - 100_000_000;
@@ -718,12 +777,16 @@ describe("Image builds", () => {
   });
 
   describe("build callbacks", () => {
-    async function registerBuild(environmentId: string, buildId: string): Promise<void> {
+    async function registerBuild(
+      environmentId: string,
+      buildId: string,
+      provider: "modal" | "daytona" = "modal"
+    ): Promise<void> {
       const store = new ImageBuildStore(env.DB);
       await store.registerBuild({
         id: buildId,
         scope: environmentScope(environmentId),
-        provider: "modal",
+        provider,
         repositoriesFingerprint: "fp-cb",
         callbackTokenHash: await hashImageBuildCallbackToken(
           MODAL_BUILD_TOKEN,
@@ -731,8 +794,60 @@ describe("Image builds", () => {
         ),
         callbackTokenExpiresAt: Date.now() + 60_000,
       });
-      await store.bindProviderSession(buildId, "modal", `session-${buildId}`);
+      await store.bindProviderSession(buildId, provider, `session-${buildId}`);
     }
+
+    it("accepts a recorded-provider callback whatever the deployment now runs on", async () => {
+      const environmentId = await seedEnvironment();
+      await registerBuild(environmentId, "cb-daytona", "daytona");
+
+      const accepted = await SELF.fetch(`${BASE}/image-builds/build-complete`, {
+        method: "POST",
+        headers: tokenHeaders(MODAL_BUILD_TOKEN),
+        body: JSON.stringify({
+          build_id: "cb-daytona",
+          provider_session_id: "session-cb-daytona",
+          repository_shas: REPOSITORY_SHAS,
+          runtime_version: RUNTIME_VERSION,
+          build_duration_seconds: 42.5,
+        }),
+      });
+
+      // Callbacks authenticate against the row's own recorded provider, so a
+      // build accepted before a provider switch — or while its provider's
+      // admission is closed — can still report and finalize.
+      expect(accepted.status).toBe(202);
+      const row = await getRow("cb-daytona");
+      expect(row?.provider).toBe("daytona");
+      expect(row?.callback_token_used_at).not.toBeNull();
+
+      // The same payload replays idempotently; a conflicting one does not.
+      const replay = await SELF.fetch(`${BASE}/image-builds/build-complete`, {
+        method: "POST",
+        headers: tokenHeaders(MODAL_BUILD_TOKEN),
+        body: JSON.stringify({
+          build_id: "cb-daytona",
+          provider_session_id: "session-cb-daytona",
+          repository_shas: REPOSITORY_SHAS,
+          runtime_version: RUNTIME_VERSION,
+          build_duration_seconds: 42.5,
+        }),
+      });
+      expect(replay.status).toBe(202);
+
+      const conflicting = await SELF.fetch(`${BASE}/image-builds/build-complete`, {
+        method: "POST",
+        headers: tokenHeaders(MODAL_BUILD_TOKEN),
+        body: JSON.stringify({
+          build_id: "cb-daytona",
+          provider_session_id: "session-cb-daytona",
+          repository_shas: REPOSITORY_SHAS,
+          runtime_version: RUNTIME_VERSION,
+          build_duration_seconds: 99,
+        }),
+      });
+      expect(conflicting.status).toBe(409);
+    });
 
     it("POST /image-builds/build-complete durably accepts provider-session finalization", async () => {
       const environmentId = await seedEnvironment();

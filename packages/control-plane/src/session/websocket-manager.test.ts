@@ -106,9 +106,10 @@ function createMockRepository() {
     createdAt: number;
     authorizationExpiresAt: number;
   }> = [];
+  const getSandbox = vi.fn(() => sandboxRow);
 
   const repo = {
-    getSandbox: () => sandboxRow,
+    getSandbox,
     setActiveSocketId: (socketId: string) => {
       // Like the UPDATE it stands in for: nothing to write without a row.
       if (sandboxRow) sandboxRow.active_socket_id = socketId;
@@ -152,6 +153,7 @@ function createMockRepository() {
 
   return {
     repo,
+    getSandbox,
     mappings,
     upsertCalls,
     setSandbox: (row: SandboxRow | null) => {
@@ -203,6 +205,10 @@ function createSandboxRow(modalSandboxId: string): SandboxRow {
     ttyd_url: null,
     ttyd_token: null,
     active_socket_id: null,
+    boot_phase: null,
+    boot_seq: null,
+    fenced: 0,
+    startup_rejected: 0,
     created_at: Date.now(),
   };
 }
@@ -431,6 +437,20 @@ describe("SessionWebSocketManagerImpl", () => {
       expect(manager.isActiveSandboxSocket(ws)).toBe(false);
     });
 
+    it("requires the sandbox id to match even when the socket identity does", () => {
+      const { manager, mockRepo } = createManager();
+      const row = createSandboxRow("sb-current");
+      mockRepo.setSandbox(row);
+      const ws = createFakeWebSocket();
+
+      manager.acceptAndSetSandboxSocket(ws, "sb-stale");
+
+      expect(row.active_socket_id).toMatch(/^sbws-/);
+      expect(manager.isActiveSandboxSocket(ws)).toBe(false);
+      expect(manager.getSandboxSocket()).toBeNull();
+      expect(ws.close).toHaveBeenCalledWith(1000, "Sandbox identity changed");
+    });
+
     it("is false for every socket once detach has revoked authority", () => {
       const { manager, sockets, mockRepo } = createManager();
       const row = createSandboxRow("sb-1");
@@ -656,6 +676,88 @@ describe("SessionWebSocketManagerImpl", () => {
 
       expect(manager.getSandboxSocket()).toBeNull();
       expect(ws.close).toHaveBeenCalledWith(1000, "Sandbox terminated");
+    });
+  });
+
+  describe("getSandboxCommandTarget", () => {
+    it("reports unavailable for an attached socket without a sandbox row", () => {
+      const { manager, mockRepo } = createManager();
+      const ws = createFakeWebSocket();
+      manager.acceptAndSetSandboxSocket(ws, "sb-1");
+      mockRepo.setSandbox(null);
+
+      expect(manager.getSandboxCommandTarget()).toEqual({ kind: "unavailable" });
+    });
+
+    it.each(["stopped", "failed", "stale"] as const)(
+      "reports unavailable for a lingering %s socket",
+      (status) => {
+        const { manager, mockRepo } = createManager();
+        const row = createSandboxRow("sb-1");
+        row.status = status;
+        mockRepo.setSandbox(row);
+        const ws = createFakeWebSocket();
+        manager.acceptAndSetSandboxSocket(ws, "sb-1");
+
+        expect(manager.getSandboxCommandTarget()).toEqual({ kind: "unavailable" });
+        expect(ws.close).toHaveBeenCalled();
+      }
+    );
+
+    it.each(["ready", "snapshotting"] as const)(
+      "returns the attached socket while the row is %s",
+      (status) => {
+        const { manager, mockRepo } = createManager();
+        const row = createSandboxRow("sb-1");
+        row.status = status;
+        mockRepo.setSandbox(row);
+        const ws = createFakeWebSocket();
+        manager.acceptAndSetSandboxSocket(ws, "sb-1");
+
+        expect(manager.getSandboxCommandTarget()).toEqual({ kind: "dispatch", socket: ws });
+      }
+    );
+
+    it.each(["spawning", "connecting"] as const)(
+      "withholds a booting sandbox's socket (%s) from operational commands",
+      (status) => {
+        const { manager, mockRepo } = createManager();
+        const row = createSandboxRow("sb-1");
+        row.status = status;
+        row.boot_phase = JSON.stringify({
+          phase: "setup",
+          status: "started",
+          bootSeq: 3,
+          repoOwner: "acme",
+          repoName: "api",
+        });
+        mockRepo.setSandbox(row);
+        const ws = createFakeWebSocket();
+        manager.acceptAndSetSandboxSocket(ws, "sb-1");
+
+        expect(manager.getSandboxSocket()).toBe(ws);
+        mockRepo.getSandbox.mockClear();
+        expect(manager.getSandboxCommandTarget()).toEqual({
+          kind: "booting",
+          phase: {
+            phase: "setup",
+            status: "started",
+            bootSeq: 3,
+            repoOwner: "acme",
+            repoName: "api",
+          },
+        });
+        expect(mockRepo.getSandbox).toHaveBeenCalledOnce();
+        // Withholding is not closing: the bridge stays attached for lifecycle use.
+        expect(ws.close).not.toHaveBeenCalled();
+      }
+    );
+
+    it("reports unavailable when no sandbox socket exists", () => {
+      const { manager, mockRepo } = createManager();
+      mockRepo.setSandbox(createSandboxRow("sb-1"));
+
+      expect(manager.getSandboxCommandTarget()).toEqual({ kind: "unavailable" });
     });
   });
 
@@ -1305,18 +1407,77 @@ describe("SessionWebSocketManagerImpl", () => {
   });
 
   describe("getConnectedClientCount", () => {
-    it("counts only non-sandbox open sockets", () => {
+    it("does not count a client whose persisted lease cannot be read", () => {
+      const { manager, sockets, mockRepo, log } = createManager();
+      const recoveredWs = createFakeWebSocket();
+      const cachedWs = createFakeWebSocket();
+      sockets.set(recoveredWs, ["wsid:ws-recovered"]);
+      sockets.set(cachedWs, ["wsid:ws-cached"]);
+      manager.setClient(cachedWs, createClientInfo());
+      const error = new Error("lease read failed");
+      vi.spyOn(
+        mockRepo.repo as unknown as WsClientMappingRepository,
+        "getWsClientMapping"
+      ).mockImplementation(() => {
+        throw error;
+      });
+
+      expect(manager.getConnectedClientCount()).toBe(1);
+      expect(recoveredWs.close).not.toHaveBeenCalled();
+      expect(log.warn).toHaveBeenCalledWith("Client authorization lease lookup failed", {
+        ws_id: "ws-recovered",
+        error,
+      });
+    });
+
+    it("counts only authorized non-sandbox open sockets", () => {
       const { manager, sockets } = createManager();
       const clientWs1 = createFakeWebSocket();
       const clientWs2 = createFakeWebSocket(WebSocket.CLOSED);
+      const unsubscribedWs = createFakeWebSocket();
       const sandboxWs = createFakeWebSocket();
 
       sockets.set(clientWs1, ["wsid:ws-1"]);
       sockets.set(clientWs2, ["wsid:ws-2"]);
+      sockets.set(unsubscribedWs, ["wsid:ws-unsubscribed"]);
       sockets.set(sandboxWs, ["sandbox"]);
+      manager.setClient(clientWs1, createClientInfo());
+      manager.setClient(clientWs2, createClientInfo());
 
       expect(manager.getConnectedClientCount()).toBe(1);
     });
+
+    it.each(["cached", "persisted"] as const)(
+      "counts only unexpired %s authorization leases",
+      (source) => {
+        const { manager, sockets, mockRepo } = createManager();
+        const now = Date.now();
+        const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+        const ws = createFakeWebSocket();
+        sockets.set(ws, ["wsid:ws-1"]);
+        mockRepo.addMapping("ws-1", {
+          participant_id: "part-1",
+          client_id: "client-1",
+          user_id: "user-1",
+          scm_name: null,
+          scm_login: null,
+          authorization_expires_at: now + 1,
+        });
+        if (source === "cached") {
+          manager.setClient(ws, createClientInfo({ authorizationExpiresAt: now + 1 }));
+        }
+        try {
+          expect(manager.getConnectedClientCount()).toBe(1);
+          clock.mockReturnValue(now + 1);
+          expect(manager.getConnectedClientCount()).toBe(0);
+          // Counting is read-only; the lease sweep retires expired clients.
+          expect(mockRepo.mappings.has("ws-1")).toBe(true);
+          expect(ws.close).not.toHaveBeenCalled();
+        } finally {
+          clock.mockRestore();
+        }
+      }
+    );
 
     it("returns 0 when no sockets", () => {
       const { manager } = createManager();

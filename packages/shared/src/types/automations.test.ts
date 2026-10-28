@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  automationInvocationStatusSchema,
+  validateAutomationTargetCounts,
   createAutomationRequestSchema,
   listAutomationsResponseSchema,
+  MAX_AUTOMATION_RETRIES,
   updateAutomationRequestSchema,
 } from "./automations";
 
@@ -14,14 +17,19 @@ const automation = {
   instructions: "Run the sync",
   triggerType: "schedule",
   scheduleCron: "0 9 * * *",
+  scheduleOnceAt: null,
   scheduleTz: "UTC",
   model: "anthropic/claude-sonnet-4-6",
+  harness: "opencode",
   reasoningEffort: null,
   enabled: true,
   nextRunAt: 123,
   consecutiveFailures: 0,
+  maxRetries: 0,
   createdBy: "user-1",
   userId: USER_ID,
+  ownerTeamId: null,
+  capabilities: { canRead: true, canManage: true, canTrigger: true },
   createdAt: 1,
   updatedAt: 2,
   deletedAt: null,
@@ -34,6 +42,48 @@ const automation = {
 };
 
 describe("listAutomationsResponseSchema", () => {
+  it("retains team ownership and server capabilities", () => {
+    const capabilities = { canRead: true, canManage: false, canTrigger: true };
+    const result = listAutomationsResponseSchema.parse({
+      automations: [{ ...automation, ownerTeamId: "team_a", capabilities }],
+      hasMore: false,
+      nextCursor: null,
+    });
+    expect(result.automations[0]).toMatchObject({ ownerTeamId: "team_a", capabilities });
+  });
+
+  it("reads an automation from a control plane that predates launch retries as allowing none", () => {
+    const { maxRetries: _maxRetries, ...legacy } = automation;
+    const result = listAutomationsResponseSchema.parse({
+      automations: [legacy],
+      hasMore: false,
+      nextCursor: null,
+    });
+    expect(result.automations[0]!.maxRetries).toBe(0);
+  });
+
+  it("reads an automation from a control plane that predates one-shot schedules", () => {
+    const { scheduleOnceAt: _scheduleOnceAt, ...legacy } = automation;
+    const result = listAutomationsResponseSchema.parse({
+      automations: [legacy],
+      hasMore: false,
+      nextCursor: null,
+    });
+    expect(result.automations[0]!.scheduleOnceAt).toBeNull();
+  });
+
+  it.each([null, Date.parse("2027-01-01T09:00:00Z")])(
+    "preserves an explicit scheduleOnceAt=%s",
+    (scheduleOnceAt) => {
+      const result = listAutomationsResponseSchema.parse({
+        automations: [{ ...automation, scheduleOnceAt }],
+        hasMore: false,
+        nextCursor: null,
+      });
+      expect(result.automations[0]!.scheduleOnceAt).toBe(scheduleOnceAt);
+    }
+  );
+
   it("accepts a valid cursor page", () => {
     expect(
       listAutomationsResponseSchema.parse({
@@ -67,6 +117,20 @@ describe("listAutomationsResponseSchema", () => {
         nextCursor: null,
       }).success
     ).toBe(false);
+  });
+
+  it("requires viewer capabilities and explicit team ownership on every item", () => {
+    const { capabilities: _capabilities, ...withoutCapabilities } = automation;
+    const { ownerTeamId: _ownerTeamId, ...withoutOwner } = automation;
+    for (const item of [withoutCapabilities, withoutOwner]) {
+      expect(
+        listAutomationsResponseSchema.safeParse({
+          automations: [item],
+          hasMore: false,
+          nextCursor: null,
+        }).success
+      ).toBe(false);
+    }
   });
 
   it("requires a canonical owner ID when ownership is present", () => {
@@ -115,6 +179,45 @@ describe("listAutomationsResponseSchema", () => {
   });
 });
 
+describe("automation grant-denial statuses", () => {
+  it("adds unauthorized without changing the existing invocation statuses", () => {
+    expect(automationInvocationStatusSchema.options).toEqual([
+      "starting",
+      "running",
+      "retrying",
+      "completed",
+      "failed",
+      "partial_failed",
+      "skipped",
+      "unauthorized",
+    ]);
+  });
+
+  it("accepts unauthorized invocation status in recent execution summaries", () => {
+    const recentExecutions = [{ id: "inv-denied", status: "unauthorized", createdAt: 123 }];
+    const response = listAutomationsResponseSchema.parse({
+      automations: [{ ...automation, recentExecutions }],
+      hasMore: false,
+      nextCursor: null,
+    });
+
+    expect(automationInvocationStatusSchema.parse("unauthorized")).toBe("unauthorized");
+    expect(response.automations[0].recentExecutions).toEqual(recentExecutions);
+  });
+});
+
+describe("automation team input", () => {
+  it.each(["team_a", null])("accepts teamId=%s on create", (teamId) => {
+    expect(
+      createAutomationRequestSchema.parse({
+        name: "Daily sync",
+        instructions: "Sync",
+        teamId,
+      })
+    ).toHaveProperty("teamId", teamId);
+  });
+});
+
 describe("automation provider selection contracts", () => {
   it("accepts complete create selections and returns selections in responses", () => {
     expect(
@@ -146,7 +249,7 @@ describe("automation provider selection contracts", () => {
   });
 
   it("rejects unknown providers in create, update, and response records", () => {
-    const providerSelections = { anthropic: { mode: "api_key" } };
+    const providerSelections = { gemini: { mode: "api_key" } };
     expect(
       createAutomationRequestSchema.safeParse({
         name: "Daily sync",
@@ -199,6 +302,19 @@ describe("automation request boundary contracts", () => {
     }
   );
 
+  it.each([createAutomationRequestSchema, updateAutomationRequestSchema])(
+    "bounds maxRetries to whole numbers up to MAX_AUTOMATION_RETRIES",
+    (schema) => {
+      const parse = (maxRetries: unknown) =>
+        schema.safeParse({ name: "Daily sync", instructions: "Run", maxRetries });
+      expect(parse(0).success).toBe(true);
+      expect(parse(MAX_AUTOMATION_RETRIES).success).toBe(true);
+      expect(parse(MAX_AUTOMATION_RETRIES + 1).success).toBe(false);
+      expect(parse(-1).success).toBe(false);
+      expect(parse(1.5).success).toBe(false);
+    }
+  );
+
   it("accepts null to clear trigger config on update", () => {
     expect(updateAutomationRequestSchema.parse({ triggerConfig: null })).toEqual({
       triggerConfig: null,
@@ -220,5 +336,30 @@ describe("automation request boundary contracts", () => {
         sentryClientSecret: " secret ",
       }).sentryClientSecret
     ).toBe(" secret ");
+  });
+});
+
+describe("validateAutomationTargetCounts", () => {
+  it("keeps repository-scoped triggers bound to one repository", () => {
+    expect(validateAutomationTargetCounts("github_event", 0, 0)).toBe(
+      "Repository-scoped triggers require exactly one repository"
+    );
+    expect(validateAutomationTargetCounts("github_event", 1, 1)).toBe(
+      "Repository-scoped triggers cannot target environments"
+    );
+    expect(validateAutomationTargetCounts("github_event", 1, 0)).toBeNull();
+  });
+
+  it("allows fan-out only for schedules", () => {
+    expect(validateAutomationTargetCounts("webhook", 2, 0)).toBe(
+      "Multi-target selections require a schedule trigger"
+    );
+    expect(validateAutomationTargetCounts("schedule", 2, 1)).toBeNull();
+  });
+
+  it("enforces the combined target cap", () => {
+    expect(validateAutomationTargetCounts("schedule", 10, 1)).toBe(
+      "At most 10 repositories and environments combined"
+    );
   });
 });

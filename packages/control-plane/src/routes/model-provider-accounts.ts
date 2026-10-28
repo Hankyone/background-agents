@@ -1,12 +1,16 @@
 import { parseBody } from "./body";
+import { readBoundedBytes } from "../http/bounded-body";
+import { withinProviderAccessDeadline } from "../auth/provider-access-deadline";
 import {
   MODEL_PROVIDER_ACCOUNT_ID_PATTERN,
   PROVIDER_DEVICE_AUTHORIZATION_ID_PATTERN,
+  completeProviderAuthorizationCodeRequestSchema,
   connectModelProviderAccountRequestSchema,
   modelProviderAccountDisplayNameSchema,
   modelProviderAccountDefaultRequestSchema,
   modelProviderAccountStatusSchema,
   reconnectModelProviderAccountRequestSchema,
+  startProviderAuthorizationCodeRequestSchema,
   startProviderDeviceAuthorizationRequestSchema,
   subscriptionProviderIdSchema,
   type SubscriptionProviderId,
@@ -34,10 +38,9 @@ import {
   ModelProviderAccountService,
   ProviderAccountServiceError,
 } from "../model-provider-accounts/service";
-import {
-  ProviderDeviceAuthorizationError,
-  ProviderDeviceAuthorizationService,
-} from "../model-provider-accounts/device-authorization-service";
+import { ProviderAuthorizationCodeService } from "../model-provider-accounts/authorization-code-service";
+import { ProviderAuthorizationError } from "../model-provider-accounts/authorization-transaction";
+import { ProviderDeviceAuthorizationService } from "../model-provider-accounts/device-authorization-service";
 import { ProviderDeviceAuthorizationFinalizer } from "../model-provider-accounts/device-authorization-finalizer";
 import {
   ProviderAccountSelectionPolicy,
@@ -46,7 +49,7 @@ import {
 import { admit, dispatch } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
 import type { Env } from "../types";
-import { SessionInternalPaths } from "../session/contracts";
+import { SessionInternalPaths, type SessionInternalPath } from "../session/contracts";
 import { createSessionRuntimeClient } from "../session/runtime-client";
 import {
   error,
@@ -69,11 +72,12 @@ const legacyAccessSchema = z.object({
   expires_in: z.number().optional(),
   account_id: z.string().optional(),
 });
-const LEGACY_REFRESH_PATH = {
+/** Providers that ever had a session-scoped legacy OAuth refresh path. */
+const LEGACY_REFRESH_PATH: Partial<Record<SubscriptionProviderId, SessionInternalPath>> = {
   openai: SessionInternalPaths.openaiTokenRefresh,
   xai: SessionInternalPaths.xaiTokenRefresh,
-} as const;
-const providerAuthorizationLogger = createLogger("provider-device-authorization");
+};
+const providerAuthorizationLogger = createLogger("provider-authorization");
 
 function service(env: Env, ctx: RequestContext): ModelProviderAccountService {
   const accounts = new ModelProviderAccountStore(ctx.db);
@@ -87,22 +91,30 @@ function service(env: Env, ctx: RequestContext): ModelProviderAccountService {
   );
 }
 
-function authorizationService(env: Env, ctx: RequestContext): ProviderDeviceAuthorizationService {
+function authorizationServiceParts(env: Env, ctx: RequestContext) {
   const accounts = new ModelProviderAccountStore(ctx.db);
   const finalizer = new ProviderDeviceAuthorizationFinalizer(
     accounts,
     new D1ModelProviderAccountAtomicWriter(ctx.db, env.PROVIDER_ACCOUNTS_ENCRYPTION_KEY),
     () => generateId(16)
   );
-  return new ProviderDeviceAuthorizationService(
+  return [
     new ProviderAccountAuthorizationStore(ctx.db),
     accounts,
     finalizer,
     env.PROVIDER_ACCOUNTS_ENCRYPTION_KEY,
     modelProviderAccountAdapterRegistry,
     { generateId, now: () => Date.now() },
-    providerAuthorizationLogger
-  );
+    providerAuthorizationLogger,
+  ] as const;
+}
+
+function authorizationService(env: Env, ctx: RequestContext): ProviderDeviceAuthorizationService {
+  return new ProviderDeviceAuthorizationService(...authorizationServiceParts(env, ctx));
+}
+
+function authorizationCodeService(env: Env, ctx: RequestContext): ProviderAuthorizationCodeService {
+  return new ProviderAuthorizationCodeService(...authorizationServiceParts(env, ctx));
 }
 
 function provider(value: string): SubscriptionProviderId | Response {
@@ -180,11 +192,11 @@ async function authorizationOperation(
   try {
     return await operation();
   } catch (cause) {
-    if (cause instanceof ProviderDeviceAuthorizationError) {
+    if (cause instanceof ProviderAuthorizationError) {
       return json({ error: cause.message, retryable: cause.retryable }, cause.status);
     }
-    providerAuthorizationLogger.error("provider_device_authorization.operation_failed", {
-      event: "provider_device_authorization.operation_failed",
+    providerAuthorizationLogger.error("provider_authorization.operation_failed", {
+      event: "provider_authorization.operation_failed",
       request_id: ctx.request_id,
       trace_id: ctx.trace_id,
       error: cause instanceof Error ? cause : String(cause),
@@ -288,6 +300,89 @@ modelProviderAccountRoutes.delete(
       if (id instanceof Response) return id;
       return authorizationOperation(ctx, async () => {
         await authorizationService(env, ctx).cancel(ctx.principal.userId, parsedProvider, id);
+        return new Response(null, { status: 204 });
+      });
+    })
+);
+modelProviderAccountRoutes.post(
+  "/model-provider-accounts/:provider/authorization-codes",
+  ACCOUNTS_MANAGE,
+  (c) =>
+    dispatch(c, async (request, env, params, ctx) => {
+      const parsedProvider = provider(params.provider);
+      if (parsedProvider instanceof Response) return parsedProvider;
+      const body = await parseBody(
+        request,
+        startProviderAuthorizationCodeRequestSchema,
+        "Invalid authorization request"
+      );
+      if (body instanceof Response) return body;
+      return authorizationOperation(ctx, async () =>
+        json(
+          await authorizationCodeService(env, ctx).start(
+            ctx.principal.userId,
+            parsedProvider,
+            body
+          ),
+          201
+        )
+      );
+    })
+);
+modelProviderAccountRoutes.get(
+  "/model-provider-accounts/:provider/authorization-codes/:id",
+  ACCOUNTS_MANAGE,
+  (c) =>
+    dispatch(c, async (_request, env, params, ctx) => {
+      const parsedProvider = provider(params.provider);
+      if (parsedProvider instanceof Response) return parsedProvider;
+      const id = authorizationId(params.id);
+      if (id instanceof Response) return id;
+      return authorizationOperation(ctx, async () =>
+        json(
+          await authorizationCodeService(env, ctx).status(ctx.principal.userId, parsedProvider, id)
+        )
+      );
+    })
+);
+modelProviderAccountRoutes.post(
+  "/model-provider-accounts/:provider/authorization-codes/:id/complete",
+  ACCOUNTS_MANAGE,
+  (c) =>
+    dispatch(c, async (request, env, params, ctx) => {
+      const parsedProvider = provider(params.provider);
+      if (parsedProvider instanceof Response) return parsedProvider;
+      const id = authorizationId(params.id);
+      if (id instanceof Response) return id;
+      const body = await parseBody(
+        request,
+        completeProviderAuthorizationCodeRequestSchema,
+        "Invalid authorization code"
+      );
+      if (body instanceof Response) return body;
+      return authorizationOperation(ctx, async () =>
+        json(
+          await authorizationCodeService(env, ctx).complete(
+            ctx.principal.userId,
+            parsedProvider,
+            id,
+            body.code
+          )
+        )
+      );
+    })
+);
+modelProviderAccountRoutes.delete(
+  "/model-provider-accounts/:provider/authorization-codes/:id",
+  ACCOUNTS_MANAGE,
+  (c) =>
+    dispatch(c, async (_request, env, params, ctx) => {
+      const parsedProvider = provider(params.provider);
+      if (parsedProvider instanceof Response) return parsedProvider;
+      const id = authorizationId(params.id);
+      if (id instanceof Response) return id;
+      return authorizationOperation(ctx, async () => {
+        await authorizationCodeService(env, ctx).cancel(ctx.principal.userId, parsedProvider, id);
         return new Response(null, { status: 204 });
       });
     })
@@ -422,11 +517,11 @@ async function handleLegacyProviderAccess(
   sessionId: string,
   providerId: SubscriptionProviderId
 ): Promise<Response> {
-  const response = await createSessionRuntimeClient(env, ctx).fetch(
-    sessionId,
-    LEGACY_REFRESH_PATH[providerId],
-    { method: "POST" }
-  );
+  const legacyPath = LEGACY_REFRESH_PATH[providerId];
+  if (!legacyPath) return error("Provider has no legacy scoped OAuth path", 409);
+  const response = await createSessionRuntimeClient(env, ctx).fetch(sessionId, legacyPath, {
+    method: "POST",
+  });
   if (!response.ok) return response;
   const parsed = legacyAccessSchema.safeParse(await response.json().catch(() => null));
   if (!parsed.success) return error("Provider access unavailable", 503);
@@ -440,11 +535,93 @@ async function handleLegacyProviderAccess(
   });
 }
 
+const PROVIDER_ACCESS_CALLBACK_TIMEOUT_MS = 7_000;
+
+const accessRequestSchema = z
+  .object({
+    reason: z.literal("unauthorized").optional(),
+    rejectedCredentialVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  })
+  .strict()
+  .refine(
+    (value) => (value.reason === undefined) === (value.rejectedCredentialVersion === undefined)
+  );
+
 async function handleProviderAccess(
-  _request: Request,
+  request: Request,
   env: Env,
   params: { id: string; provider: string },
   ctx: SandboxRouteContext
+): Promise<Response> {
+  const deadlineHeader = request.headers.get("X-Provider-Deadline-Ms");
+  if (
+    deadlineHeader !== null &&
+    (!/^\d+$/.test(deadlineHeader) || !Number.isSafeInteger(Number(deadlineHeader)))
+  )
+    return error("Invalid provider access deadline", 400);
+  const headerDeadline =
+    deadlineHeader === null
+      ? undefined
+      : Math.min(Date.now() + PROVIDER_ACCESS_CALLBACK_TIMEOUT_MS, Number(deadlineHeader));
+  if (headerDeadline !== undefined && headerDeadline <= Date.now())
+    return error("Provider access deadline exceeded", 504);
+  let raw: unknown;
+  try {
+    const body = await withinProviderAccessDeadline(
+      readBoundedBytes(request.body, 1024, request.headers.get("content-length")),
+      headerDeadline
+    );
+    if (!body.ok) return error("Invalid provider access request", 400);
+    const text = new TextDecoder().decode(body.bytes);
+    raw = text.trim() ? JSON.parse(text) : {};
+  } catch (cause) {
+    if (cause instanceof ModelProviderAccountBrokerError && cause.code === "deadline_exceeded")
+      return error("Provider access deadline exceeded", 504);
+    return error("Invalid provider access request", 400);
+  }
+  const parsed = accessRequestSchema.safeParse(raw);
+  if (!parsed.success) return error("Invalid provider access request", 400);
+  // Legacy/OpenCode callers without a callback deadline retain their existing
+  // exchange wait. Native Codex's client also enforces its own total 8s budget.
+  const deadlineAt =
+    headerDeadline ??
+    (parsed.data.reason ? Date.now() + PROVIDER_ACCESS_CALLBACK_TIMEOUT_MS : undefined);
+  if (deadlineAt !== undefined && deadlineAt <= Date.now())
+    return error("Provider access deadline exceeded", 504);
+  const operation = handleProviderAccessWork(
+    env,
+    params,
+    ctx,
+    parsed.data.rejectedCredentialVersion,
+    deadlineAt
+  );
+  // The caller may time out after the provider rotates. Keep the persistence/fence
+  // alive in Workers as well as Node; never abandon or blindly repeat that grant.
+  if (deadlineAt !== undefined) {
+    ctx.executionCtx.submit(
+      () =>
+        operation.then(
+          () => undefined,
+          () => undefined
+        ),
+      { name: "provider-access-settlement" }
+    );
+  }
+  try {
+    return await withinProviderAccessDeadline(operation, deadlineAt);
+  } catch (cause) {
+    return cause instanceof ModelProviderAccountBrokerError && cause.code === "deadline_exceeded"
+      ? error("Provider access deadline exceeded", 504)
+      : error("Provider access unavailable", 503);
+  }
+}
+
+async function handleProviderAccessWork(
+  env: Env,
+  params: { id: string; provider: string },
+  ctx: SandboxRouteContext,
+  rejectedCredentialVersion?: number,
+  deadlineAt?: number
 ): Promise<Response> {
   const sessionId = params.id;
   const parsedProvider = provider(params.provider);
@@ -468,10 +645,23 @@ async function handleProviderAccess(
   }
   if (!binding) return error("Session provider account is not configured", 404);
   if (binding.authMode === "legacy_scoped_oauth") {
+    if (rejectedCredentialVersion !== undefined)
+      return error("Rejected-version refresh requires a connected account", 409);
     return handleLegacyProviderAccess(env, ctx, sessionId, parsedProvider);
   }
   if (binding.authMode === "api_key") {
     return error("Session uses API-key mode for this provider", 409);
+  }
+  if (
+    modelProviderAccountAdapterRegistry.runtimeCredentialKind(parsedProvider) !==
+    "brokered_access_token"
+  ) {
+    // The stored secret only leaves through the runtime-credential route,
+    // which applies the account and expiry checks for it.
+    return error(
+      "Provider delivers a stored provider secret; use the runtime-credential route",
+      409
+    );
   }
   const broker = new ModelProviderAccountBroker(
     {
@@ -486,12 +676,29 @@ async function handleProviderAccess(
     { now: () => Date.now(), createOwner: () => generateId() }
   );
   try {
-    return json(await broker.getAccess(binding.providerAccountId, parsedProvider));
+    return json(
+      await broker.getAccess(binding.providerAccountId, parsedProvider, {
+        rejectedCredentialVersion,
+        deadlineAt,
+      })
+    );
   } catch (cause) {
     if (cause instanceof ModelProviderAccountBrokerError) {
       const status =
-        cause.code === "account_not_found" ? 404 : cause.code === "upstream_retry_safe" ? 502 : 409;
-      return error(cause.message, status);
+        cause.code === "deadline_exceeded"
+          ? 504
+          : cause.code === "account_not_found"
+            ? 404
+            : cause.code === "upstream_retry_safe"
+              ? 502
+              : 409;
+      return json(
+        {
+          error: cause.message,
+          ...(cause.code === "exchange_busy" ? { retryable: true } : {}),
+        },
+        status
+      );
     }
     return error("Provider access unavailable", 503);
   }

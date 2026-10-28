@@ -49,18 +49,43 @@ function getArrayArg(
   return Array.isArray(value) ? value : undefined;
 }
 
-function summarizeApplyPatch(patchText: string | undefined): PatchSummary {
-  if (!patchText) {
-    return {
-      addCount: 0,
-      updateCount: 0,
-      deleteCount: 0,
-      totalFiles: 0,
-      firstFile: null,
-      firstOperation: null,
-    };
-  }
+const SUBTASK_ROOT_TOOL = "task";
 
+/**
+ * Whether a tool call opens a nested subtask. Both harnesses report the root
+ * as `task`; the Claude runtime maps its sub-agent tool at the event boundary.
+ */
+export function isSubtaskRootTool(tool: string | undefined): boolean {
+  return tool?.toLowerCase() === SUBTASK_ROOT_TOOL;
+}
+
+const MCP_TOOL_PREFIX = "mcp__";
+
+/**
+ * Splits an external MCP tool name (`mcp__<server>__<tool>`) into its parts.
+ * First-party tools never arrive qualified: the Claude runtime strips its own
+ * server prefix at the event boundary, so they hit the same branches as
+ * OpenCode's.
+ */
+export function parseMcpToolName(
+  tool: string | undefined
+): { server: string; tool: string } | null {
+  if (!tool || !tool.toLowerCase().startsWith(MCP_TOOL_PREFIX)) return null;
+  const rest = tool.slice(MCP_TOOL_PREFIX.length);
+  const separator = rest.indexOf("__");
+  if (separator <= 0 || separator + 2 >= rest.length) return null;
+  return { server: rest.slice(0, separator), tool: rest.slice(separator + 2) };
+}
+
+function summarizeArgumentCount(args: Record<string, unknown> | undefined): string {
+  const argumentCount = args ? Object.keys(args).length : 0;
+  return argumentCount > 0 ? `${argumentCount} argument${argumentCount === 1 ? "" : "s"}` : "";
+}
+
+function summarizeApplyPatch(
+  patchText: string | undefined,
+  changes: unknown[] | undefined
+): PatchSummary {
   const summary: PatchSummary = {
     addCount: 0,
     updateCount: 0,
@@ -70,6 +95,32 @@ function summarizeApplyPatch(patchText: string | undefined): PatchSummary {
     firstOperation: null,
   };
 
+  function recordChange(operation: PatchOperation, filePath: string): void {
+    if (operation === "add") summary.addCount += 1;
+    else if (operation === "update") summary.updateCount += 1;
+    else summary.deleteCount += 1;
+    summary.totalFiles += 1;
+    if (!summary.firstFile) {
+      summary.firstFile = basename(filePath);
+      summary.firstOperation = operation;
+    }
+  }
+
+  if (!patchText) {
+    for (const change of changes ?? []) {
+      if (!change || typeof change !== "object") continue;
+      const entry = change as Record<string, unknown>;
+      const filePath = getStringArg(entry, "path");
+      const kind = entry.kind;
+      if (!filePath || !kind || typeof kind !== "object") continue;
+      const operation = getStringArg(kind as Record<string, unknown>, "type");
+      if (operation === "add" || operation === "update" || operation === "delete") {
+        recordChange(operation, filePath);
+      }
+    }
+    return summary;
+  }
+
   for (const line of patchText.split("\n")) {
     let operation: PatchOperation | null = null;
     let filePath: string | undefined;
@@ -77,24 +128,15 @@ function summarizeApplyPatch(patchText: string | undefined): PatchSummary {
     if (line.startsWith("*** Add File: ")) {
       operation = "add";
       filePath = line.slice("*** Add File: ".length);
-      summary.addCount += 1;
     } else if (line.startsWith("*** Update File: ")) {
       operation = "update";
       filePath = line.slice("*** Update File: ".length);
-      summary.updateCount += 1;
     } else if (line.startsWith("*** Delete File: ")) {
       operation = "delete";
       filePath = line.slice("*** Delete File: ".length);
-      summary.deleteCount += 1;
     }
 
-    if (!operation) continue;
-
-    summary.totalFiles += 1;
-    if (!summary.firstFile) {
-      summary.firstFile = basename(filePath);
-      summary.firstOperation = operation;
-    }
+    if (operation) recordChange(operation, filePath ?? "");
   }
 
   return summary;
@@ -125,14 +167,27 @@ export interface FormattedToolCall {
 }
 
 /**
- * Format a tool call event for compact display
- * Note: OpenCode uses camelCase field names (filePath, not file_path)
- * Tool names are normalized to lowercase for matching since OpenCode may
- * report them in different cases (e.g., "todowrite" vs "TodoWrite")
+ * Format a tool call event for compact display.
+ *
+ * Tool names are matched case-insensitively: OpenCode reports lowercase names
+ * (`read`, `todowrite`) while the Claude Agent SDK capitalizes them (`Read`,
+ * `TodoWrite`). Argument keys differ the same way (OpenCode `filePath`, Claude
+ * Agent `file_path`), so each branch accepts both spellings. External MCP
+ * tools arrive as `mcp__<server>__<tool>`.
  */
 export function formatToolCall(event: ToolCallEvent): FormattedToolCall {
   const { tool, args, output } = event;
   const normalizedTool = tool?.toLowerCase() || "unknown";
+
+  const mcpTool = parseMcpToolName(tool);
+  if (mcpTool) {
+    return {
+      toolName: `${mcpTool.server}: ${mcpTool.tool}`,
+      summary: summarizeArgumentCount(args),
+      icon: null,
+      getDetails: () => ({ args, output }),
+    };
+  }
 
   switch (normalizedTool) {
     case "read": {
@@ -149,11 +204,32 @@ export function formatToolCall(event: ToolCallEvent): FormattedToolCall {
       };
     }
 
-    case "edit": {
+    case "edit":
+    case "multiedit": {
       const filePath = getStringArg(args, "filePath", "file_path");
+      const fileLabel = filePath ? basename(filePath) : "file";
+      const edits = normalizedTool === "multiedit" ? getArrayArg(args, "edits") : undefined;
       return {
         toolName: "Edit",
-        summary: filePath ? basename(filePath) : "file",
+        summary: edits
+          ? `${fileLabel} (${edits.length} edit${edits.length === 1 ? "" : "s"})`
+          : fileLabel,
+        icon: "pencil",
+        getDetails: () => ({ args, output }),
+      };
+    }
+
+    case "notebookedit": {
+      const notebookPath = getStringArg(
+        args,
+        "notebook_path",
+        "notebookPath",
+        "filePath",
+        "file_path"
+      );
+      return {
+        toolName: "NotebookEdit",
+        summary: notebookPath ? basename(notebookPath) : "notebook",
         icon: "pencil",
         getDetails: () => ({ args, output }),
       };
@@ -214,7 +290,7 @@ export function formatToolCall(event: ToolCallEvent): FormattedToolCall {
     }
 
     case "skill": {
-      const name = getStringArg(args, "name");
+      const name = getStringArg(args, "name", "skill");
       return {
         toolName: "skill",
         summary: name ? `"${name}"` : "",
@@ -253,9 +329,35 @@ export function formatToolCall(event: ToolCallEvent): FormattedToolCall {
       };
     }
 
+    case "taskcreate":
+    case "taskupdate": {
+      const subject = getStringArg(args, "subject", "description", "taskId", "task_id");
+      const status = normalizedTool === "taskupdate" ? getStringArg(args, "status") : undefined;
+      return {
+        toolName: normalizedTool === "taskcreate" ? "TaskCreate" : "TaskUpdate",
+        summary: subject
+          ? `${subject}${status ? ` (${status})` : ""}`
+          : (status ?? (normalizedTool === "taskcreate" ? "task" : "update")),
+        icon: "file",
+        getDetails: () => ({ args, output }),
+      };
+    }
+
+    case "askuserquestion": {
+      const questions = getArrayArg(args, "questions");
+      return {
+        toolName: "AskUserQuestion",
+        summary: questions
+          ? `${questions.length} question${questions.length === 1 ? "" : "s"}`
+          : "question",
+        icon: null,
+        getDetails: () => ({ args, output }),
+      };
+    }
+
     case "apply_patch": {
       const patchText = getStringArg(args, "patchText");
-      const patchSummary = summarizeApplyPatch(patchText);
+      const patchSummary = summarizeApplyPatch(patchText, getArrayArg(args, "changes"));
 
       let summary = "patch";
       if (patchSummary.totalFiles === 1 && patchSummary.firstFile) {
@@ -289,11 +391,9 @@ export function formatToolCall(event: ToolCallEvent): FormattedToolCall {
     }
 
     default: {
-      const argumentCount = args ? Object.keys(args).length : 0;
       return {
         toolName: tool || "Unknown",
-        summary:
-          argumentCount > 0 ? `${argumentCount} argument${argumentCount === 1 ? "" : "s"}` : "",
+        summary: summarizeArgumentCount(args),
         icon: null,
         getDetails: () => ({ args, output }),
       };
@@ -317,8 +417,17 @@ export function formatToolGroup(events: ToolCallEvent[]): {
   const normalizedTool = rawToolName.toLowerCase();
   const count = events.length;
 
-  // Build summary based on tool type
-  // Use lowercase for matching since OpenCode may report tool names in different cases
+  const mcpTool = parseMcpToolName(rawToolName);
+  if (mcpTool) {
+    return {
+      toolName: `${mcpTool.server}: ${mcpTool.tool}`,
+      count,
+      summary: `${count} call${count === 1 ? "" : "s"}`,
+    };
+  }
+
+  // Build summary based on tool type; names are matched case-insensitively
+  // (see formatToolCall).
   switch (normalizedTool) {
     case "read": {
       return {
@@ -328,9 +437,18 @@ export function formatToolGroup(events: ToolCallEvent[]): {
       };
     }
 
-    case "edit": {
+    case "edit":
+    case "multiedit": {
       return {
         toolName: "Edit",
+        count,
+        summary: `${count} file${count === 1 ? "" : "s"}`,
+      };
+    }
+
+    case "write": {
+      return {
+        toolName: "Write",
         count,
         summary: `${count} file${count === 1 ? "" : "s"}`,
       };

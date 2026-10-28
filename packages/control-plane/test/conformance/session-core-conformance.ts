@@ -378,7 +378,7 @@ export const STORAGE_CONTRACTS: Record<
           expect(attachments.getUnreferenced(["attachment-1"])).toHaveLength(1);
           expect(repository.cancelPendingMessage("message-middle")).toBe(false);
           expect(
-            repository.listMessages({ limit: 1, status: "pending", cursor: "30" })
+            repository.listMessages({ limit: 1, status: "pending", cursor: { createdAt: 30 } })
           ).toMatchObject([{ id: "message-old" }]);
           expect(repository.listPendingMessagesWithCreatedAt().map(({ id }) => id)).toEqual([
             "message-old",
@@ -469,7 +469,7 @@ export const STORAGE_CONTRACTS: Record<
 
           sql.exec(
             `UPDATE sandbox SET modal_object_id = 'provider-1', code_server_url = 'old',
-           vnc_url = 'old', tunnel_urls = '{}', ttyd_url = 'old'`
+           vnc_url = 'old', tunnel_urls = '{}', ttyd_url = 'old', last_heartbeat = 200`
           );
           repository.updateSandboxForSpawn({
             status: "connecting",
@@ -480,6 +480,7 @@ export const STORAGE_CONTRACTS: Record<
             status: "connecting",
             modal_object_id: null,
             modal_sandbox_id: "sandbox-provider-id",
+            last_heartbeat: null,
             code_server_url: null,
             vnc_url: null,
             tunnel_urls: null,
@@ -511,15 +512,10 @@ export const STORAGE_CONTRACTS: Record<
             scm_name: "Conformance User",
           });
           repository.updateParticipantWsToken("participant-conformance", "ws-hash", 200);
-          repository.updateParticipantTokens("participant-conformance", {
-            scmAccessTokenEncrypted: "access-2",
-            scmRefreshTokenEncrypted: "refresh-2",
-            scmTokenExpiresAt: 300,
-          });
           expect(repository.getParticipantByWsTokenHash("ws-hash")).toMatchObject({
-            scm_access_token_encrypted: "access-2",
-            scm_refresh_token_encrypted: "refresh-2",
-            scm_token_expires_at: 300,
+            id: "participant-conformance",
+            scm_login: "original",
+            ws_token_created_at: 200,
           });
 
           repository.createParticipant({

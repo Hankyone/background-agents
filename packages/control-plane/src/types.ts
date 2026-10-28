@@ -4,7 +4,7 @@
 
 import type { CacheStore } from "@open-inspect/shared/cache-store";
 import type { SqlDatabase } from "./db/sql-database";
-import type { ImageBuildFinalizationQueue } from "./image-builds/finalization-job";
+import type { Jobs } from "./jobs";
 import type { FetchClient, QueueMetricsSource } from "./platform-ports";
 import type { SessionRuntimeDispatch } from "./session/runtime-client";
 import type { ObjectStorage } from "./storage/object-storage";
@@ -26,9 +26,7 @@ export interface EnvConfig {
   MODAL_TOKEN_ID?: string;
   MODAL_TOKEN_SECRET?: string;
   MODAL_API_SECRET?: string; // Shared secret for authenticating with Modal endpoints
-  ANTHROPIC_API_KEY?: string; // Anthropic API key for Claude models
   DAYTONA_API_KEY?: string; // Daytona REST API key (Bearer auth + HMAC derivation)
-  OPENCOMPUTER_API_KEY?: string; // OpenComputer REST API key (X-API-Key auth + HMAC derivation)
   VERCEL_TOKEN?: string; // Vercel API access token for Sandbox API
   // Pepper for image-build callback token hashes.
   IMAGE_CALLBACK_TOKEN_PEPPER?: string;
@@ -62,17 +60,21 @@ export interface EnvConfig {
   ALLOWED_GITHUB_ORGS?: string;
   UNSAFE_ALLOW_ALL_USERS?: string;
   CF_ACCOUNT_ID?: string; // Cloudflare account ID
-  SANDBOX_PROVIDER?: string; // "modal" (default), "daytona", "vercel", "opencomputer", or "e2b"
+  SANDBOX_PROVIDER?: string; // "modal" (default), "modal-vm", "daytona", "vercel", "e2b", or "boat"
   MODAL_WORKSPACE?: string; // Modal workspace name
   MODAL_ENVIRONMENT?: string; // Modal environment name for dashboard URLs
   MODAL_ENVIRONMENT_WEB_SUFFIX?: string; // Modal environment web suffix for endpoint URLs
+  // Origin serving the Modal functions by path, in place of their derived
+  // `*.modal.run` hosts. Unset in every cloud deployment; a proxy or a
+  // stand-in server sets it, as the other providers' `*_API_URL` settings do.
+  MODAL_API_URL?: string;
   DAYTONA_API_URL?: string; // Daytona REST API base URL
   DAYTONA_BASE_SNAPSHOT?: string; // Named Daytona snapshot used for fresh sandbox creation
   DAYTONA_AUTO_STOP_INTERVAL_MINUTES?: string; // Daytona idle stop interval in minutes
   DAYTONA_AUTO_ARCHIVE_INTERVAL_MINUTES?: string; // Daytona archive interval in minutes
   DAYTONA_TARGET?: string; // Optional Daytona target name
-  OPENCOMPUTER_API_URL?: string; // OpenComputer REST API base URL
-  OPENCOMPUTER_TEMPLATE?: string; // Declarative template containing sandbox runtime
+  DAYTONA_TOOLBOX_API_URL?: string; // Optional explicit Daytona toolbox proxy base URL
+  DAYTONA_PREBUILDS_ENABLED?: string; // Admits new Daytona image builds and prebuilt selection
   VERCEL_PROJECT_ID?: string; // Vercel project ID used for Sandbox API scope
   VERCEL_TEAM_ID?: string; // Optional Vercel team ID used for Sandbox API scope
   VERCEL_BASE_SNAPSHOT_ID?: string; // Optional prebuilt base snapshot with sandbox runtime
@@ -87,10 +89,19 @@ export interface EnvConfig {
   E2B_SANDBOX_TIMEOUT_SECONDS?: string; // Sandbox TTL in seconds; Hobby plans must set 3300
   E2B_AUTO_PAUSE?: string; // "true" (default) pauses on TTL expiry (resumable, auto-resumes) instead of killing
 
+  BOAT_API_KEY?: string; // Boat REST API key (Bearer auth + sandbox access password HMAC)
+  BOAT_API_URL?: string; // Boat REST API base URL (default https://boat.dev/api/v1)
+  BOAT_BASE_SNAPSHOT?: string; // Named Boat snapshot built by boat-infra; fresh sandboxes deploy from it
+  BOAT_ORG?: string; // Optional Boat organization wallet sandboxes are billed to
+  BOAT_SANDBOX_TYPE?: string; // Machine size when a session requests no resources: small, default (default), large, xlarge
+
   // Sandbox lifecycle configuration
-  SANDBOX_INACTIVITY_TIMEOUT_MS?: string; // Inactivity timeout in ms (default: 600000 = 10 min)
-  EXECUTION_TIMEOUT_MS?: string; // Max processing time before auto-fail; sessions fall back to DEFAULT_SANDBOX_TIMEOUT_SECONDS, the scheduler's recovery sweep to its DEFAULT_EXECUTION_TIMEOUT_MS
+  SANDBOX_INACTIVITY_TIMEOUT_MS?: string; // Inactivity timeout in ms; defaults to DEFAULT_INACTIVITY_CONFIG.timeoutMs
+  SANDBOX_UNATTENDED_INACTIVITY_TIMEOUT_MS?: string; // Unattended inactivity timeout in ms; defaults to DEFAULT_INACTIVITY_CONFIG.unattendedTimeoutMs
+  SANDBOX_BOOT_TIMEOUT_MS?: string; // Longest a connected sandbox may boot before it is failed, in ms; defaults to DEFAULT_BOOT_BUDGET_CONFIG
+  EXECUTION_TIMEOUT_MS?: string; // Max processing time for one message before auto-fail, for sessions and for the automation runs watching them; overridden per session by sandboxTimeoutMs, and falls back to DEFAULT_SANDBOX_TIMEOUT_SECONDS
   SECRETS_CAP_ENFORCEMENT?: string; // "enforce" (default) fails spawn/build on oversized secret payloads; set "warn" to only log
+  TEAMS_ENFORCEMENT?: string; // "off" | "shadow" (default) | "on"
 
   // Logging
   LOG_LEVEL?: string; // "debug" | "info" | "warn" | "error" (default: "info")
@@ -118,8 +129,8 @@ export interface Platform {
   /** GitHub Autofix queues, read for health metrics only. */
   AUTOFIX_QUEUE?: QueueMetricsSource;
   AUTOFIX_DLQ?: QueueMetricsSource;
-  /** Durable callback-to-finalizer handoff for provider-session image builds. */
-  IMAGE_BUILD_FINALIZATION_QUEUE?: ImageBuildFinalizationQueue;
+  /** Durable background work supplied by every host. */
+  JOBS: Jobs;
 }
 
 /** What the application runs against: its configuration and the platform ports. */

@@ -1,16 +1,16 @@
-import { NextResponse } from "next/server";
-import { getServerAuthSession } from "@/lib/server-auth-session";
 import { controlPlaneUserFetch } from "@/lib/control-plane";
 
-export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
-  const session = await getServerAuthSession();
-  if (!session?.user) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      { status: 401, headers: { "Cache-Control": "private, no-store", Vary: "Cookie" } }
-    );
-  }
+function hasSandboxUnavailableError(value: unknown): boolean {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    "error" in value &&
+    value.error === "Sandbox access is unavailable"
+  );
+}
 
+export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const response = await controlPlaneUserFetch(
     `/sessions/${encodeURIComponent(id)}/sandbox-access`,
@@ -18,12 +18,12 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
   );
   const conflict =
     response.status === 409
-      ? ((await response
+      ? await response
           .clone()
           .json()
-          .catch(() => null)) as { error?: unknown } | null)
+          .catch(() => null)
       : null;
-  if (conflict?.error === "Sandbox access is unavailable") {
+  if (hasSandboxUnavailableError(conflict)) {
     await response.body?.cancel();
     return new Response(null, {
       status: 204,

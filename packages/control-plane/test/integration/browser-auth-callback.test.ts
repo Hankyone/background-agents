@@ -1,14 +1,17 @@
 import { createExecutionContext, env } from "cloudflare:test";
 import { getSetCookies, routeRequest } from "./helpers";
 import { isCanonicalUserId } from "@open-inspect/shared/user-id";
+import { BROWSER_AUTH_CLIENT_IP_HEADER } from "@open-inspect/shared/browser-auth-routes";
 import { buildServiceAuthHeaders } from "@open-inspect/shared/service-auth";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getUserAuth } from "../../src/auth/user/runtime";
 import { createCloudflareEnv } from "../../src/cloudflare/platform";
 import { resolveGitHubCredentialAuthority } from "../../src/source-control/github-credential-authority";
-import { decryptToken } from "../../src/auth/crypto";
 import { UserStore } from "../../src/db/user-store";
-import { resolveGitHubEnrichmentForRequest } from "../../src/session/identity";
+import {
+  resolveCurrentGitHubAccessToken,
+  resolveGitHubEnrichmentForRequest,
+} from "../../src/session/identity";
 import { cleanD1Tables } from "./cleanup";
 import { createSignedGoogleIdToken } from "./google-id-token";
 
@@ -17,6 +20,7 @@ const PUBLIC_WEB_ORIGIN = "https://app.test.local";
 const WEB_SERVICE_SECRET = "test-service-secret-web";
 const GOOGLE_CLIENT_ID = "google-client-id";
 const GOOGLE_SUBJECT = "google-subject";
+const GITHUB_PERMISSION_DENIED_MESSAGE = "Resource not accessible by integration";
 const MS_PER_SECOND = 1000;
 const GOOGLE_ACCESS_TOKEN_LIFETIME_MS = 60 * 60 * MS_PER_SECOND;
 
@@ -30,6 +34,9 @@ function handleRequest(
 let googleIdToken = "";
 let googlePublicKey: JsonWebKey;
 let googleCertRequestCount = 0;
+let githubEmailLookupStatus = 200;
+let githubEmailLookupMessage = GITHUB_PERMISSION_DENIED_MESSAGE;
+let githubEmailLookupHeaders: Record<string, string> = {};
 
 async function signedWebRequest(
   path: string,
@@ -37,6 +44,7 @@ async function signedWebRequest(
     method: "GET" | "POST";
     body?: string;
     cookie?: string;
+    clientIp?: string;
   }
 ): Promise<Request> {
   const url = `${CONTROL_PLANE_ORIGIN}${path}`;
@@ -45,6 +53,7 @@ async function signedWebRequest(
     headers: {
       ...(init.body ? { "Content-Type": "application/json" } : {}),
       ...(init.cookie ? { Cookie: init.cookie } : {}),
+      ...(init.clientIp ? { [BROWSER_AUTH_CLIENT_IP_HEADER]: init.clientIp } : {}),
       Origin: PUBLIC_WEB_ORIGIN,
       ...(await buildServiceAuthHeaders({
         service: "web",
@@ -84,6 +93,19 @@ beforeAll(async () => {
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
     if (url === "https://github.com/login/oauth/access_token") {
+      const body = new URLSearchParams(
+        input instanceof Request ? await input.clone().text() : String(init?.body ?? "")
+      );
+      if (body.get("grant_type") === "refresh_token") {
+        expect(body.get("refresh_token")).toBe("github-refresh-token");
+        return Response.json({
+          access_token: "github-refreshed-access-token",
+          token_type: "bearer",
+          expires_in: 28_800,
+          refresh_token: "github-rotated-refresh-token",
+          refresh_token_expires_in: 15_897_600,
+        });
+      }
       return Response.json({
         access_token: "github-access-token",
         token_type: "bearer",
@@ -101,6 +123,12 @@ beforeAll(async () => {
       });
     }
     if (url.startsWith("https://api.github.com/user/emails")) {
+      if (githubEmailLookupStatus !== 200) {
+        return Response.json(
+          { message: githubEmailLookupMessage },
+          { status: githubEmailLookupStatus, headers: githubEmailLookupHeaders }
+        );
+      }
       return Response.json([
         {
           email: "octocat@example.com",
@@ -139,6 +167,9 @@ beforeAll(async () => {
 beforeEach(async () => {
   await cleanD1Tables();
   googleCertRequestCount = 0;
+  githubEmailLookupStatus = 200;
+  githubEmailLookupMessage = GITHUB_PERMISSION_DENIED_MESSAGE;
+  githubEmailLookupHeaders = {};
 });
 
 afterAll(() => {
@@ -325,10 +356,11 @@ describe("browser auth callback", () => {
         "SELECT COUNT(*) AS count FROM authorization_audit_events WHERE action = 'workspace.owner_bootstrapped'"
       ).first()
     ).resolves.toEqual({ count: 0 });
+    await expect(
+      env.DB.prepare("SELECT COUNT(*) AS count FROM user_scm_tokens").first()
+    ).resolves.toEqual({ count: 0 });
 
     const enrichment = await resolveGitHubEnrichmentForRequest(
-      createCloudflareEnv(env),
-      env.DB,
       new UserStore(env.DB),
       session.user.id,
       await resolveGitHubCredentialAuthority(
@@ -348,11 +380,59 @@ describe("browser auth callback", () => {
       scmUserId: "583231",
       scmLogin: "octocat",
       email: "583231+octocat@users.noreply.github.com",
-      accessTokenEncrypted: expect.any(String),
     });
     await expect(
-      decryptToken(enrichment?.accessTokenEncrypted ?? "", env.TOKEN_ENCRYPTION_KEY)
+      resolveCurrentGitHubAccessToken(
+        new UserStore(env.DB),
+        () => getUserAuth(createCloudflareEnv(env), env.DB).api,
+        session.user.id,
+        "583231"
+      )
     ).resolves.toBe("github-access-token");
+
+    await env.DB.prepare("UPDATE user_identities SET access_token_expires_at = ? WHERE id = ?")
+      .bind(Date.now() + 30_000, account?.id)
+      .run();
+    await expect(
+      resolveCurrentGitHubAccessToken(
+        new UserStore(env.DB),
+        () => getUserAuth(createCloudflareEnv(env), env.DB).api,
+        session.user.id,
+        "583231"
+      )
+    ).resolves.toBe("github-refreshed-access-token");
+
+    await env.DB.prepare(
+      `UPDATE user_identities
+       SET access_token = NULL, refresh_token = NULL,
+           access_token_expires_at = NULL, refresh_token_expires_at = NULL
+       WHERE id = ?`
+    )
+      .bind(account?.id)
+      .run();
+    await expect(
+      resolveCurrentGitHubAccessToken(
+        new UserStore(env.DB),
+        () => getUserAuth(createCloudflareEnv(env), env.DB).api,
+        session.user.id,
+        "583231"
+      )
+    ).resolves.toBeNull();
+
+    const serviceEnrichment = await resolveGitHubEnrichmentForRequest(
+      new UserStore(env.DB),
+      session.user.id,
+      await resolveGitHubCredentialAuthority(
+        {
+          principal: { kind: "service", service: "slack-bot", actor: null },
+          getUserAuth: () => getUserAuth(createCloudflareEnv(env), env.DB),
+        },
+        new Headers()
+      )
+    );
+    expect(serviceEnrichment).toMatchObject({
+      scmUserId: "583231",
+    });
 
     await expect(
       env.DB.prepare(
@@ -386,6 +466,124 @@ describe("browser auth callback", () => {
     );
     expect(channelOnlyResponse.status).toBe(401);
   });
+
+  it.each([
+    [403, {}, "github_email_permission_missing", "203.0.113.91", GITHUB_PERMISSION_DENIED_MESSAGE],
+    [
+      403,
+      { "x-ratelimit-remaining": "0" },
+      "provider_unavailable",
+      "203.0.113.92",
+      GITHUB_PERMISSION_DENIED_MESSAGE,
+    ],
+    [502, {}, "provider_unavailable", "203.0.113.93", GITHUB_PERMISSION_DENIED_MESSAGE],
+    [403, {}, "provider_unavailable", "203.0.113.94", "Your account has been suspended"],
+  ] as const)(
+    "redirects to login when GitHub rejects the email lookup (%s, %j)",
+    async (status, headers, reason, clientIp, message) => {
+      githubEmailLookupStatus = status;
+      githubEmailLookupMessage = message;
+      githubEmailLookupHeaders = headers;
+      const requestEnv = {
+        ...env,
+        UNSAFE_ALLOW_ALL_USERS: "false",
+        ALLOWED_USERS: "octocat",
+        GOOGLE_CLIENT_ID: undefined,
+        GOOGLE_CLIENT_SECRET: undefined,
+      };
+      // A separate client keeps this sign-in out of the other tests' rate-limit bucket.
+      const initiationBody = JSON.stringify({
+        provider: "github",
+        callbackURL: "/after-sign-in",
+        disableRedirect: true,
+      });
+      const initiationResponse = await handleRequest(
+        await signedWebRequest("/api/auth/sign-in/social", {
+          method: "POST",
+          body: initiationBody,
+          clientIp,
+        }),
+        requestEnv
+      );
+      expect(initiationResponse.status).toBe(200);
+      const providerUrl = new URL((await initiationResponse.json<{ url: string }>()).url);
+      const state = providerUrl.searchParams.get("state");
+      const stateCookie = cookiePair(initiationResponse, "__Secure-openinspect.state");
+
+      const callbackResponse = await handleRequest(
+        await signedWebRequest(
+          `/api/auth/callback/github?code=authorization-code&state=${encodeURIComponent(state ?? "")}`,
+          {
+            method: "GET",
+            cookie: stateCookie,
+            clientIp,
+          }
+        ),
+        requestEnv
+      );
+
+      expect(callbackResponse.status).toBe(302);
+      expect(callbackResponse.headers.get("Location")).toBe(
+        `${PUBLIC_WEB_ORIGIN}/login?error=${reason}`
+      );
+      expect(
+        getSetCookies(callbackResponse.headers).some((cookie) =>
+          cookie.startsWith("__Secure-openinspect.session_token=")
+        )
+      ).toBe(false);
+      expect(getSetCookies(callbackResponse.headers)).toContainEqual(
+        expect.stringMatching(/^__Secure-openinspect\.state=;.*Max-Age=0/)
+      );
+      await expect(
+        env.DB.prepare("SELECT COUNT(*) AS count FROM auth_sessions").first()
+      ).resolves.toEqual({ count: 0 });
+      await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM users").first()).resolves.toEqual({
+        count: 0,
+      });
+    }
+  );
+
+  it.each([
+    ["the user cancels GitHub consent", "error=access_denied", true, "access_denied"],
+    ["the state cookie is missing", "code=authorization-code", false, "state_mismatch"],
+  ] as const)(
+    "sends Better Auth's own callback errors to login when %s",
+    async (_label, callbackQuery, sendStateCookie, error) => {
+      const clientIp = sendStateCookie ? "203.0.113.95" : "203.0.113.96";
+      const initiationResponse = await handleRequest(
+        await signedWebRequest("/api/auth/sign-in/social", {
+          method: "POST",
+          body: JSON.stringify({
+            provider: "github",
+            callbackURL: "/after-sign-in",
+            disableRedirect: true,
+          }),
+          clientIp,
+        }),
+        env
+      );
+      const providerUrl = new URL((await initiationResponse.json<{ url: string }>()).url);
+      const state = providerUrl.searchParams.get("state");
+      const stateCookie = cookiePair(initiationResponse, "__Secure-openinspect.state");
+
+      const callbackResponse = await handleRequest(
+        await signedWebRequest(
+          `/api/auth/callback/github?${callbackQuery}&state=${encodeURIComponent(state ?? "")}`,
+          {
+            method: "GET",
+            ...(sendStateCookie ? { cookie: stateCookie } : {}),
+            clientIp,
+          }
+        ),
+        env
+      );
+
+      expect(callbackResponse.status).toBe(302);
+      expect(callbackResponse.headers.get("Location")).toBe(
+        `${PUBLIC_WEB_ORIGIN}/login?error=${error}`
+      );
+    }
+  );
 
   it("signs an existing canonical user in through a migrated GitHub account", async () => {
     const canonicalUserId = "11111111111111111111111111111111";

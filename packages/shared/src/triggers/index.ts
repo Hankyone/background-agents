@@ -23,11 +23,14 @@ export type {
 } from "./types";
 export {
   TRIGGER_TYPE_TO_SOURCE,
+  WEBHOOK_SESSION_KEY_MAX_LENGTH,
+  automationTriggerTypeSchema,
   automationEventSchema,
   githubAutomationEventSchema,
   linearAutomationEventSchema,
   sentryAutomationEventSchema,
   webhookAutomationEventSchema,
+  webhookSessionKeySchema,
   slackAutomationEventSchema,
   triggerConfigSchema,
 } from "./types";
@@ -40,6 +43,7 @@ export {
   isGitHubConditionCompatible,
   matchesConditions,
   validateConditions,
+  validateTriggerConditions,
 } from "./conditions";
 
 // Registry
@@ -87,10 +91,15 @@ export {
   evaluateJsonPathFilter,
   buildWebhookContextBlock,
 } from "./webhook";
+export type { WebhookDeliveryOptions } from "./webhook";
 
 // Slack source module
 export {
   slackSource,
+  hasValidSlackChannelCondition,
+  hasSlackActorIncludeList,
+  normalizeSlackChannelConditions,
+  parseSlackChannelCondition,
   normalizeSlackEvent,
   buildSlackContextBlock,
   slackChannelLabel,
@@ -98,4 +107,9 @@ export {
   REGEX_PATTERN_MAX_LENGTH,
   ALLOWED_REGEX_FLAGS,
 } from "./slack";
-export type { SlackMessageInput, SlackChannelMeta } from "./slack";
+export type {
+  SlackMessageAuthor,
+  SlackMessageInput,
+  SlackChannelMeta,
+  SlackChannelConditionParseResult,
+} from "./slack";

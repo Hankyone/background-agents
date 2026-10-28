@@ -13,53 +13,45 @@ The infrastructure spans multiple cloud providers:
 | **Vercel**     | Next.js Web App, optional sandbox sessions           | Native provider + Sandbox API calls |
 | **Modal**      | Optional sandbox infrastructure                      | CLI wrapper (no provider exists)    |
 | **Daytona**    | Optional sandbox snapshots                           | REST API wrapper                    |
+| **Boat**       | Optional sandbox snapshots                           | REST API wrapper                    |
 
 ## Directory Structure
 
 ```
 terraform/
 ├── d1/
-│   └── migrations/              # D1 database migrations (applied via d1-migrate.sh)
-├── modules/                      # Reusable Terraform modules
-│   ├── cloudflare-kv/           # KV namespace management
-│   ├── cloudflare-worker/       # Worker deployment with bindings (KV, DO, D1)
-│   ├── daytona-infra/           # Daytona snapshot bootstrap wrapper
-│   ├── vercel-project/          # Vercel project + environment vars
-│   └── modal-app/               # Modal CLI wrapper
-│       └── scripts/             # Deployment scripts
+│   └── migrations/              # D1 migrations (applied via d1-migrate.sh)
+├── modules/                     # Reusable modules with input/output definitions
 ├── environments/
-│   └── production/              # Production root module (split by concern)
-│       ├── main.tf              # Entrypoint + file map
-│       ├── locals.tf            # Shared naming/URL/script path locals
-│       ├── kv.tf                # Cloudflare KV namespaces
-│       ├── d1.tf                # D1 database + migrations
-│       ├── workers-*.tf         # Worker builds/deployments per service
-│       ├── web-*.tf             # Web app resources (Vercel/OpenNext)
-│       ├── daytona.tf           # Daytona snapshot resources
-│       ├── modal.tf             # Modal infrastructure
-│       ├── checks.tf            # Terraform check blocks
-│       ├── moved.tf             # State move declarations
-│       ├── variables.tf         # Input variables
-│       ├── outputs.tf           # Output values
-│       ├── backend.tf           # State backend (R2)
-│       ├── versions.tf          # Provider versions
-│       └── terraform.tfvars.example
+│   ├── production/              # Cloudflare-based deployment (split by concern)
+│   ├── aws-staging/             # AWS staging root module
+│   └── aws-production/          # AWS production root module
 └── README.md                    # This file
 ```
+
+The [production root module](environments/production/) is split across `.tf` files loaded together;
+there is no special entrypoint file. See [variables.tf](environments/production/variables.tf) for
+inputs, [outputs.tf](environments/production/outputs.tf) for outputs, and
+[terraform.tfvars.example](environments/production/terraform.tfvars.example) for configuration. For
+AWS deployment instructions, see [AWS staging](environments/aws-staging/) and
+[AWS production](environments/aws-production/).
 
 ## Prerequisites
 
 ### 1. Required Tools
 
 ```bash
-# Terraform >= 1.9.0
+# Terraform >= 1.14.0 (see environments/production/versions.tf)
 brew install terraform
 
 # Modal CLI (for Modal deployments)
 pip install modal
 
-# Node.js >= 22 (for building workers)
-brew install node@22
+# Node.js >= 24 (for building workers). node@24 is keg-only, so put it on PATH
+# (add the export to your shell profile to keep it across sessions).
+brew install node@24
+export PATH="$(brew --prefix node@24)/bin:$PATH"
+node --version  # must print v24 or newer
 ```
 
 ### 2. Cloudflare Setup
@@ -193,9 +185,20 @@ The GitHub Actions workflow (`.github/workflows/terraform.yml`) automates:
 | Pull Request  | `terraform plan` with PR comment |
 | Merge to main | `terraform apply` (auto-approve) |
 
-### Required GitHub Secrets
+### GitHub Actions Secrets and Variables
 
-Add these secrets to your repository settings:
+Keep credentials in Actions **Secrets**. Non-secret configuration (account/application IDs, provider
+settings, feature flags, allowlists, and branding) can use Actions **Variables** instead. The
+workflows prefer a non-empty variable, then the same-named secret, then the existing default where
+one exists. Existing secret-only deployments continue to work; an empty variable falls back to the
+secret rather than clearing it. `CLASSIFICATION_MODEL` and `CLASSIFICATION_REASONING_EFFORT` remain
+variable-only.
+
+See [the CI/CD setup guide](../docs/GETTING_STARTED.md#set-up-cicd-optional) for the complete
+variable list and bulk upload examples using `gh variable set` and `gh secret set`.
+
+Add these settings to your repository, using **Variables** for non-secret configuration (including
+`R2_MEDIA_BUCKET_NAME`) and **Secrets** for credentials:
 
 ```
 # Deployment
@@ -207,12 +210,18 @@ CLOUDFLARE_ACCOUNT_ID
 CLOUDFLARE_WORKER_SUBDOMAIN
 R2_ACCESS_KEY_ID
 R2_SECRET_ACCESS_KEY
+R2_MEDIA_LOCATION # Optional; defaults to ENAM
+R2_MEDIA_BUCKET_NAME # Optional; name of the Terraform-created media bucket (import an existing one first)
 WEB_PLATFORM # Optional; defaults to vercel
 
 # Vercel web app (only if WEB_PLATFORM=vercel)
 VERCEL_API_TOKEN
 VERCEL_TEAM_ID
 VERCEL_PROJECT_ID
+
+# Documentation site (packages/docs)
+DOCS_SITE_ENABLED # Optional; defaults to false, which destroys a provisioned docs project
+DOCS_CUSTOM_DOMAIN # Optional; empty serves the vercel.app URL only
 
 # Modal
 MODAL_TOKEN_ID
@@ -224,11 +233,15 @@ MODAL_API_SECRET
 
 # Sandbox provider
 SANDBOX_PROVIDER
+SANDBOX_INACTIVITY_TIMEOUT_MS # Optional; defaults to 600000
+SANDBOX_UNATTENDED_INACTIVITY_TIMEOUT_MS # Optional; defaults to 120000, minimum 60000
+SANDBOX_BOOT_TIMEOUT_MS       # Optional; defaults to 1800000, must exceed 240000
 
 # Daytona (only if SANDBOX_PROVIDER=daytona)
 DAYTONA_API_URL
 DAYTONA_API_KEY
-DAYTONA_BASE_SNAPSHOT
+DAYTONA_BASE_SNAPSHOT            # Prefix for the Terraform-managed base snapshot
+DAYTONA_BASE_SNAPSHOT_MEMORY_GIB # Optional; defaults to 2
 DAYTONA_TARGET # Optional
 
 # Vercel Sandboxes (only if SANDBOX_PROVIDER=vercel)
@@ -238,6 +251,13 @@ VERCEL_SANDBOX_TEAM_ID # Optional
 VERCEL_BASE_SNAPSHOT_ID # Optional manual fallback; skips Terraform-managed snapshot builds
 VERCEL_SANDBOX_RUNTIME # Optional; defaults to node24
 VERCEL_SNAPSHOT_EXPIRATION_MS # Optional; defaults to 0
+
+# Boat (only if SANDBOX_PROVIDER=boat)
+BOAT_API_KEY
+BOAT_BASE_SNAPSHOT # Prefix for the Terraform-managed saved snapshot
+BOAT_API_URL       # Optional; defaults to https://boat.dev/api/v1
+BOAT_ORG           # Optional organization wallet
+BOAT_SANDBOX_TYPE  # Optional; defaults to default
 VERCEL_SANDBOX_API_BASE_URL # Optional advanced Vercel Sandbox API base URL override
 
 # Optional GitHub sign-in pair (set both or neither)
@@ -268,10 +288,13 @@ ENABLE_LINEAR_BOT # Optional; defaults to false
 LINEAR_CLIENT_ID
 LINEAR_CLIENT_SECRET
 LINEAR_WEBHOOK_SECRET
+LINEAR_API_KEY # Optional; fallback comment posting
 
 # API Keys
-ANTHROPIC_API_KEY
+ANTHROPIC_API_KEY # Optional; injected into Modal sandboxes and used by an Anthropic classifier when CLASSIFICATION_ANTHROPIC_API_KEY is unset
+CLASSIFICATION_ANTHROPIC_API_KEY # Optional; classifier-only Anthropic key that never reaches sandboxes
 CLASSIFICATION_OPENAI_API_KEY # Required when classification_model is an OpenAI model and the Slack or Linear bot is enabled
+CLASSIFICATION_BEDROCK_API_KEY # Required when classification_model is a Bedrock model and the Slack or Linear bot is enabled; see "Classify on Amazon Bedrock (Optional)" in docs/GETTING_STARTED.md
 
 # Security Secrets
 TOKEN_ENCRYPTION_KEY
@@ -282,133 +305,93 @@ NEXTAUTH_SECRET # Browser-auth secret; legacy Actions secret name
 # Access control
 ALLOWED_USERS
 ALLOWED_EMAIL_DOMAINS
+UNSAFE_ALLOW_ALL_USERS # Optional; defaults to false
+
+# Two-phase first deployment (see "Durable Objects" below)
 ENABLE_DURABLE_OBJECT_BINDINGS # Optional; defaults to true
+ENABLE_SERVICE_BINDINGS # Optional; defaults to true
 
 # Branding
 APP_NAME # Optional; defaults to Open-Inspect
 APP_ICON_URL
 ```
 
+### Sandbox Inactivity
+
+Set `sandbox_inactivity_timeout_ms` and `sandbox_unattended_inactivity_timeout_ms` in
+`terraform.tfvars`, or use the corresponding uppercase Actions settings above for CI deployments.
+Terraform passes them to the control-plane Worker as `SANDBOX_INACTIVITY_TIMEOUT_MS` and
+`SANDBOX_UNATTENDED_INACTIVITY_TIMEOUT_MS`. See
+[the CI/CD setup guide](../docs/GETTING_STARTED.md#set-up-cicd-optional) for which sessions use each
+timeout and what extends them.
+
+### Co-locating the request path
+
+For a Vercel web deployment, an API request travels from the browser to a Vercel edge, then to the
+web project's functions, the control-plane Worker, and D1. The edge and function regions are
+separate placements. Without Smart Placement, the Worker normally runs near its caller. Session
+requests also reach a session Durable Object, which reads and writes D1. Browser WebSockets and
+sandbox agent connections reach that object through the Worker; sandboxes run in their provider's
+locations, independently of the web functions and session objects.
+
+Two production Terraform inputs let you reduce distance along this path without changing the
+defaults:
+
+| Terraform input            | Actions repository variable | Default | Scope                                       |
+| -------------------------- | --------------------------- | ------- | ------------------------------------------- |
+| `web_serverless_region`    | `WEB_SERVERLESS_REGION`     | `iad1`  | Vercel web project functions only, not docs |
+| `session_do_location_hint` | `SESSION_DO_LOCATION_HINT`  | `""`    | New session Durable Objects                 |
+
+Set these in `terraform.tfvars`, or use the Actions repository variables for CI deployments. Choose
+a supported Vercel region near your users and D1's primary, balancing distance to each. The web
+region must match `^[a-z]{3}[0-9]$`; it has no effect when `web_platform = "cloudflare"`. Choose the
+session hint for D1's region: `wnam`, `enam`, `sam`, `weur`, `eeur`, `apac`, `apac-ne`, `apac-se`,
+`oc`, `afr`, or `me`. Prefer `apac` for general Asia-Pacific placement; use `apac-ne` or `apac-se`
+for the northeast or southeast subregion. See
+[Cloudflare's location hints](https://developers.cloudflare.com/durable-objects/reference/data-location/#provide-a-location-hint).
+An empty hint preserves automatic placement. Terraform rejects invalid values; if an invalid hint
+reaches the Worker outside Terraform, it logs a warning and ignores it rather than failing the
+request. Consider the Worker's Smart Placement separately after measuring these changes; neither
+input enables it.
+
+Apply and measure one setting at a time. A web region change takes effect only after a web redeploy
+following Terraform apply: Deploy Web pulls the updated project settings before building. A session
+hint is best-effort and only affects objects first created after the change. It applies to all
+session callers, including bots, automations, and sandboxes. Existing objects stay where they are,
+so requests to older sessions may still cross regions. Objects near D1 may also be farther from some
+sandboxes or third-party APIs; watch agent-event latency as well as web request latency.
+
+Check actual placement rather than assuming the settings were honored:
+
+- **Web functions:** inspect the function's location in **Function** details in
+  [Vercel Runtime Logs](https://vercel.com/docs/logs/runtime#log-details), not the request's
+  **Region** field (the edge location). In
+  [log drains](https://vercel.com/docs/drains/reference/logs#logs-schema), use `proxy.lambdaRegion`
+  for the function execution region; `executionRegion` describes request execution and
+  `proxy.region` describes proxy processing.
+- **Control-plane Worker:** inspect `$workers.event.request.cf.colo` on `cf-worker-event` in Workers
+  telemetry, comparing the callers whose requests you want to improve.
+- **Session Durable Objects:** query GraphQL `durableObjectsPeriodicGroups`, grouped by `coloCode`;
+  filter by `objectId` to check a newly created session rather than an older one.
+
+To roll back, unset the relevant Actions repository variable or remove the Terraform override,
+re-apply, and redeploy the web app if its region changed. This restores the default web region
+and/or removes the hint for future objects. Objects created with a hint remain where they are. These
+settings do not move D1, enable read replication, or select a sandbox-provider region.
+
 ## Module Reference
 
-### cloudflare-kv
+Browse [modules/](modules/) for the available modules. Each module's `variables.tf` defines its
+inputs, types, defaults, and validation; `outputs.tf` defines its returned values.
 
-Creates a Cloudflare Workers KV namespace.
+Use the maintained deployment configurations as integration examples:
 
-```hcl
-module "my_kv" {
-  source = "../../modules/cloudflare-kv"
+- [Cloudflare KV namespaces](environments/production/kv.tf)
+- [Control-plane Worker and bindings](environments/production/workers-control-plane.tf)
+- [Vercel web project](environments/production/web-vercel.tf)
+- [Modal deployment](environments/production/modal.tf)
 
-  account_id     = var.cloudflare_account_id
-  namespace_name = "my-namespace"
-}
-```
-
-**Outputs:** `namespace_id`, `namespace_name`
-
-### cloudflare-worker
-
-Deploys a Cloudflare Worker with bindings using the native 3-resource pattern: `cloudflare_worker` +
-`cloudflare_worker_version` + `cloudflare_workers_deployment`
-
-```hcl
-module "my_worker" {
-  source = "../../modules/cloudflare-worker"
-
-  account_id  = var.cloudflare_account_id
-  worker_name = "my-worker"
-  script_path = "dist/index.js"  # Path to bundled JS file
-
-  kv_namespaces = [
-    { binding_name = "KV", namespace_id = module.my_kv.namespace_id }
-  ]
-
-  service_bindings = [
-    { binding_name = "OTHER_WORKER", service_name = "other-worker" }
-  ]
-
-  secrets = [
-    { name = "API_KEY", value = var.api_key }
-  ]
-
-  durable_objects = [
-    { binding_name = "DO", class_name = "MyDurableObject" }
-  ]
-
-  d1_databases = [
-    { binding_name = "DB", database_id = cloudflare_d1_database.main.id }
-  ]
-
-  compatibility_date = "2024-09-23"
-  migration_tag      = "v1"  # For DO migrations
-}
-```
-
-**Outputs:** `worker_name`, `worker_id`, `version_id`, `deployment_id`, `worker_url`
-
-### vercel-project
-
-Creates a Vercel project with environment variables.
-
-```hcl
-module "web_app" {
-  source = "../../modules/vercel-project"
-
-  project_name = "my-app"
-  team_id      = var.vercel_team_id
-  framework    = "nextjs"
-
-  git_repository = {
-    type = "github"
-    repo = "owner/repo"
-  }
-
-  root_directory = "packages/web"
-
-  environment_variables = [
-    {
-      key       = "API_URL"
-      value     = "https://api.example.com"
-      targets   = ["production", "preview"]
-      sensitive = false
-    }
-  ]
-}
-```
-
-**Outputs:** `project_id`, `project_name`, `production_url`
-
-### modal-app
-
-Deploys a Modal app via CLI wrapper.
-
-```hcl
-module "modal" {
-  source = "../../modules/modal-app"
-
-  modal_token_id     = var.modal_token_id
-  modal_token_secret = var.modal_token_secret
-
-  app_name                     = "my-app"
-  workspace                    = "my-workspace"
-  modal_environment            = "main"
-  modal_environment_web_suffix = ""
-  deploy_path                  = "${path.root}/../../../packages/modal-infra"
-  deploy_module                = "deploy"
-
-  secrets = [
-    {
-      name = "my-secret"
-      values = {
-        KEY1 = "value1"
-        KEY2 = "value2"
-      }
-    }
-  ]
-}
-```
-
-**Outputs:** `app_name`, `deploy_id`, `api_health_url`
+The other sandbox providers are wired in the same [production directory](environments/production/).
 
 ## Important Notes
 
@@ -449,6 +432,15 @@ Since Modal has no Terraform provider, the module uses `null_resource` with `loc
 - Changes are detected via source file hashing
 - Manual intervention may be needed for complex updates
 
+Terraform replaces every Modal secret with its configured values whenever any secret changes, so do
+not add keys to Terraform-managed Modal secrets by hand. A failed replacement fails the apply.
+
+Clearing `anthropic_api_key` (for example, after moving the classifier to
+`classification_anthropic_api_key`) keeps `ANTHROPIC_API_KEY=""` in Modal's `llm-api-keys` secret,
+so the next apply overwrites the old value. New and restored sandboxes stop receiving the key, but
+sandboxes that are already running keep it until they terminate. Rotate the key if it must be
+revoked immediately.
+
 ## Verification
 
 After deployment, verify with:
@@ -467,7 +459,7 @@ curl https://open-inspect-control-plane-prod.<subdomain>.workers.dev/health
 # Manual form: https://<workspace>[-<modal_environment_web_suffix>]--open-inspect-api-health.modal.run
 MODAL_WORKSPACE_SLUG="<workspace>" # or "<workspace>-<modal_environment_web_suffix>"
 curl https://${MODAL_WORKSPACE_SLUG}--open-inspect-api-health.modal.run
-# Daytona and Vercel use their provider APIs directly, so there is no Open-Inspect shim health URL.
+# Daytona, Vercel, E2B and Boat use their provider APIs directly, so there is no Open-Inspect shim health URL.
 
 # 3. Verify the web deployment
 curl -I "$(terraform output -raw web_app_url)"

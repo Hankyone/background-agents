@@ -3,9 +3,9 @@ import { SELF, env } from "cloudflare:test";
 import { buildServiceAuthHeaders } from "@open-inspect/shared/service-auth";
 import worker, { SessionDO } from "../../src/index";
 import type { WorkerBindings } from "../../src/cloudflare/platform";
+import { REPOS_CACHE_KEY, reposCacheIdentity } from "../../src/routes/repos";
 import { cleanD1Tables } from "./cleanup";
-
-const REPOS_CACHE_KEY = "repos:list:v2";
+import { closeWebSocket, initSession } from "./helpers";
 
 function recordingExecutionContext(): {
   context: ExecutionContext;
@@ -42,6 +42,7 @@ describe("composite Worker lifecycle boundary", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await env.REPOS_CACHE.delete(REPOS_CACHE_KEY);
   });
 
@@ -118,6 +119,34 @@ describe("composite Worker lifecycle boundary", () => {
     expect(sessionNamespace.get).not.toHaveBeenCalled();
   });
 
+  it.each(["wnam", "apac-ne", "apac-se"])(
+    "preserves a real WebSocket upgrade with session location hint %s",
+    async (locationHint) => {
+      const { sessionName } = await initSession();
+      const get = vi.spyOn(env.SESSION, "get");
+      const { context } = recordingExecutionContext();
+
+      const response = await worker.fetch(
+        new Request(`https://test.local/sessions/${sessionName}/ws`, {
+          headers: { Upgrade: "websocket" },
+        }),
+        { ...env, SESSION_DO_LOCATION_HINT: locationHint } as WorkerBindings,
+        context
+      );
+
+      const ws = response.webSocket;
+      expect(ws).not.toBeNull();
+      ws!.accept();
+      try {
+        expect(response.status).toBe(101);
+        expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+        expect(get).toHaveBeenCalledExactlyOnceWith(expect.anything(), { locationHint });
+      } finally {
+        await closeWebSocket(ws!);
+      }
+    }
+  );
+
   it("routes a non-upgrade WebSocket path through ordinary HTTP dispatch", async () => {
     const response = await SELF.fetch("https://test.local/sessions/missing-session/ws");
 
@@ -129,7 +158,12 @@ describe("composite Worker lifecycle boundary", () => {
   it("keeps route background work on the original fetch execution context", async () => {
     await env.REPOS_CACHE.put(
       REPOS_CACHE_KEY,
-      JSON.stringify({ repos: [], cachedAt: new Date(0).toISOString(), freshUntil: 0 })
+      JSON.stringify({
+        repos: [],
+        cachedAt: new Date(0).toISOString(),
+        scmIdentity: await reposCacheIdentity(env),
+        freshUntil: 0,
+      })
     );
     const url = "https://test.local/repos";
     const authHeaders = await buildServiceAuthHeaders({

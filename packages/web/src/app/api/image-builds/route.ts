@@ -1,13 +1,14 @@
 import { NextResponse } from "next/server";
-import { getServerAuthSession } from "@/lib/server-auth-session";
 import { controlPlaneUserFetch } from "@/lib/control-plane";
 import {
+  excludeOtherProviderBuilds,
   excludeSupersededBuilds,
   imageBuildsEnabledReposResponseSchema,
   imageBuildsEnabledResponseSchema,
   imageBuildsStatusResponseSchema,
 } from "@/lib/image-builds";
-import { REPO_IMAGES_UNSUPPORTED_MESSAGE, supportsRepoImages } from "@/lib/sandbox-provider";
+import { getPublicSandboxProvider } from "@/lib/sandbox-provider";
+import { rejectUnsupportedRepoImages } from "@/lib/repo-images-unsupported";
 
 /**
  * Unified image-build feed: every prebuild-enabled scope plus the cross-scope
@@ -15,21 +16,24 @@ import { REPO_IMAGES_UNSUPPORTED_MESSAGE, supportsRepoImages } from "@/lib/sandb
  * the settings pages and the session-target picker.
  */
 export async function GET() {
-  const session = await getServerAuthSession();
-  if (!session?.user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  if (!supportsRepoImages()) {
-    return NextResponse.json({ error: REPO_IMAGES_UNSUPPORTED_MESSAGE }, { status: 501 });
-  }
-
   try {
-    const [enabledResponse, enabledReposResponse, statusResponse] = await Promise.all([
+    const rejection = await rejectUnsupportedRepoImages();
+    if (rejection) return rejection;
+
+    const results = await Promise.allSettled([
       controlPlaneUserFetch("/image-builds/enabled"),
       controlPlaneUserFetch("/image-builds/enabled-repos"),
       controlPlaneUserFetch("/image-builds/status"),
     ]);
+
+    if (results.some((result) => result.status === "fulfilled" && result.value.status === 401)) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const [enabledResponse, enabledReposResponse, statusResponse] = results.map((result) => {
+      if (result.status === "rejected") throw result.reason;
+      return result.value;
+    });
 
     if (!enabledResponse.ok || !enabledReposResponse.ok || !statusResponse.ok) {
       return NextResponse.json({ error: "Failed to fetch image builds" }, { status: 502 });
@@ -57,9 +61,13 @@ export async function GET() {
     // Persisted repo flags, unlike units, never drop a scope on a transient
     // resolution failure — the settings toggles read these.
     const enabledRepos = parsedEnabledRepos.data.repos;
-    const images = excludeSupersededBuilds(parsedStatus.data.images);
+    const images = excludeOtherProviderBuilds(
+      excludeSupersededBuilds(parsedStatus.data.images),
+      getPublicSandboxProvider()
+    );
+    const admission = parsedEnabled.data.admission;
 
-    return NextResponse.json({ units, enabledRepos, images });
+    return NextResponse.json({ units, enabledRepos, images, ...(admission ? { admission } : {}) });
   } catch (error) {
     console.error("Failed to fetch image builds:", error);
     return NextResponse.json({ error: "Failed to fetch image builds" }, { status: 500 });

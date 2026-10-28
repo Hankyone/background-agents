@@ -10,8 +10,13 @@ import { Switch } from "@/components/ui/switch";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ErrorBanner } from "@/components/ui/error-banner";
 import { RefreshIcon } from "@/components/ui/icons";
-import { IMAGE_BUILDS_KEY, formatReadyDetails, parsePrimaryBuildSha } from "@/lib/image-builds";
-import { supportsRepoImages } from "@/lib/sandbox-provider";
+import {
+  DEFAULT_IMAGE_BUILD_ADMISSION_OPEN,
+  IMAGE_BUILDS_KEY,
+  formatReadyDetails,
+  parsePrimaryBuildSha,
+} from "@/lib/image-builds";
+import { REPO_IMAGES_UNSUPPORTED_MESSAGE, supportsRepoImages } from "@/lib/sandbox-provider";
 import { ImageBuildStatus } from "./image-build-status";
 import { browserApiFetch } from "@/lib/browser-api-fetch";
 import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
@@ -33,15 +38,13 @@ export function ImagesSettings() {
     return (
       <div>
         <h2 className="text-xl font-semibold text-foreground mb-1">Pre-Built Images</h2>
-        <p className="text-sm text-muted-foreground">
-          Pre-built images are only available when <code>SANDBOX_PROVIDER=modal</code>,{" "}
-          <code>SANDBOX_PROVIDER=vercel</code>, or <code>SANDBOX_PROVIDER=opencomputer</code>.
-        </p>
+        <p className="text-sm text-muted-foreground">{REPO_IMAGES_UNSUPPORTED_MESSAGE}.</p>
       </div>
     );
   }
 
   const loading = reposLoading || imagesLoading;
+  const admissionOpen = data?.admission?.open ?? DEFAULT_IMAGE_BUILD_ADMISSION_OPEN;
 
   // Toggle state reads the persisted flags, not `units` — the units feed
   // resolves scopes through source control and can transiently drop a repo.
@@ -116,12 +119,7 @@ export function ImagesSettings() {
   };
 
   if (loading) {
-    return (
-      <div className="flex items-center gap-2 text-muted-foreground">
-        <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
-        Loading image settings...
-      </div>
-    );
+    return <ImagesSettingsSkeleton showRebuild={canManage} />;
   }
 
   // Without the feed there is no toggle state to show — rendering the list
@@ -143,6 +141,8 @@ export function ImagesSettings() {
           Enable pre-built images to speed up sandbox creation. Images are rebuilt automatically
           when the default branch changes.
         </p>
+
+        {!admissionOpen && <PrebuildsPausedNotice />}
 
         {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
@@ -191,7 +191,9 @@ export function ImagesSettings() {
                       variant="ghost"
                       size="icon"
                       onClick={() => handleTrigger(repo.owner, repo.name)}
-                      disabled={!isEnabled || isTriggering || image?.status === "building"}
+                      disabled={
+                        !isEnabled || !admissionOpen || isTriggering || image?.status === "building"
+                      }
                       title="Rebuild image"
                     >
                       <RefreshIcon className={`w-4 h-4 ${isTriggering ? "animate-spin" : ""}`} />
@@ -210,5 +212,56 @@ export function ImagesSettings() {
         )}
       </div>
     </TooltipProvider>
+  );
+}
+
+const SKELETON_REPO_COUNT = 3;
+
+/** Mirrors the loaded page: heading, description, and one row per repository. */
+function ImagesSettingsSkeleton({ showRebuild }: { showRebuild: boolean }) {
+  return (
+    <div
+      role="status"
+      aria-label="Loading image settings"
+      className="animate-pulse motion-reduce:animate-none"
+    >
+      <div className="h-5 w-40 bg-muted rounded mt-1 mb-2" />
+      <div className="mb-6 py-0.5 space-y-1">
+        <div className="h-4 w-full bg-muted rounded" />
+        <div className="h-4 w-2/3 bg-muted rounded" />
+      </div>
+
+      <div className="space-y-2">
+        {Array.from({ length: SKELETON_REPO_COUNT }, (_, index) => (
+          <div
+            key={index}
+            className="flex items-center justify-between px-4 py-3 border border-border"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="h-5 w-9 shrink-0 bg-muted rounded-full" />
+              <div className="h-4 w-44 bg-muted rounded" />
+            </div>
+            <div className="flex items-center gap-3 flex-shrink-0 ml-4">
+              <div className="h-3 w-16 bg-muted rounded" />
+              {showRebuild && <div className="size-7 bg-muted rounded" />}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A paused deployment still shows its toggles: they record intent an operator
+ * can set before admission opens. It stops offering rebuilds, which would be
+ * refused, and says why.
+ */
+function PrebuildsPausedNotice() {
+  return (
+    <p className="text-sm text-muted-foreground mb-4" role="status">
+      Prebuilds are paused for this deployment. Existing images keep working; new builds start once
+      an operator enables them.
+    </p>
   );
 }

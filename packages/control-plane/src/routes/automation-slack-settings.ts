@@ -2,8 +2,9 @@
  * Slack integration settings read by the slack-bot and the automation form.
  */
 
-import { listChannels } from "@open-inspect/shared/slack";
+import { listChannels, type ControlPlaneSlackChannelsResponse } from "@open-inspect/shared/slack";
 import { SlackChannelStore } from "../db/slack-channel-store";
+import { TeamChannelBindingStore } from "../db/team-channel-bindings";
 import { Hono } from "hono";
 import { admit, dispatch } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
@@ -15,7 +16,7 @@ import {
 } from "./shared";
 import type { Env } from "../types";
 import { createLogger } from "../logger";
-import { AUTOMATIONS_READ } from "./automation-shared";
+import { AUTOMATIONS_READ_PERMISSION } from "./automation-shared";
 
 const logger = createLogger("router:automations");
 
@@ -45,7 +46,7 @@ async function handleGetWatchedSlackChannels(
  * GET /integration-settings/slack/channels
  *
  * Lists the workspace's channels (public + private the bot can see) so the
- * automation form can offer a channel picker instead of a raw channel ID. Sourced
+ * automation and team binding forms can offer a channel picker. Sourced
  * live from Slack via `conversations.list` using the bot token.
  *
  * Returns `{ channels }` on success, or `{ channels: [], error }` when the token
@@ -53,21 +54,37 @@ async function handleGetWatchedSlackChannels(
  * scope) — the form then degrades to manual channel-ID entry. Internal-auth gated
  * by the router (non-public route).
  */
-async function handleGetSlackChannels(
+export async function handleGetSlackChannels(
   request: Request,
   env: Env,
   _params: object,
-  _ctx: RequestContext
+  ctx: RequestContext
 ): Promise<Response> {
   if (!env.SLACK_BOT_TOKEN) {
-    return json({ channels: [], error: "not_configured" });
+    return json({
+      channels: [],
+      error: "not_configured",
+    } satisfies ControlPlaneSlackChannelsResponse);
   }
   const result = await listChannels(env.SLACK_BOT_TOKEN, { signal: request.signal });
   if (!result.ok) {
     logger.warn("slack.channels.list_failed", { slack_error: result.error });
-    return json({ channels: [], error: result.error });
+    return json({ channels: [], error: result.error } satisfies ControlPlaneSlackChannelsResponse);
   }
-  return json({ channels: result.channels });
+  let channels = result.channels;
+  if (ctx.teamAdmission && !ctx.authorization?.permissions.includes("automations.read")) {
+    // A team capability must not expose unrelated private workspace channels.
+    const bindings = await new TeamChannelBindingStore(ctx.db).listByTeam(
+      ctx.teamAdmission.team.id
+    );
+    const boundIds = new Set(
+      bindings
+        .filter((binding) => binding.provider === "slack")
+        .map((binding) => binding.externalId)
+    );
+    channels = channels.filter((channel) => !channel.isPrivate || boundIds.has(channel.id));
+  }
+  return json({ channels } satisfies ControlPlaneSlackChannelsResponse);
 }
 
 export const automationSlackSettingsRoutes = new Hono<ControlPlaneHonoEnv>();
@@ -82,6 +99,8 @@ automationSlackSettingsRoutes.get(
   }),
   (c) => dispatch(c, handleGetWatchedSlackChannels)
 );
-automationSlackSettingsRoutes.get("/integration-settings/slack/channels", AUTOMATIONS_READ, (c) =>
-  dispatch(c, handleGetSlackChannels)
+automationSlackSettingsRoutes.get(
+  "/integration-settings/slack/channels",
+  AUTOMATIONS_READ_PERMISSION,
+  (c) => dispatch(c, handleGetSlackChannels)
 );

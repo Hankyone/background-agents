@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { cleanD1Tables } from "./cleanup";
 import { initSession, queryDO, seedEvents, seedMessage } from "./helpers";
-import { installFailFastModalFetch } from "./mock-modal-fetch";
 import type { ChildSessionDetail } from "@open-inspect/shared/types/session-api";
 import type { SpawnContext } from "../../src/session/spawn-context";
 
@@ -58,9 +57,6 @@ describe("DO internal sub-session routes", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
-    // Restore the suite-wide fail-fast Modal mock so later test files do not
-    // re-open real outbound *.modal.run calls after this file's success stub.
-    installFailFastModalFetch();
   });
 
   describe("GET /internal/spawn-context", () => {
@@ -105,10 +101,9 @@ describe("DO internal sub-session routes", () => {
       expect(context.promptAuthor).toBeDefined();
       expect(context.promptAuthor.userId).toBe("user-1");
       expect(context.promptAuthor.scmLogin).toBe("acmedev");
-      // Encrypted token fields may be null in tests (no SCM token provided at init)
-      expect(context.promptAuthor).toHaveProperty("scmAccessTokenEncrypted");
-      expect(context.promptAuthor).toHaveProperty("scmRefreshTokenEncrypted");
-      expect(context.promptAuthor).toHaveProperty("scmTokenExpiresAt");
+      expect(context.promptAuthor).not.toHaveProperty("scmAccessTokenEncrypted");
+      expect(context.promptAuthor).not.toHaveProperty("scmRefreshTokenEncrypted");
+      expect(context.promptAuthor).not.toHaveProperty("scmTokenExpiresAt");
     });
 
     it("returns 404 when session is not initialized", async () => {

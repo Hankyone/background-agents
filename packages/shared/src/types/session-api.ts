@@ -1,15 +1,18 @@
+import { harnessIdSchema } from "../harnesses";
+import { generatedFileDetailsSchema } from "../generated-files";
 import { z } from "zod";
 import { sessionSkillSelectionSchema } from "./skills";
-import type { AgentResponse } from "./artifacts";
+import { artifactTypeSchema, type AgentResponse, type StoredFileArtifactType } from "./artifacts";
 import { sessionRepositoriesInputSchema } from "./repositories";
 import type { EventResponse } from "./sandbox-events";
 import { MAX_WEB_PROMPT_CHARS, promptContentSchema } from "./prompts";
 import { modelProviderSelectionsSchema } from "./provider-accounts";
+import { sessionVisibilitySchema } from "./teams";
 import {
   messageSourceSchema,
   sessionStatusSchema,
   type SandboxStatus,
-  type Session,
+  type SessionListResponse,
   type SessionStatus,
 } from "./sessions";
 
@@ -46,11 +49,21 @@ export const slackCallbackContextSchema = z.object({
 
 export type SlackCallbackContext = z.infer<typeof slackCallbackContextSchema>;
 
+/**
+ * Domain separator for the Slack activity-refresh callback. Signed into the
+ * body and required by the route, so a body minted for another callback — whose
+ * signature is equally valid — cannot satisfy this one. Shared so the producer
+ * and the route cannot drift apart on the literal.
+ */
+export const SLACK_ACTIVITY_REFRESH_KIND = "slack.activity_refresh";
+
 const linearCallbackContextBaseSchema = z.strictObject({
   source: z.literal("linear"),
   issueId: nonEmptyStringSchema,
   issueIdentifier: nonEmptyStringSchema,
   issueUrl: nonEmptyStringSchema,
+  /** External Linear team used for scoped reads; absent in persisted legacy contexts. */
+  linearTeamId: nonEmptyStringSchema.optional(),
   /** Settings repository when one can be resolved for this Linear message. */
   repoFullName: nonEmptyStringSchema.optional(),
   model: nonEmptyStringSchema,
@@ -154,6 +167,12 @@ export const sendPromptRequestSchema = z
 
 export type SendPromptRequest = z.infer<typeof sendPromptRequestSchema>;
 
+export const sessionBudgetUpdateSchema = z.strictObject({
+  maxCostUsd: z.number().finite().positive().nullable(),
+});
+
+export type SessionBudgetUpdate = z.infer<typeof sessionBudgetUpdateSchema>;
+
 /** Request body for POST /sessions/:parentId/children/:childId/prompt. */
 export const childFollowUpPromptRequestSchema = z.strictObject({
   content: z
@@ -212,9 +231,13 @@ function hasExclusiveSessionTarget(
 }
 
 const createSessionRequestBaseSchema = z.object({
+  teamId: z.string().min(1).nullable().optional(),
+  visibility: sessionVisibilitySchema.optional(),
   repoOwner: z.string().trim().min(1).nullish(),
   repoName: z.string().trim().min(1).nullish(),
   title: z.string().optional(),
+  /** Agent harness; fixed at create like base_branch. Omission means the built-in harness. */
+  harness: harnessIdSchema.optional(),
   model: z.string().optional(),
   reasoningEffort: z.string().optional(),
   branch: z.string().optional(),
@@ -232,6 +255,7 @@ const createSessionRequestBaseSchema = z.object({
   environmentId: z.string().trim().min(1).nullish(),
   /** Managed skills are resolved and pinned when the session is created. */
   skillSelection: sessionSkillSelectionSchema.optional(),
+  includePersonalMemories: z.boolean().optional(),
   /** Explicit account/API-key choices. Omission resolves provider policy. */
   providerSelections: modelProviderSelectionsSchema.optional(),
 });
@@ -282,12 +306,18 @@ export type CreateSessionInput = z.infer<typeof createSessionInputSchema>;
 
 export const createMediaArtifactRequestSchema = z.object({
   artifactId: z.string(),
-  artifactType: z.string(),
+  artifactType: artifactTypeSchema.extract(["screenshot", "video"]),
   objectKey: z.string(),
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 export type CreateMediaArtifactRequest = z.infer<typeof createMediaArtifactRequestSchema>;
+
+/** Successful durable registration, not confirmation of Slack publication. */
+export const generatedFileUploadResponseSchema = generatedFileDetailsSchema.safeExtend({
+  artifactId: z.string().min(1),
+});
+export type GeneratedFileUploadResponse = z.infer<typeof generatedFileUploadResponseSchema>;
 
 export const createSessionResponseSchema = z.object({
   sessionId: z.string().min(1),
@@ -299,15 +329,14 @@ export type CreateSessionResponse = z.infer<typeof createSessionResponseSchema>;
 export const sendPromptResponseSchema = z.object({
   messageId: z.string().min(1),
   status: z.literal("queued").optional(),
+  /** True when the request's clientRequestId named a prompt the session had already queued. */
+  deduplicated: z.boolean().optional(),
 });
 
 export type SendPromptResponse = z.infer<typeof sendPromptResponseSchema>;
 
-export interface ListSessionsResponse {
-  sessions: Session[];
-  cursor?: string;
-  hasMore: boolean;
-}
+/** @deprecated Import SessionListResponse from ./sessions. */
+export type ListSessionsResponse = SessionListResponse;
 
 /** Request body for POST /sessions/:parentId/children. */
 export const spawnChildSessionRequestSchema = z.object({
@@ -343,6 +372,15 @@ export interface ChildSessionTrajectory {
   limit: number;
 }
 
+/** Discovery only: no object keys, URLs, or download authorization. */
+export interface ChildStoredFileSummary {
+  id: string;
+  type: StoredFileArtifactType;
+  filename?: string;
+  caption?: string;
+  available?: boolean;
+}
+
 export interface ChildSessionDetail {
   session: {
     id: string;
@@ -357,6 +395,7 @@ export interface ChildSessionDetail {
   };
   sandbox: { status: SandboxStatus } | null;
   hasUnfinishedPrompt?: boolean;
+  fileArtifacts?: ChildStoredFileSummary[];
   artifacts: Array<{ type: string; url: string; metadata: unknown }>;
   recentEvents: Array<{ type: string; data: unknown; createdAt: number }>;
   finalResponse?: ChildSessionFinalResponse | null;

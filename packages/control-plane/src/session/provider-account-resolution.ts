@@ -3,6 +3,11 @@ import {
   type ModelProviderSelections,
   type SubscriptionProviderId,
 } from "@open-inspect/shared/types/provider-accounts";
+import {
+  getHarnessCapabilities,
+  harnessSupportsProviderAuth,
+  type HarnessId,
+} from "@open-inspect/shared/harnesses";
 import { ProviderDefaultStore } from "../db/provider-account-defaults";
 import { ModelProviderAccountStore } from "../db/model-provider-accounts";
 import type { SessionModelProviderAuthInput } from "../model-provider-accounts/provider-auth-contracts";
@@ -19,13 +24,34 @@ interface ProviderAccountResolutionStores {
   adapters: ProviderAccountAdapterLookup;
 }
 
-function legacy(provider: SubscriptionProviderId): SessionModelProviderAuthInput {
-  return { provider, authMode: "legacy_scoped_oauth", selectionSource: "legacy_fallback" };
+/**
+ * What a provider resolves to when nothing was selected and no default exists.
+ * OpenAI and xAI keep the legacy scoped-OAuth path their plugins understand;
+ * Anthropic never had one, so it falls back to the API key (the platform key
+ * or a user secret), never to a placeholder.
+ */
+function noSelectionFallback(provider: SubscriptionProviderId): SessionModelProviderAuthInput {
+  if (LEGACY_SCOPED_OAUTH_PROVIDERS.has(provider)) {
+    return { provider, authMode: "legacy_scoped_oauth", selectionSource: "legacy_fallback" };
+  }
+  return apiKey(provider, "api_key_fallback");
 }
+
+const LEGACY_SCOPED_OAUTH_PROVIDERS: ReadonlySet<SubscriptionProviderId> = new Set([
+  "openai",
+  "xai",
+]);
 
 export interface ProviderAccountResolutionInput {
   explicit?: ModelProviderSelections;
   unattended: boolean;
+  /**
+   * The session's harness. An installation default only applies where the
+   * harness can select a provider account; otherwise the provider resolves
+   * to api_key (selectionSource "harness_fallback") rather than binding an
+   * account the harness cannot use.
+   */
+  harness: HarnessId;
 }
 
 function apiKey(
@@ -41,6 +67,14 @@ async function resolveProvider(
   stores: ProviderAccountResolutionStores,
   policy: ProviderAccountSelectionPolicy
 ): Promise<SessionModelProviderAuthInput> {
+  // Preserve the complete routing shape without binding unreachable strict-harness accounts.
+  const capabilities = getHarnessCapabilities(input.harness);
+  if (
+    capabilities.selectionPolicy === "strict" &&
+    capabilities.providerAuth[provider] === undefined
+  ) {
+    return apiKey(provider, "harness_fallback");
+  }
   const explicit = input.explicit?.[provider];
   if (explicit?.mode === "api_key") return apiKey(provider, "explicit");
   if (explicit?.mode === "provider_account") {
@@ -54,7 +88,15 @@ async function resolveProvider(
   }
 
   const providerDefault = await stores.defaults.get(provider);
-  if (!providerDefault) return legacy(provider);
+  if (!providerDefault) {
+    // A strict harness has no legacy scoped-OAuth path; with nothing selected it
+    // runs on the API key (platform key or user secret), as Anthropic does.
+    if (capabilities.selectionPolicy === "strict") return apiKey(provider, "api_key_fallback");
+    return noSelectionFallback(provider);
+  }
+  if (!harnessSupportsProviderAuth(input.harness, provider, "provider_account")) {
+    return apiKey(provider, "harness_fallback");
+  }
   if (input.unattended && providerDefault.unattendedMode === "api_key") {
     return apiKey(provider, "unattended_policy");
   }

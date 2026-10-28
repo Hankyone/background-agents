@@ -12,20 +12,54 @@ describe("normalizeWebhookEvent", () => {
   });
 
   it("uses idempotencyKey for trigger key when provided", () => {
-    const event = normalizeWebhookEvent("auto-1", { test: true }, "my-key");
+    const event = normalizeWebhookEvent("auto-1", { test: true }, { idempotencyKey: "my-key" });
     expect(event.triggerKey).toBe("webhook:idem:my-key");
     expect(event.concurrencyKey).toBe("webhook:idem:my-key");
+  });
+
+  it("scopes concurrency to the sessionKey and keeps dedup on the idempotencyKey", () => {
+    const event = normalizeWebhookEvent(
+      "auto-1",
+      { test: true },
+      {
+        idempotencyKey: "my-key",
+        sessionKey: "card-42",
+      }
+    );
+    expect(event.triggerKey).toBe("webhook:idem:my-key");
+    expect(event.concurrencyKey).toBe("webhook:session:card-42");
+    expect(event.sessionKey).toBe("card-42");
+  });
+
+  it("leaves sessionKey unset without one", () => {
+    expect(normalizeWebhookEvent("auto-1", { test: true }).sessionKey).toBeUndefined();
+  });
+
+  it("strips sessionKey from body in context but keeps it in body", () => {
+    const event = normalizeWebhookEvent(
+      "auto-1",
+      { sessionKey: "card-42", data: "value" },
+      { sessionKey: "card-42" }
+    );
+    expect(event.body).toEqual({ sessionKey: "card-42", data: "value" });
+    expect(event.contextBlock).not.toContain("sessionKey");
+    expect(event.contextBlock).toContain("value");
   });
 
   it("strips idempotencyKey from body in context but keeps it in body", () => {
     const event = normalizeWebhookEvent(
       "auto-1",
       { idempotencyKey: "key-1", data: "value" },
-      "key-1"
+      { idempotencyKey: "key-1" }
     );
     expect(event.body).toEqual({ idempotencyKey: "key-1", data: "value" });
     expect(event.contextBlock).not.toContain("idempotencyKey");
     expect(event.contextBlock).toContain("value");
+  });
+
+  it("puts a body that is not an object in the context as it is", () => {
+    expect(normalizeWebhookEvent("auto-1", ["sessionKey"]).contextBlock).toContain("sessionKey");
+    expect(normalizeWebhookEvent("auto-1", "plain text").contextBlock).toContain("plain text");
   });
 });
 
@@ -97,6 +131,34 @@ describe("evaluateJsonPathFilter", () => {
     expect(
       evaluateJsonPathFilter({ path: "$.event.name", comparison: "contains", value: "xyz" }, body)
     ).toBe(false);
+  });
+
+  it.each([
+    { comparison: "gt", value: "3", expected: true },
+    { comparison: "gte", value: "10", expected: true },
+    { comparison: "lt", value: "11", expected: true },
+    { comparison: "lte", value: "10", expected: true },
+    { comparison: "gt", value: true, expected: true },
+    { comparison: "gt", value: "not numeric", expected: false },
+    { comparison: "lt", value: undefined, expected: false },
+  ] as const)(
+    "preserves stored numeric filter semantics: $comparison $value",
+    ({ comparison, value, expected }) => {
+      expect(evaluateJsonPathFilter({ path: "$.event.count", comparison, value }, body)).toBe(
+        expected
+      );
+    }
+  );
+
+  it.each([
+    { value: 123, text: "release-123", expected: true },
+    { value: 456, text: "release-123", expected: false },
+    { value: true, text: "result=true", expected: true },
+    { value: undefined, text: "undefined", expected: true },
+  ])("preserves scalar contains filters: $value", ({ value, text, expected }) => {
+    expect(
+      evaluateJsonPathFilter({ path: "$.text", comparison: "contains", value }, { text })
+    ).toBe(expected);
   });
 
   it("evaluates exists comparison", () => {

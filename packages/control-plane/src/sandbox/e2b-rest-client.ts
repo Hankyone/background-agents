@@ -6,6 +6,7 @@
  */
 
 import { createLogger } from "../logger";
+import { scrubEnvValues } from "./scrub-env-values";
 import { z } from "zod";
 
 const log = createLogger("e2b-rest-client");
@@ -223,36 +224,6 @@ function assertProcessStarted(buffer: Uint8Array): void {
   }
 }
 
-/**
- * Strip every create-env value from provider error text before it can escape
- * into a persisted/broadcast failure reason. The create request carries
- * secrets (SANDBOX_AUTH_TOKEN, user secrets, build callback tokens); if E2B
- * ever echoes request values in an error body, the echo must die here. Each
- * value is matched raw and through two levels of JSON escaping — the shapes an
- * echo can take in a parsed message or in raw body text that itself quotes the
- * encoded request. Every non-empty value is scrubbed: user secrets are
- * arbitrary-length, so there is no "too short to matter" — the cost is that
- * incidental text matching a config value ("true", a port) is redacted too,
- * which is the right failure direction for an error path.
- */
-function scrubEnvValues(text: string, envVars: Record<string, string>): string {
-  const needles = new Set<string>();
-  for (const value of Object.values(envVars)) {
-    if (!value) continue;
-    let form = value;
-    for (let i = 0; i < 3; i++) {
-      needles.add(form);
-      form = JSON.stringify(form).slice(1, -1);
-    }
-  }
-  let scrubbed = text;
-  // Longest first, so a short needle cannot split a longer one mid-replacement.
-  for (const needle of [...needles].sort((a, b) => b.length - a.length)) {
-    scrubbed = scrubbed.split(needle).join("[redacted]");
-  }
-  return scrubbed;
-}
-
 function scrubbedCreateError(error: E2BApiError, envVars: Record<string, string>): E2BApiError {
   const scrub = (text: string) => scrubEnvValues(text, envVars);
   const body =
@@ -310,8 +281,10 @@ export class E2BRestClient {
     }
   }
 
-  async getSandbox(id: string): Promise<E2BSandboxDetail> {
-    return this.requestJson("GET", `/sandboxes/${id}`, TIMEOUT_GET_MS, e2bSandboxDetailSchema);
+  async getSandbox(id: string, signal?: AbortSignal): Promise<E2BSandboxDetail> {
+    return this.requestJson("GET", `/sandboxes/${id}`, TIMEOUT_GET_MS, e2bSandboxDetailSchema, {
+      signal,
+    });
   }
 
   /**

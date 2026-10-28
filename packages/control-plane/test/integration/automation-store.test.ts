@@ -13,15 +13,21 @@ import { SessionIndexStore } from "../../src/db/session-index";
 import { cleanD1Tables } from "./cleanup";
 import { seedRun, fetchRuns } from "./run-helpers";
 
+/** Default deadline the sweep holds a run to when the row carries none of its own. */
+const DEFAULT_DEADLINE_MS = 3 * 60 * 60 * 1000;
+
 function makeAutomation(overrides?: Partial<AutomationRow>): AutomationRow {
   const now = Date.now();
   return {
     id: `auto-${Math.random().toString(36).slice(2, 8)}`,
+    owner_team_id: null,
     name: "Test Automation",
     instructions: "Run tests",
     trigger_type: "schedule",
     schedule_cron: "0 9 * * *",
+    schedule_once_at: null,
     schedule_tz: "UTC",
+    harness: "opencode",
     model: "anthropic/claude-sonnet-4-6",
     reasoning_effort: null,
     enabled: 1,
@@ -51,6 +57,7 @@ function makeRun(automationId: string, overrides?: Partial<AutomationRunRow>): A
     failure_reason: null,
     scheduled_at: now,
     started_at: null,
+    execution_deadline_at: null,
     completed_at: null,
     created_at: now,
     invocation_id: `inv-${id}`,
@@ -59,6 +66,7 @@ function makeRun(automationId: string, overrides?: Partial<AutomationRunRow>): A
     repo_id: null,
     base_branch: null,
     environment_id: null,
+    first_prompt_pending: 0,
     ...overrides,
   };
 }
@@ -83,6 +91,16 @@ async function seedRunForKey(
     .bind(invocationId, automationId, concurrencyKey, run.created_at ?? now, now)
     .run();
   await seedRun(makeRun(automationId, { ...run, invocation_id: invocationId }));
+}
+
+async function seedSessionRow(id: string, updatedAt = Date.now()): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO sessions (id, title, owner_team_id, visibility, user_id, status,
+       spawn_source, created_at, updated_at)
+     VALUES (?, 'Thread', NULL, 'private', 'user-1', 'completed', 'automation', ?, ?)`
+  )
+    .bind(id, updatedAt, updatedAt)
+    .run();
 }
 
 describe("AutomationStore (D1 integration)", () => {
@@ -587,6 +605,8 @@ describe("AutomationStore (D1 integration)", () => {
       // Create a session
       await sessionStore.create({
         id: "sess-enriched",
+        ownerTeamId: null,
+        visibility: "workspace",
         title: "Auto Session Title",
         repoOwner: "acme",
         repoName: "web-app",
@@ -667,31 +687,97 @@ describe("AutomationStore (D1 integration)", () => {
           session_id: "sess-t1",
           scheduled_at: twoHoursAgo,
           started_at: twoHoursAgo,
+          execution_deadline_at: now - 1000,
           created_at: twoHoursAgo,
         })
       );
 
-      const timedOut = await store.getTimedOutRunningRuns(90 * 60 * 1000, 50);
+      const timedOut = await store.getRunsPastExecutionDeadline(now, DEFAULT_DEADLINE_MS, 50);
       expect(timedOut).toHaveLength(1);
       expect(timedOut[0].id).toBe("run-timeout-1");
     });
 
-    it("does not find recent running runs", async () => {
+    it("leaves a long-running run alone while its own deadline is in the future", async () => {
       const store = new AutomationStore(env.DB);
       const now = Date.now();
       await store.create(makeAutomation({ id: "auto-rec4" }));
 
+      // Three hours in, but launched with an eight-hour budget: still working.
+      const threeHoursAgo = now - 3 * 60 * 60 * 1000;
       await seedRun(
         makeRun("auto-rec4", {
-          id: "run-recent-running",
+          id: "run-long-running",
           status: "running",
-          started_at: now,
-          created_at: now,
+          session_id: "sess-t4",
+          started_at: threeHoursAgo,
+          execution_deadline_at: threeHoursAgo + 8 * 60 * 60 * 1000,
+          created_at: threeHoursAgo,
         })
       );
 
-      const timedOut = await store.getTimedOutRunningRuns(90 * 60 * 1000, 50);
+      const timedOut = await store.getRunsPastExecutionDeadline(now, DEFAULT_DEADLINE_MS, 50);
       expect(timedOut).toHaveLength(0);
+    });
+
+    it("widens a claimed deadline to the session's own budget", async () => {
+      const store = new AutomationStore(env.DB);
+      const now = Date.now();
+      await store.create(makeAutomation({ id: "auto-rec6" }));
+      await seedRun(makeRun("auto-rec6", { id: "run-widen", status: "starting", created_at: now }));
+
+      await store.claimRunSession("run-widen", "sess-widen", now, now + 60_000);
+      expect(await store.setRunExecutionDeadline("run-widen", now + 600_000)).toBe(true);
+
+      expect(
+        await store.getRunsPastExecutionDeadline(now + 120_000, DEFAULT_DEADLINE_MS, 50)
+      ).toHaveLength(0);
+      const [swept] = await store.getRunsPastExecutionDeadline(
+        now + 700_000,
+        DEFAULT_DEADLINE_MS,
+        50
+      );
+      expect(swept?.id).toBe("run-widen");
+    });
+
+    it("refuses to widen the deadline of a run that already finished", async () => {
+      const store = new AutomationStore(env.DB);
+      const now = Date.now();
+      await store.create(makeAutomation({ id: "auto-rec7" }));
+      await seedRun(
+        makeRun("auto-rec7", {
+          id: "run-done",
+          status: "completed",
+          started_at: now,
+          completed_at: now,
+        })
+      );
+
+      expect(await store.setRunExecutionDeadline("run-done", now + 600_000)).toBe(false);
+    });
+
+    // A pre-0079 worker can claim a run after the migration's backfill and
+    // before it is replaced; that row has no deadline of its own.
+    it("holds a run that never claimed a deadline to the default deadline from its start", async () => {
+      const store = new AutomationStore(env.DB);
+      const now = Date.now();
+      await store.create(makeAutomation({ id: "auto-rec5" }));
+
+      const seedUndeadlined = (id: string, startedAt: number) =>
+        seedRun(
+          makeRun("auto-rec5", {
+            id,
+            status: "running",
+            session_id: `sess-${id}`,
+            started_at: startedAt,
+            execution_deadline_at: null,
+            created_at: startedAt,
+          })
+        );
+      await seedUndeadlined("run-no-deadline-old", now - DEFAULT_DEADLINE_MS - 1);
+      await seedUndeadlined("run-no-deadline-fresh", now - DEFAULT_DEADLINE_MS + 60_000);
+
+      const swept = await store.getRunsPastExecutionDeadline(now, DEFAULT_DEADLINE_MS, 50);
+      expect(swept.map((r) => r.id)).toEqual(["run-no-deadline-old"]);
     });
 
     it("drains oldest orphaned runs first when LIMIT is hit", async () => {
@@ -730,12 +816,13 @@ describe("AutomationStore (D1 integration)", () => {
             session_id: `sess-${i}`,
             scheduled_at: base + i * 1000,
             started_at: base + i * 1000,
+            execution_deadline_at: base + i * 1000,
             created_at: base + i * 1000,
           })
         );
       }
 
-      const timedOut = await store.getTimedOutRunningRuns(90 * 60 * 1000, 3);
+      const timedOut = await store.getRunsPastExecutionDeadline(now, DEFAULT_DEADLINE_MS, 3);
       expect(timedOut).toHaveLength(3);
       expect(timedOut.map((r) => r.id)).toEqual(["run-to-0", "run-to-1", "run-to-2"]);
     });
@@ -755,12 +842,64 @@ describe("AutomationStore (D1 integration)", () => {
 
     it("timeout sweep is served by idx_runs_timeout_sweep, not a full scan", async () => {
       const plan = await env.DB.prepare(
-        `EXPLAIN QUERY PLAN ${AutomationStore.TIMED_OUT_RUNNING_RUNS_SQL}`
+        `EXPLAIN QUERY PLAN ${AutomationStore.RUNS_PAST_EXECUTION_DEADLINE_SQL}`
       )
-        .bind(Date.now())
+        .bind(Date.now(), Date.now())
         .all<{ detail: string }>();
       const detail = plan.results.map((r) => r.detail).join("\n");
       expect(detail).toContain("USING INDEX idx_runs_timeout_sweep");
+      // The OR over the deadline column walks the partial index rather than
+      // range-searching it. That index holds only 'running' rows, so the walk
+      // is bounded by the active set, never by the append-only table.
+      expect(detail).not.toMatch(/SCAN automation_runs(?! USING INDEX)/);
+    });
+  });
+
+  describe("completeTimedOutRun", () => {
+    it("overturns a sweep-declared timeout", async () => {
+      const store = new AutomationStore(env.DB);
+      const now = Date.now();
+      await store.create(makeAutomation({ id: "auto-ct1" }));
+      await seedRun(
+        makeRun("auto-ct1", {
+          id: "run-ct1",
+          status: "failed",
+          failure_reason: "execution_timeout",
+          started_at: now - 1000,
+          completed_at: now - 500,
+        })
+      );
+
+      expect(await store.completeTimedOutRun("run-ct1", now)).toBe(true);
+
+      const run = await store.getRunById("auto-ct1", "run-ct1");
+      expect(run!.status).toBe("completed");
+      expect(run!.failure_reason).toBeNull();
+      expect(run!.completed_at).toBe(now);
+    });
+
+    it("leaves every other terminal state final", async () => {
+      const store = new AutomationStore(env.DB);
+      const now = Date.now();
+      await store.create(makeAutomation({ id: "auto-ct2" }));
+      await seedRun(
+        makeRun("auto-ct2", {
+          id: "run-ct2",
+          status: "failed",
+          failure_reason: "Sandbox crashed",
+          started_at: now - 1000,
+          completed_at: now - 500,
+        })
+      );
+      await seedRun(
+        makeRun("auto-ct2", { id: "run-ct3", status: "completed", completed_at: now - 500 })
+      );
+
+      expect(await store.completeTimedOutRun("run-ct2", now)).toBe(false);
+      expect(await store.completeTimedOutRun("run-ct3", now)).toBe(false);
+      expect((await store.getRunById("auto-ct2", "run-ct2"))!.failure_reason).toBe(
+        "Sandbox crashed"
+      );
     });
   });
 
@@ -907,9 +1046,10 @@ describe("AutomationStore (D1 integration)", () => {
       expect(active!.id).toBe("run-ck3");
     });
 
-    it("getLatestSteerableRunForThread finds a completed run with a session (any status)", async () => {
+    it("getLatestContinuableRun finds a completed run with a session (any status)", async () => {
       const store = new AutomationStore(env.DB);
       await store.create(makeAutomation({ id: "auto-steer1" }));
+      const sessionUpdatedAt = Date.now() - 60_000;
 
       await seedRunForKey("auto-steer1", "slack:C1:t1", {
         id: "run-steer1",
@@ -917,44 +1057,90 @@ describe("AutomationStore (D1 integration)", () => {
         session_id: "sess-1",
         completed_at: Date.now(),
       });
+      await seedSessionRow("sess-1", sessionUpdatedAt);
 
-      const run = await store.getLatestSteerableRunForThread("auto-steer1", "slack:C1:t1", 0);
-      expect(run).not.toBeNull();
-      expect(run!.id).toBe("run-steer1");
+      const run = await store.getLatestContinuableRun("auto-steer1", "slack:C1:t1");
+      expect(run).toMatchObject({
+        id: "run-steer1",
+        first_prompt_pending: 0,
+        last_activity_at: sessionUpdatedAt,
+      });
     });
 
-    it("getLatestSteerableRunForThread excludes runs without a session", async () => {
+    it("getLatestContinuableRun ignores a session a failed launch claimed but never created", async () => {
+      const store = new AutomationStore(env.DB);
+      await store.create(makeAutomation({ id: "auto-steer7" }));
+
+      await seedRunForKey("auto-steer7", "slack:C1:t7", {
+        id: "run-steer7-older",
+        status: "completed",
+        session_id: "sess-steer7",
+        scheduled_at: Date.now() - 60_000,
+        created_at: Date.now() - 60_000,
+      });
+      await seedSessionRow("sess-steer7");
+      await seedRunForKey("auto-steer7", "slack:C1:t7", {
+        id: "run-steer7-failed",
+        status: "failed",
+        session_id: "sess-never-created",
+      });
+
+      expect(await store.getLatestContinuableRun("auto-steer7", "slack:C1:t7")).toMatchObject({
+        id: "run-steer7-older",
+      });
+    });
+
+    it("getLatestContinuableRun excludes runs that never got a session", async () => {
       const store = new AutomationStore(env.DB);
       await store.create(makeAutomation({ id: "auto-steer2" }));
 
-      // A skip/starting row (session_id null) must not shadow the thread session.
+      // A skipped row (session_id null) must not shadow the thread session.
       await seedRunForKey("auto-steer2", "slack:C1:t2", {
         id: "run-steer2-skip",
         status: "skipped",
         session_id: null,
       });
 
-      const run = await store.getLatestSteerableRunForThread("auto-steer2", "slack:C1:t2", 0);
-      expect(run).toBeNull();
+      expect(await store.getLatestContinuableRun("auto-steer2", "slack:C1:t2")).toBeNull();
     });
 
-    it("getLatestSteerableRunForThread excludes runs created before the window", async () => {
+    it("getLatestContinuableRun includes a run that is still launching", async () => {
       const store = new AutomationStore(env.DB);
       await store.create(makeAutomation({ id: "auto-steer3" }));
 
       await seedRunForKey("auto-steer3", "slack:C1:t3", {
-        id: "run-steer3-old",
-        status: "completed",
-        session_id: "sess-old",
-        created_at: Date.now() - 48 * 60 * 60 * 1000,
+        id: "run-steer3-starting",
+        status: "starting",
+        session_id: null,
       });
 
-      const sinceMs = Date.now() - 24 * 60 * 60 * 1000;
-      const run = await store.getLatestSteerableRunForThread("auto-steer3", "slack:C1:t3", sinceMs);
-      expect(run).toBeNull();
+      expect(await store.getLatestContinuableRun("auto-steer3", "slack:C1:t3")).toMatchObject({
+        id: "run-steer3-starting",
+        status: "starting",
+      });
     });
 
-    it("getLatestSteerableRunForThread returns the most recent session run for the key", async () => {
+    it("getLatestContinuableRun measures activity from the session's latest update", async () => {
+      const store = new AutomationStore(env.DB);
+      await store.create(makeAutomation({ id: "auto-steer6" }));
+      const runCreatedAt = Date.now() - 10 * 24 * 60 * 60 * 1000;
+      const sessionUpdatedAt = Date.now() - 60_000;
+
+      await seedRunForKey("auto-steer6", "slack:C1:t6", {
+        id: "run-steer6",
+        status: "completed",
+        session_id: "sess-steer6",
+        created_at: runCreatedAt,
+      });
+      await seedSessionRow("sess-steer6", sessionUpdatedAt);
+
+      expect(await store.getLatestContinuableRun("auto-steer6", "slack:C1:t6")).toMatchObject({
+        id: "run-steer6",
+        last_activity_at: sessionUpdatedAt,
+      });
+    });
+
+    it("getLatestContinuableRun returns the most recent run for the key", async () => {
       const store = new AutomationStore(env.DB);
       await store.create(makeAutomation({ id: "auto-steer4" }));
 
@@ -972,16 +1158,134 @@ describe("AutomationStore (D1 integration)", () => {
         scheduled_at: Date.now(),
         created_at: Date.now(),
       });
+      await seedSessionRow("sess-older");
+      await seedSessionRow("sess-newer");
 
-      const run = await store.getLatestSteerableRunForThread("auto-steer4", "slack:C1:t4", 0);
+      const run = await store.getLatestContinuableRun("auto-steer4", "slack:C1:t4");
       expect(run!.id).toBe("run-steer4-newer");
     });
 
-    it("getLatestSteerableRunForThread returns null for a null concurrency key", async () => {
+    it("getLatestContinuableRun returns null for a null concurrency key", async () => {
       const store = new AutomationStore(env.DB);
       await store.create(makeAutomation({ id: "auto-steer5" }));
-      const run = await store.getLatestSteerableRunForThread("auto-steer5", null, 0);
-      expect(run).toBeNull();
+      expect(await store.getLatestContinuableRun("auto-steer5", null)).toBeNull();
     });
+  });
+});
+
+describe("AutomationStore held continuity prompts", () => {
+  beforeEach(cleanD1Tables);
+
+  function heldPrompt(runId: string, id: string, createdAt = Date.now(), clientRequestId = id) {
+    return {
+      id,
+      run_id: runId,
+      actor_user_id: "user-1",
+      actor_author_id: "user-1",
+      client_request_id: clientRequestId,
+      prompt: JSON.stringify({ content: id, authorId: "user-1", source: "automation" }),
+      request_id: `req-${id}`,
+      created_at: createdAt,
+      retry_at: createdAt,
+    };
+  }
+
+  it("holds prompts from the run's creation until its first prompt is queued and the held ones drain", async () => {
+    const store = new AutomationStore(env.DB);
+    await store.create(makeAutomation({ id: "auto-hold1" }));
+    await seedRunForKey("auto-hold1", "webhook:session:k", { id: "run-hold1", status: "starting" });
+
+    expect(await store.holdPromptForLaunchingRun(heldPrompt("run-hold1", "h1"))).toBe("held");
+
+    expect(
+      await store.claimRunSession("run-hold1", "sess-hold1", Date.now(), Date.now() + 60_000)
+    ).toBe(true);
+    expect(await store.getLatestContinuableRun("auto-hold1", "webhook:session:k")).toMatchObject({
+      status: "running",
+      first_prompt_pending: 1,
+      has_held_prompts: 1,
+    });
+    expect(await store.holdPromptForLaunchingRun(heldPrompt("run-hold1", "h2"))).toBe("held");
+
+    // The first prompt is queued, but h1 and h2 are not released yet: h3 queues behind them.
+    await store.markRunFirstPromptQueued("run-hold1");
+    expect(await store.holdPromptForLaunchingRun(heldPrompt("run-hold1", "h3"))).toBe("held");
+    expect((await store.getHeldPrompts("run-hold1")).map((held) => held.id)).toEqual([
+      "h1",
+      "h2",
+      "h3",
+    ]);
+
+    for (const id of ["h1", "h2", "h3"]) await store.deleteHeldPrompt(id);
+    await seedSessionRow("sess-hold1");
+    expect(await store.getLatestContinuableRun("auto-hold1", "webhook:session:k")).toMatchObject({
+      first_prompt_pending: 0,
+      has_held_prompts: 0,
+    });
+    expect(await store.holdPromptForLaunchingRun(heldPrompt("run-hold1", "h4"))).toBe(
+      "not_holding"
+    );
+  });
+
+  it("holds a retried follow-up once", async () => {
+    const store = new AutomationStore(env.DB);
+    await store.create(makeAutomation({ id: "auto-hold4" }));
+    await seedRunForKey("auto-hold4", "webhook:session:k", { id: "run-hold4", status: "starting" });
+
+    expect(
+      await store.holdPromptForLaunchingRun(heldPrompt("run-hold4", "h1", Date.now(), "webhook:r"))
+    ).toBe("held");
+    expect(
+      await store.holdPromptForLaunchingRun(heldPrompt("run-hold4", "h2", Date.now(), "webhook:r"))
+    ).toBe("duplicate");
+    expect((await store.getHeldPrompts("run-hold4")).map((held) => held.id)).toEqual(["h1"]);
+  });
+
+  it("does not hold prompts for a run that ended", async () => {
+    const store = new AutomationStore(env.DB);
+    await store.create(makeAutomation({ id: "auto-hold2" }));
+    await seedRunForKey("auto-hold2", "webhook:session:k", {
+      id: "run-hold2",
+      status: "failed",
+      session_id: null,
+    });
+
+    expect(await store.holdPromptForLaunchingRun(heldPrompt("run-hold2", "h1"))).toBe(
+      "not_holding"
+    );
+  });
+
+  it("selects runs whose held prompts are due, longest-waiting first, and defers them", async () => {
+    const store = new AutomationStore(env.DB);
+    await store.create(makeAutomation({ id: "auto-hold3" }));
+    const now = Date.now();
+    for (const [runId, retryAt] of [
+      ["run-due-late", now - 1],
+      ["run-due-early", now - 60_000],
+      ["run-not-due", now + 60_000],
+    ] as const) {
+      await seedRunForKey("auto-hold3", `webhook:session:${runId}`, {
+        id: runId,
+        status: "starting",
+      });
+      await store.holdPromptForLaunchingRun(heldPrompt(runId, `h-${runId}`, retryAt));
+    }
+
+    expect((await store.getRunsWithDueHeldPrompts(now, 10)).map((run) => run.id)).toEqual([
+      "run-due-early",
+      "run-due-late",
+    ]);
+    expect((await store.getRunsWithDueHeldPrompts(now, 1)).map((run) => run.id)).toEqual([
+      "run-due-early",
+    ]);
+
+    // A run the sweep could not settle moves behind the others.
+    await store.deferHeldPrompts("run-due-early", now + 120_000);
+    expect((await store.getRunsWithDueHeldPrompts(now, 1)).map((run) => run.id)).toEqual([
+      "run-due-late",
+    ]);
+
+    expect(await store.deleteHeldPromptsForRun("run-due-late")).toBe(1);
+    expect(await store.getRunsWithDueHeldPrompts(now, 10)).toEqual([]);
   });
 });

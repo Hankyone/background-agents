@@ -5,15 +5,16 @@
 import {
   DEFAULT_MAX_CONCURRENT_CHILD_SESSIONS,
   DEFAULT_MAX_TOTAL_CHILD_SESSIONS,
+  DEFAULT_LINEAR_UNBOUND_CHANNELS,
+  linearBotGlobalSettingsSchema,
   type CodeServerSettings,
   type EnvironmentSettingsIntegrationId,
   type GitHubBotSettings,
   type IntegrationId,
-  type LinearBotSettings,
   type SandboxSettings,
   type VncSettings,
 } from "@open-inspect/shared/types/integrations";
-import { isValidReasoningEffort } from "@open-inspect/shared/models";
+import { getValidHarnessOrDefault } from "@open-inspect/shared/harnesses";
 import {
   IntegrationSettingsStore,
   IntegrationSettingsValidationError,
@@ -34,10 +35,24 @@ import {
   json,
   error,
   requirePermission,
+  requireAll,
+  permissionRequirement,
+  environmentRequirement,
 } from "./shared";
 import { parseJsonBody } from "./body";
 
 const logger = createLogger("router:integration-settings");
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function extractSettings(body: unknown): Record<string, unknown> | Response {
+  if (!isRecord(body) || !isRecord(body.settings)) {
+    return error("Request body must include settings object", 400);
+  }
+  return body.settings;
+}
 
 function integrationId(id: string): IntegrationId | null {
   return isValidIntegrationId(id) ? id : null;
@@ -99,17 +114,15 @@ async function handleSetIntegrationSettings(
   const id = integrationId(params.id);
   if (!id) return error(`Unknown integration: ${params.id}`, 404);
 
-  const body = await parseJsonBody<{ settings?: Record<string, unknown> }>(request);
+  const body = await parseJsonBody(request);
   if (body instanceof Response) return body;
-
-  if (!body?.settings || typeof body.settings !== "object") {
-    return error("Request body must include settings object", 400);
-  }
+  const settings = extractSettings(body);
+  if (settings instanceof Response) return settings;
 
   const store = new IntegrationSettingsStore(ctx.db);
 
   try {
-    await store.setGlobal(id, body.settings);
+    await store.setGlobal(id, settings);
 
     logger.info("integration_settings.updated", {
       event: "integration_settings.updated",
@@ -211,18 +224,16 @@ async function handleSetRepoSettings(
   if (repository instanceof Response) return repository;
   const { owner, name } = repository;
 
-  const body = await parseJsonBody<{ settings?: Record<string, unknown> }>(request);
+  const body = await parseJsonBody(request);
   if (body instanceof Response) return body;
-
-  if (!body?.settings || typeof body.settings !== "object") {
-    return error("Request body must include settings object", 400);
-  }
+  const settings = extractSettings(body);
+  if (settings instanceof Response) return settings;
 
   const store = new IntegrationSettingsStore(ctx.db);
   const repo = `${owner}/${name}`;
 
   try {
-    await store.setRepoSettings(id, repo, body.settings);
+    await store.setRepoSettings(id, repo, settings);
 
     logger.info("integration_repo_settings.updated", {
       event: "integration_repo_settings.updated",
@@ -308,15 +319,13 @@ async function handleSetEnvironmentSettings(
   if (settingsParams instanceof Response) return settingsParams;
   const { integrationId, environmentId, store } = settingsParams;
 
-  const body = await parseJsonBody<{ settings?: Record<string, unknown> }>(request);
+  const body = await parseJsonBody(request);
   if (body instanceof Response) return body;
-
-  if (!body?.settings || typeof body.settings !== "object") {
-    return error("Request body must include settings object", 400);
-  }
+  const settings = extractSettings(body);
+  if (settings instanceof Response) return settings;
 
   try {
-    await store.setEnvironmentSettings(integrationId, environmentId, body.settings);
+    await store.setEnvironmentSettings(integrationId, environmentId, settings);
 
     logger.info("integration_environment_settings.updated", {
       event: "integration_environment_settings.updated",
@@ -391,19 +400,15 @@ async function handleGetResolvedConfig(
 
   if (id === "github") {
     const githubSettings = settings as GitHubBotSettings;
-    const reasoningEffort =
-      githubSettings.model &&
-      githubSettings.reasoningEffort &&
-      !isValidReasoningEffort(githubSettings.model, githubSettings.reasoningEffort)
-        ? null
-        : (githubSettings.reasoningEffort ?? null);
+    const harness = getValidHarnessOrDefault(githubSettings.harness);
 
     return json({
       integrationId: id,
       repo,
       config: {
         model: githubSettings.model ?? null,
-        reasoningEffort,
+        harness,
+        reasoningEffort: githubSettings.reasoningEffort ?? null,
         autoReviewOnOpen: githubSettings.autoReviewOnOpen ?? true,
         enabledRepos,
         allowedTriggerUsers: githubSettings.allowedTriggerUsers ?? null,
@@ -414,24 +419,21 @@ async function handleGetResolvedConfig(
   }
 
   if (id === "linear") {
-    const linearSettings = settings as LinearBotSettings;
-    const linearReasoningEffort =
-      linearSettings.model &&
-      linearSettings.reasoningEffort &&
-      !isValidReasoningEffort(linearSettings.model, linearSettings.reasoningEffort)
-        ? null
-        : (linearSettings.reasoningEffort ?? null);
+    const linearSettings = linearBotGlobalSettingsSchema.parse(settings);
+    const harness = getValidHarnessOrDefault(linearSettings.harness);
 
     return json({
       integrationId: id,
       repo,
       config: {
+        harness,
         model: linearSettings.model ?? null,
-        reasoningEffort: linearReasoningEffort,
+        reasoningEffort: linearSettings.reasoningEffort ?? null,
         allowUserPreferenceOverride: linearSettings.allowUserPreferenceOverride ?? true,
         allowLabelModelOverride: linearSettings.allowLabelModelOverride ?? true,
         emitToolProgressActivities: linearSettings.emitToolProgressActivities ?? true,
         issueSessionInstructions: linearSettings.issueSessionInstructions ?? null,
+        unboundChannels: linearSettings.unboundChannels ?? DEFAULT_LINEAR_UNBOUND_CHANNELS,
         enabledRepos,
       },
     });
@@ -476,7 +478,10 @@ async function handleGetResolvedConfig(
         // null → use the provider's default reservation (no override configured).
         cpuCores: sandboxSettings.cpuCores ?? null,
         memoryMib: sandboxSettings.memoryMib ?? null,
+        cpuLimitCores: sandboxSettings.cpuLimitCores ?? null,
+        memoryLimitMib: sandboxSettings.memoryLimitMib ?? null,
         sandboxTimeoutMs: sandboxSettings.sandboxTimeoutMs ?? null,
+        finalSnapshotBufferMs: sandboxSettings.finalSnapshotBufferMs ?? null,
         enabledRepos,
       },
     });
@@ -499,7 +504,10 @@ const REPO_SETTINGS_MANAGE = admit({
 });
 const ENVIRONMENT_SETTINGS_MANAGE = admit({
   ...GITHUB_USER_OR_SERVICE_ROUTE,
-  authorization: requirePermission("environments.settings.manage"),
+  authorization: requireAll(
+    permissionRequirement("environments.settings.manage"),
+    environmentRequirement("manage", "environmentId")
+  ),
 });
 
 export const integrationSettingsRoutes = new Hono<ControlPlaneHonoEnv>();
@@ -510,7 +518,10 @@ integrationSettingsRoutes.get(
   admit({
     ...GITHUB_USER_OR_SERVICE_ROUTE,
     authorization: requirePermission("integrations.read", {
-      actorlessGrants: [{ service: "slack-bot", pathParams: { id: "slack" } }],
+      actorlessGrants: [
+        { service: "slack-bot", pathParams: { id: "slack" } },
+        { service: "linear-bot", pathParams: { id: "linear" } },
+      ],
     }),
   }),
   (c) => dispatch(c, handleGetIntegrationSettings)
@@ -544,7 +555,13 @@ integrationSettingsRoutes.delete(
 // code-server, and VNC only)
 integrationSettingsRoutes.get(
   "/integration-settings/:id/environments/:environmentId",
-  INTEGRATIONS_READ,
+  admit({
+    ...GITHUB_USER_OR_SERVICE_ROUTE,
+    authorization: requireAll(
+      permissionRequirement("integrations.read"),
+      environmentRequirement("read", "environmentId")
+    ),
+  }),
   (c) => dispatch(c, handleGetEnvironmentSettings)
 );
 integrationSettingsRoutes.put(

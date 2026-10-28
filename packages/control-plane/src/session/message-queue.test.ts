@@ -14,10 +14,14 @@ import type { MessageRow, ParticipantRow, SessionRow, SessionAttachmentRow } fro
 import type { SessionCoreRepository } from "./session-core-repository";
 import type { ParticipantRepository } from "./participant-repository";
 import type { MessageRepository } from "./message-repository";
-import type { SessionWebSocketManager } from "./websocket-manager";
+import type { SandboxCommandTarget, SessionWebSocketManager } from "./websocket-manager";
 import type { ParticipantService } from "./participant-service";
 import type { CallbackNotificationService } from "./callback-notification-service";
 import { createEarliestAlarmScheduler } from "./alarm/scheduler";
+import { ExecutionStopCoordinator } from "./execution-stop-coordinator";
+import type { SandboxAlarmResult } from "../sandbox/lifecycle/manager";
+import { MessageFailureService } from "./message-failure-service";
+import { SandboxExecutionEventHandler } from "./sandbox-events/execution.handler";
 import type { SessionStatusService } from "./session-status-service";
 import type { GitHubAutofixSessionCommand } from "@open-inspect/shared";
 
@@ -53,16 +57,20 @@ function createSession(overrides: Partial<SessionRow> = {}): SessionRow {
     branch_name: null,
     base_sha: null,
     current_sha: null,
-    opencode_session_id: null,
+    agent_session_id: null,
+    harness: "opencode",
     model: "anthropic/claude-haiku-4-5",
     reasoning_effort: null,
     status: "active",
+    status_revision: 1,
     parent_session_id: null,
     spawn_source: "user" as const,
     spawn_depth: 0,
     code_server_enabled: 0,
     vnc_enabled: 0,
     total_cost: 0,
+    max_cost_usd: null,
+    budget_exhausted: 0,
     sandbox_settings: null,
     environment_id: null,
     created_at: 1000,
@@ -89,6 +97,7 @@ function createMessage(overrides: Partial<MessageRow> = {}): MessageRow {
     status: "pending",
     error_message: null,
     stop_confirmation_deadline: null,
+    reported_cost_usd: 0,
     created_at: 1000,
     started_at: null,
     completed_at: null,
@@ -128,11 +137,15 @@ it("creates a canonical SHA-256 web prompt fingerprint", async () => {
   ).resolves.toBe(fingerprint);
 });
 
-function buildQueue() {
+function buildQueue(
+  mayDispatch: () => boolean = () => true,
+  getSandboxPromptBlockReason: () => string | null = () => null
+) {
   // Mutable so tests can pin that the deadline honors the value current at
   // dispatch time — the thunk exists because settings can be persisted after
   // the queue is constructed.
   let executionTimeoutMs = EXECUTION_TIMEOUT_MS;
+  let awaitingStop: { id: string; deadline: number } | null = null;
   const log = {
     debug: vi.fn(),
     info: vi.fn(),
@@ -141,14 +154,15 @@ function buildQueue() {
     child: vi.fn(),
   };
   const repository = {
+    transaction: vi.fn((closure: () => unknown) => closure()),
     createMessageWithAttachments: vi.fn(),
     createEvent: vi.fn(),
     getPendingOrProcessingCount: vi.fn(() => 1),
     getMessageByClientRequestId: vi.fn(() => null as MessageRow | null),
-    admitAutofixMessage: vi.fn<MessageRepository["admitAutofixMessage"]>(() => ({
-      kind: "enqueued",
-      messageId: "msg-autofix",
-    })),
+    admitAutofixMessage: vi.fn<MessageRepository["admitAutofixMessage"]>((data) => {
+      if (typeof data.message.authorId === "function") data.message.authorId();
+      return { kind: "enqueued", messageId: "msg-autofix" };
+    }),
     getAutofixMessageId: vi.fn(() => null as string | null),
     getMessageStatus: vi.fn((_messageId: string): MessageStatus | null => "pending"),
     cancelPendingMessage: vi.fn(() => false),
@@ -156,20 +170,23 @@ function buildQueue() {
     listUnfinishedMessages: vi.fn((): MessageRow[] => []),
     listPromptQueue: vi.fn(() => []),
     getProcessingMessage: vi.fn(() => null as { id: string } | null),
-    getMessageAwaitingStopConfirmation: vi.fn(
-      () => null as { id: string; deadline: number } | null
-    ),
-    clearMessageAwaitingStopConfirmation: vi.fn(),
+    getMessageContent: vi.fn(() => null as string | null),
+    getMessageAwaitingStopConfirmation: vi.fn(() => awaitingStop),
+    clearMessageAwaitingStopConfirmation: vi.fn((messageId: string) => {
+      if (awaitingStop?.id === messageId) awaitingStop = null;
+    }),
     getProcessingMessageWithCreatedAt: vi.fn(
       () => null as { id: string; created_at: number } | null
     ),
     getNextPendingMessage: vi.fn(() => null as MessageRow | null),
+    getMessageById: vi.fn(() => null as MessageRow | null),
     startMessageProcessing: vi.fn<MessageRepository["startMessageProcessing"]>(() => true),
     updateMessageToProcessing: vi.fn(),
     updateMessageToPending: vi.fn(),
-    getParticipantById: vi.fn(() => createParticipant()),
+    getParticipantById: vi.fn((_id: string) => createParticipant()),
     getSession: vi.fn(() => createSession()),
     updateParticipantCoalesce: vi.fn(),
+    updateParticipantIdentity: vi.fn(),
     recordMessageCompletion: vi.fn((event: { messageId: string }, completedAt: number) => ({
       messageId: event.messageId,
       messageCreatedAt: 1000,
@@ -177,7 +194,9 @@ function buildQueue() {
       completedAt,
       status: "failed" as const,
     })),
-    markMessageAwaitingStopConfirmation: vi.fn(),
+    markMessageAwaitingStopConfirmation: vi.fn((id: string, deadline: number) => {
+      awaitingStop = { id, deadline };
+    }),
     listPendingMessagesWithCreatedAt: vi.fn((): Array<{ id: string; created_at: number }> => []),
   };
 
@@ -187,6 +206,12 @@ function buildQueue() {
 
   const wsManager = {
     getSandboxSocket: vi.fn(() => null as WebSocket | null),
+    // Mirrors the attached socket unless a test withholds it, the way the
+    // registry does while a bridge is attached ahead of its boot.
+    getSandboxCommandTarget: vi.fn((): SandboxCommandTarget => {
+      const socket = wsManager.getSandboxSocket();
+      return socket ? { kind: "dispatch", socket } : { kind: "unavailable" };
+    }),
     send: vi.fn((_ws: WebSocket, _message: ServerMessage) => true),
   };
 
@@ -210,17 +235,60 @@ function buildQueue() {
   const sandboxLifecycle = {
     spawnSandbox: vi.fn(async () => {}),
     updateLastActivity: vi.fn((_timestamp: number) => {}),
+    onPromptDispatched: vi.fn(() => {}),
     terminateUnresponsiveSandbox: vi.fn(async () => {}),
-    terminateFailedSandbox: vi.fn(async () => true),
+    terminateFailedSandbox: vi.fn(
+      async (_reason: string) => "sandbox_terminated" as SandboxAlarmResult
+    ),
     reportSandboxError: vi.fn((_reason: string) => {}),
   };
   const backgroundTasks = createTestBackgroundTasks();
+  const sessionIndex = { touchUpdatedAt: vi.fn(async () => true) };
   const getAlarm = vi.fn(async () => null as number | null);
   const setAlarm = vi.fn(async (_timestamp: number) => {});
+  const alarmDeadlines = {
+    pending: vi.fn(() => null as number | null),
+    earliest: vi.fn(() => null as number | null),
+    cancelled: vi.fn(() => false),
+    setPending: vi.fn(),
+    setPendingEarliest: vi.fn(),
+    activate: vi.fn(),
+    clear: vi.fn(),
+    beginDelivery: vi.fn(() => null as number | "cancelled" | null),
+    completeDelivery: vi.fn(),
+  };
   const projectTerminalMessage = vi.fn(async () => {});
-  const getProviderAuthenticationError = vi.fn(async (_model: string) => null as string | null);
+  const getProviderAuthenticationError = vi.fn(
+    async (_model: string, _canonicalUserId?: string | null) => null as string | null
+  );
 
-  const queue = new SessionMessageQueue(
+  const alarmScheduler = createEarliestAlarmScheduler(
+    { getAlarm, setAlarm, deleteAlarm: vi.fn(async () => {}) },
+    alarmDeadlines
+  );
+  const messageFailures = new MessageFailureService(
+    backgroundTasks,
+    log,
+    repository as unknown as MessageRepository,
+    messenger,
+    callbackService as unknown as CallbackNotificationService,
+    projectTerminalMessage
+  );
+  const executionStop: ExecutionStopCoordinator = new ExecutionStopCoordinator(
+    log,
+    repository as unknown as SessionCoreRepository,
+    repository as unknown as MessageRepository,
+    wsManager as unknown as SessionWebSocketManager,
+    messenger,
+    sessionStatus as unknown as SessionStatusService,
+    messageFailures,
+    sandboxLifecycle,
+    alarmScheduler,
+    alarmDeadlines,
+    (): void => queue.broadcastPromptQueue(),
+    (): Promise<void> => queue.processMessageQueue()
+  );
+  const queue: SessionMessageQueue = new SessionMessageQueue(
     backgroundTasks,
     log,
     repository as unknown as SessionCoreRepository,
@@ -233,28 +301,20 @@ function buildQueue() {
     callbackService as unknown as CallbackNotificationService,
     sessionStatus as unknown as SessionStatusService,
     getProviderAuthenticationError,
-    projectTerminalMessage,
+    messageFailures,
     sandboxLifecycle,
-    null,
+    sessionIndex,
     "github",
-    createEarliestAlarmScheduler(
-      { getAlarm, setAlarm, deleteAlarm: vi.fn(async () => {}) },
-      {
-        pending: vi.fn(() => null),
-        earliest: vi.fn(() => null),
-        cancelled: vi.fn(() => false),
-        setPending: vi.fn(),
-        activate: vi.fn(),
-        clear: vi.fn(),
-        beginDelivery: vi.fn(() => null),
-        completeDelivery: vi.fn(),
-      }
-    ),
-    () => executionTimeoutMs
+    alarmScheduler,
+    executionStop,
+    () => executionTimeoutMs,
+    mayDispatch,
+    getSandboxPromptBlockReason
   );
 
   return {
     queue,
+    executionStop,
     repository,
     attachmentRepository,
     wsManager,
@@ -262,9 +322,11 @@ function buildQueue() {
     broadcast,
     sessionStatus,
     sandboxLifecycle,
+    sessionIndex,
     backgroundTasks,
     getAlarm,
     setAlarm,
+    alarmDeadlines,
     callbackService,
     getProviderAuthenticationError,
     projectTerminalMessage,
@@ -276,6 +338,143 @@ function buildQueue() {
 }
 
 describe("SessionMessageQueue", () => {
+  it("rechecks native deployment admission before both insertion and dispatch", async () => {
+    const h = buildQueue();
+    h.repository.getSession.mockReturnValue(
+      createSession({ harness: "codex", model: "openai/gpt-6.1-sol" })
+    );
+    h.getProviderAuthenticationError.mockResolvedValue("This model has been disabled.");
+    await expect(
+      h.queue.enqueuePromptFromApi({ content: "next", authorId: "user-1", source: "agent" })
+    ).rejects.toThrow("disabled");
+    expect(h.repository.createMessageWithAttachments).not.toHaveBeenCalled();
+    h.repository.getNextPendingMessage.mockReturnValueOnce(createMessage());
+    await h.queue.processMessageQueue();
+    expect(h.getProviderAuthenticationError).toHaveBeenCalledTimes(2);
+    expect(h.repository.startMessageProcessing).not.toHaveBeenCalled();
+  });
+
+  it("rejects new websocket and API prompts during a failed safety hold", async () => {
+    const h = buildQueue(
+      () => false,
+      () => "Start a new session to continue."
+    );
+    const ws = {} as WebSocket;
+    h.participantService.getByUserId.mockReturnValue(null as unknown as ParticipantRow);
+
+    await h.queue.handlePromptMessage(ws, createClientInfo(), {
+      content: "Continue",
+      clientRequestId: "request-1",
+    });
+    await expect(
+      h.queue.enqueuePromptFromApi({ content: "Continue", authorId: "user-1", source: "agent" })
+    ).rejects.toMatchObject({ name: "SandboxPromptBlockedError" });
+
+    expect(h.wsManager.send).toHaveBeenCalledWith(
+      ws,
+      expect.objectContaining({
+        type: "error",
+        code: "SANDBOX_RECOVERY_REQUIRED",
+        clientRequestId: "request-1",
+        message: "Start a new session to continue.",
+      })
+    );
+    expect(h.participantService.create).not.toHaveBeenCalled();
+    expect(h.repository.createMessageWithAttachments).not.toHaveBeenCalled();
+    expect(h.sessionStatus.transition).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the safety hold after asynchronous prompt fingerprinting", async () => {
+    let held = false;
+    const h = buildQueue(
+      () => true,
+      () => (held ? "Sandbox recovery required" : null)
+    );
+    const ws = {} as WebSocket;
+    const handling = h.queue.handlePromptMessage(ws, createClientInfo(), {
+      content: "Continue",
+      clientRequestId: "request-1",
+    });
+    held = true;
+    await handling;
+
+    expect(h.repository.createMessageWithAttachments).not.toHaveBeenCalled();
+    expect(h.wsManager.send).toHaveBeenCalledWith(
+      ws,
+      expect.objectContaining({ code: "SANDBOX_RECOVERY_REQUIRED" })
+    );
+  });
+  it("cannot dispatch while final-cost settlement waits for terminal projection", async () => {
+    const h = buildQueue();
+    const session = createSession({ total_cost: 9, max_cost_usd: 10 });
+    h.repository.getSession.mockReturnValue(session);
+    h.repository.getProcessingMessage.mockReturnValue({ id: "msg-finishing" });
+    h.repository.recordMessageCompletion.mockImplementation((event, completedAt) => {
+      h.repository.getProcessingMessage.mockReturnValue(null);
+      return {
+        messageId: event.messageId,
+        messageCreatedAt: 1000,
+        messageStartedAt: 1100,
+        completedAt,
+        status: "failed",
+      };
+    });
+    h.repository.getNextPendingMessage.mockReturnValue(createMessage({ id: "msg-next" }));
+    h.wsManager.getSandboxSocket.mockReturnValue({ readyState: 1 } as WebSocket);
+    let release!: () => void;
+    h.projectTerminalMessage.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        })
+    );
+    const budget = {
+      observeExecutionCost: vi.fn(() => {
+        session.budget_exhausted = 1;
+        session.total_cost = 10;
+        return { warningEvent: null, stopPreparation: null, statusChanged: true };
+      }),
+      deliverTransition: vi.fn(async () => {}),
+    };
+    const handler = new SandboxExecutionEventHandler(
+      h.backgroundTasks,
+      h.log,
+      h.repository as unknown as MessageRepository,
+      h.callbackService as unknown as CallbackNotificationService,
+      { broadcast: h.broadcast, sendToSandbox: async () => {} },
+      h.projectTerminalMessage,
+      h.sessionStatus as unknown as SessionStatusService,
+      async () => {},
+      () => {},
+      async () => {},
+      () => h.queue.processMessageQueue(),
+      () => h.queue.broadcastPromptQueue(),
+      budget,
+      (closure) => closure(),
+      () => {}
+    );
+    const finishing = handler.handleExecutionComplete(
+      {
+        type: "execution_complete",
+        messageId: "msg-finishing",
+        success: true,
+        messageCostUsd: 1,
+        sandboxId: "sb",
+        timestamp: 2,
+      },
+      { now: 2000, messageId: "msg-finishing", processingMessage: { id: "msg-finishing" } }
+    );
+    await h.queue.processMessageQueue();
+    try {
+      expect(budget.observeExecutionCost).toHaveBeenCalledOnce();
+      expect(h.projectTerminalMessage).toHaveBeenCalledOnce();
+      expect(h.repository.startMessageProcessing).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await finishing;
+    }
+  });
+
   it("admits Autofix feedback through the message repository", async () => {
     const h = buildQueue();
     const command: Extract<GitHubAutofixSessionCommand, { type: "enqueue_feedback" }> = {
@@ -288,6 +487,13 @@ describe("SessionMessageQueue", () => {
         kind: "review",
         authorType: "human",
         feedbackUrl: "https://github.com/acme/widgets/pull/42#pullrequestreview-1234",
+        feedback: {
+          version: 1,
+          kind: "review",
+          url: "https://github.com/acme/widgets/pull/42#pullrequestreview-1234",
+          body: "Review body",
+          comments: [],
+        },
       },
       attemptLimit: 10,
     };
@@ -304,7 +510,7 @@ describe("SessionMessageQueue", () => {
     });
     expect(h.repository.admitAutofixMessage).toHaveBeenCalledWith({
       message: expect.objectContaining({
-        authorId: "part-1",
+        authorId: expect.any(Function),
         content: command.prompt,
         source: "github",
         status: "pending",
@@ -319,35 +525,53 @@ describe("SessionMessageQueue", () => {
     expect(h.repository.createEvent).not.toHaveBeenCalled();
     expect(h.sessionStatus.transition).toHaveBeenCalledWith("active");
     expect(h.broadcast).toHaveBeenCalledWith({ type: "prompt_queue_updated", promptQueue: [] });
-  });
-
-  it("re-drives duplicate pending Autofix work without admitting another message", async () => {
-    const h = buildQueue();
-    h.repository.admitAutofixMessage.mockReturnValue({
-      kind: "duplicate",
-      messageId: "msg-existing",
-    });
-
-    const result = await h.queue.enqueueAutofix({
-      type: "enqueue_feedback",
-      feedbackKey: "github:review:1234",
-      pullRequest: { repositoryId: "99", number: 42, artifactId: "artifact-1" },
-      prompt: "Address the submitted review feedback.",
-      author: { id: "7", login: "alice" },
-      origin: {
-        kind: "review",
-        authorType: "human",
-        feedbackUrl: "https://github.com/acme/widgets/pull/42#pullrequestreview-1234",
-      },
-      attemptLimit: 10,
-    });
-
-    expect(result).toEqual({ kind: "duplicate", messageId: "msg-existing" });
-    expect(h.sessionStatus.transition).toHaveBeenCalledWith("active");
-    expect(h.broadcast).not.toHaveBeenCalledWith(
-      expect.objectContaining({ type: "sandbox_event" })
+    expect(h.log.info).toHaveBeenCalledWith(
+      "autofix.enqueue",
+      expect.objectContaining({ recovery_hold: false })
     );
   });
+
+  it.each([false, true])(
+    "reconciles duplicate pending Autofix work while held=%s",
+    async (held) => {
+      const h = buildQueue(
+        () => !held,
+        () => (held ? "Sandbox recovery required" : null)
+      );
+      h.repository.admitAutofixMessage.mockReturnValue({
+        kind: "duplicate",
+        messageId: "msg-existing",
+      });
+
+      const result = await h.queue.enqueueAutofix({
+        type: "enqueue_feedback",
+        feedbackKey: "github:review:1234",
+        pullRequest: { repositoryId: "99", number: 42, artifactId: "artifact-1" },
+        prompt: "Address the submitted review feedback.",
+        author: { id: "7", login: "alice" },
+        origin: {
+          kind: "review",
+          authorType: "human",
+          feedbackUrl: "https://github.com/acme/widgets/pull/42#pullrequestreview-1234",
+        },
+        attemptLimit: 10,
+      });
+
+      expect(result).toEqual({ kind: "duplicate", messageId: "msg-existing" });
+      expect(h.log.info).toHaveBeenCalledWith(
+        "autofix.enqueue",
+        expect.objectContaining({ outcome: "duplicate", message_id: "msg-existing" })
+      );
+      expect(h.sessionStatus.transition).toHaveBeenCalledWith("active");
+      expect(h.broadcast).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: "sandbox_event" })
+      );
+      if (held) {
+        expect(h.repository.getNextPendingMessage).not.toHaveBeenCalled();
+        expect(h.sandboxLifecycle.spawnSandbox).not.toHaveBeenCalled();
+      }
+    }
+  );
 
   it("passes closed-session state into atomic Autofix admission", async () => {
     const h = buildQueue();
@@ -376,6 +600,93 @@ describe("SessionMessageQueue", () => {
       expect.objectContaining({ sessionClosed: true })
     );
     expect(h.sessionStatus.transition).not.toHaveBeenCalled();
+    expect(h.participantService.getByUserId).not.toHaveBeenCalled();
+    expect(h.repository.updateParticipantCoalesce).not.toHaveBeenCalled();
+  });
+
+  it("queues Autofix feedback during a recovery hold and dispatches only after it lifts", async () => {
+    let held = true;
+    const h = buildQueue(
+      () => !held,
+      () => (held ? "Sandbox recovery required" : null)
+    );
+    h.wsManager.getSandboxSocket.mockReturnValue({ readyState: 1 } as WebSocket);
+
+    const result = await h.queue.enqueueAutofix({
+      type: "enqueue_feedback",
+      feedbackKey: "github:review:held",
+      pullRequest: { repositoryId: "99", number: 42, artifactId: "artifact-1" },
+      prompt: "Address the feedback",
+      author: { id: "7", login: "alice" },
+      origin: {
+        kind: "review",
+        authorType: "human",
+        feedbackUrl: "https://github.com/acme/widgets/pull/42#pullrequestreview-held",
+      },
+      attemptLimit: 10,
+    });
+
+    expect(result).toEqual({ kind: "enqueued", messageId: "msg-autofix" });
+    const admitted = h.repository.admitAutofixMessage.mock.calls[0][0];
+    expect(admitted).not.toHaveProperty("sandboxRecoveryRequired");
+    expect(admitted.message.status).toBe("pending");
+    h.repository.getNextPendingMessage.mockReturnValue(
+      createMessage({ id: "msg-autofix", content: admitted.message.content, source: "github" })
+    );
+    await h.queue.processMessageQueue();
+    expect(h.sessionStatus.transition).toHaveBeenCalledExactlyOnceWith("active");
+    expect(h.repository.startMessageProcessing).not.toHaveBeenCalled();
+    expect(h.sandboxLifecycle.spawnSandbox).not.toHaveBeenCalled();
+    expect(h.wsManager.send).not.toHaveBeenCalled();
+    expect(h.log.info).toHaveBeenCalledWith(
+      "autofix.enqueue",
+      expect.objectContaining({ recovery_hold: true, message_id: "msg-autofix" })
+    );
+
+    held = false;
+    await h.queue.processMessageQueue();
+    expect(h.repository.startMessageProcessing).toHaveBeenCalledWith(
+      "msg-autofix",
+      expect.any(Number),
+      expect.any(Object)
+    );
+    expect(h.wsManager.send).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ type: "prompt", messageId: "msg-autofix" })
+    );
+  });
+
+  it("logs the reason for rejected Autofix feedback", async () => {
+    const h = buildQueue();
+    h.repository.admitAutofixMessage.mockReturnValue({
+      kind: "rejected",
+      reason: "budget_exhausted",
+    });
+    const result = await h.queue.enqueueAutofix({
+      type: "enqueue_feedback",
+      feedbackKey: "github:review:1234",
+      pullRequest: { repositoryId: "99", number: 42, artifactId: "artifact-1" },
+      prompt: "Address the feedback",
+      author: { id: "7", login: "alice" },
+      origin: {
+        kind: "review",
+        authorType: "human",
+        feedbackUrl: "https://github.com/acme/widgets/pull/42#pullrequestreview-1234",
+      },
+      attemptLimit: 10,
+    });
+
+    expect(result).toEqual({ kind: "rejected", reason: "budget_exhausted" });
+    expect(h.log.info).toHaveBeenCalledWith("autofix.rejected", {
+      event: "autofix.rejected",
+      feedback_key: "github:review:1234",
+      pull_request_number: 42,
+      artifact_id: "artifact-1",
+      recovery_hold: false,
+      reason: "budget_exhausted",
+    });
+    expect(h.sessionStatus.transition).not.toHaveBeenCalled();
+    expect(h.participantService.getByUserId).not.toHaveBeenCalled();
   });
 
   it("returns a duplicate without re-driving it in a closed session", async () => {
@@ -405,16 +716,23 @@ describe("SessionMessageQueue", () => {
     expect(h.repository.getNextPendingMessage).not.toHaveBeenCalled();
   });
 
-  it("looks up and re-drives pending Autofix work", async () => {
-    const h = buildQueue();
-    h.repository.getAutofixMessageId.mockReturnValue("msg-existing");
+  it.each([false, true])(
+    "looks up and reconciles pending Autofix work while held=%s",
+    async (held) => {
+      const h = buildQueue(
+        () => !held,
+        () => (held ? "Sandbox recovery required" : null)
+      );
+      h.repository.getAutofixMessageId.mockReturnValue("msg-existing");
 
-    await expect(h.queue.lookupAutofix("github:review:1234")).resolves.toEqual({
-      kind: "found",
-      messageId: "msg-existing",
-    });
-    expect(h.sessionStatus.transition).toHaveBeenCalledWith("active");
-  });
+      await expect(h.queue.lookupAutofix("github:review:1234")).resolves.toEqual({
+        kind: "found",
+        messageId: "msg-existing",
+      });
+      expect(h.sessionStatus.transition).toHaveBeenCalledWith("active");
+      if (held) expect(h.repository.getNextPendingMessage).not.toHaveBeenCalled();
+    }
+  );
 
   it("cancels a pending prompt and confirms it to the requester", async () => {
     const h = buildQueue();
@@ -472,12 +790,44 @@ describe("SessionMessageQueue", () => {
 
     await h.queue.processMessageQueue();
 
-    expect(h.broadcast).toHaveBeenCalledWith({ type: "sandbox_spawning" });
+    // Lifecycle announces a launch only once it decides to launch one.
+    expect(h.broadcast).not.toHaveBeenCalledWith({ type: "sandbox_spawning" });
     expect(h.sandboxLifecycle.spawnSandbox).toHaveBeenCalledTimes(1);
     expect(h.repository.updateMessageToProcessing).not.toHaveBeenCalled();
     expect(h.repository.startMessageProcessing).not.toHaveBeenCalled();
     expect(h.callbackService.notifyStarted).not.toHaveBeenCalled();
   });
+
+  it("does not spawn or dispatch while the session budget is exhausted", async () => {
+    const h = buildQueue();
+    h.repository.getSession.mockReturnValue(createSession({ budget_exhausted: 1 }));
+    h.repository.getNextPendingMessage.mockReturnValue(createMessage());
+
+    await h.queue.processMessageQueue();
+
+    expect(h.sandboxLifecycle.spawnSandbox).not.toHaveBeenCalled();
+    expect(h.repository.startMessageProcessing).not.toHaveBeenCalled();
+  });
+
+  it.each([null, "Provider authentication expired"])(
+    "rechecks budget exhaustion before handling provider auth result %s",
+    async (authenticationError) => {
+      const h = buildQueue();
+      const ready = {} as WebSocket;
+      h.wsManager.getSandboxSocket.mockReturnValue(ready);
+      h.repository.getNextPendingMessage.mockReturnValue(createMessage());
+      h.getProviderAuthenticationError.mockImplementationOnce(async () => {
+        h.repository.getSession.mockReturnValue(createSession({ budget_exhausted: 1 }));
+        return authenticationError;
+      });
+
+      await h.queue.processMessageQueue();
+
+      expect(h.repository.startMessageProcessing).not.toHaveBeenCalled();
+      expect(h.repository.recordMessageCompletion).not.toHaveBeenCalled();
+      expect(h.wsManager.send).not.toHaveBeenCalled();
+    }
+  );
 
   it.each(["cancelled", "archived"] as const)(
     "does not dispatch queued work for a %s session",
@@ -519,6 +869,43 @@ describe("SessionMessageQueue", () => {
     );
   });
 
+  it("defers, without spawning, while the bridge is attached but the sandbox is still booting", async () => {
+    const h = buildQueue();
+    h.repository.getNextPendingMessage.mockReturnValue(createMessage({ id: "msg-boot" }));
+    h.wsManager.getSandboxCommandTarget.mockReturnValue({
+      kind: "booting",
+      phase: {
+        phase: "setup",
+        status: "started",
+        bootSeq: 3,
+        repoOwner: "acme",
+        repoName: "repo",
+        detail: "not logged",
+      },
+    });
+
+    await h.queue.processMessageQueue();
+    await h.backgroundTasks.settle();
+
+    expect(h.log.info).toHaveBeenCalledWith("prompt.dispatch", {
+      event: "prompt.dispatch",
+      message_id: "msg-boot",
+      outcome: "deferred",
+      reason: "sandbox_booting",
+      boot_seq: 3,
+      phase: "setup",
+      phase_status: "started",
+      repo_owner: "acme",
+      repo_name: "repo",
+      elapsed_ms: null,
+      warning: false,
+    });
+    expect(h.sandboxLifecycle.spawnSandbox).not.toHaveBeenCalled();
+    expect(h.broadcast).not.toHaveBeenCalledWith({ type: "sandbox_spawning" });
+    expect(h.repository.startMessageProcessing).not.toHaveBeenCalled();
+    expect(h.wsManager.send).not.toHaveBeenCalled();
+  });
+
   it("dispatches the next prompt when only the head was cancelled during the provider-auth lookup", async () => {
     const h = buildQueue();
     const session = createSession();
@@ -547,7 +934,6 @@ describe("SessionMessageQueue", () => {
       expect.objectContaining({ message_id: "msg-b", reason: "no_sandbox" })
     );
     expect(h.sandboxLifecycle.spawnSandbox).toHaveBeenCalledTimes(1);
-    expect(h.broadcast).toHaveBeenCalledWith({ type: "sandbox_spawning" });
   });
 
   it("does not block queue processing on the sandbox spawn", async () => {
@@ -659,6 +1045,54 @@ describe("SessionMessageQueue", () => {
         messageId: "msg-existing",
       })
     );
+  });
+
+  it("rejects a new websocket prompt when the session budget is exhausted", async () => {
+    const h = buildQueue();
+    h.repository.getSession.mockReturnValue(createSession({ budget_exhausted: 1 }));
+
+    await h.queue.handlePromptMessage({} as WebSocket, createClientInfo(), {
+      clientRequestId: "request-budget",
+      content: "continue",
+    });
+
+    expect(h.wsManager.send).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        type: "error",
+        code: "BUDGET_EXHAUSTED",
+        clientRequestId: "request-budget",
+      })
+    );
+    expect(h.repository.createMessageWithAttachments).not.toHaveBeenCalled();
+  });
+
+  it("touches the session index when a prompt is queued", async () => {
+    const h = buildQueue();
+
+    await h.queue.handlePromptMessage({} as WebSocket, createClientInfo(), {
+      clientRequestId: "request-touch",
+      content: "hello",
+    });
+    await h.backgroundTasks.settle();
+
+    expect(h.backgroundTasks.submissions).toContainEqual(
+      expect.objectContaining({ name: "session_index.touch_updated_at" })
+    );
+    expect(h.sessionIndex.touchUpdatedAt).toHaveBeenCalledWith("s1");
+  });
+
+  it("touches the session index when an API prompt is queued", async () => {
+    const h = buildQueue();
+
+    await h.queue.enqueuePromptFromApi({
+      content: "follow-up",
+      authorId: "user-1",
+      source: "automation",
+    });
+    await h.backgroundTasks.settle();
+
+    expect(h.sessionIndex.touchUpdatedAt).toHaveBeenCalledWith("s1");
   });
 
   it("returns a null position when retrying a completed correlated prompt", async () => {
@@ -907,38 +1341,91 @@ describe("SessionMessageQueue", () => {
     expect(h.broadcast).toHaveBeenCalledWith({ type: "sandbox_event", event });
   });
 
-  it("preserves Autofix origin on the canonical dispatch-time user event", async () => {
-    const h = buildQueue();
-    h.repository.getParticipantById.mockReturnValue(
-      createParticipant({ scm_user_id: "255062780", scm_login: "open-inspect[bot]" })
-    );
-    const origin = {
-      kind: "review",
-      authorType: "human",
-      feedbackUrl: "https://github.com/acme/widgets/pull/42#pullrequestreview-1234",
-    } as const;
-    h.repository.getNextPendingMessage.mockReturnValue(
-      createMessage({ source: "github", origin_context: JSON.stringify(origin) })
-    );
-    h.wsManager.getSandboxSocket.mockReturnValue({ readyState: 1 } as WebSocket);
+  it.each(["openai/gpt-5.3-codex", "openai/gpt-5.3-codex-spark"])(
+    "dispatches a resumed %s session through the OpenAI replacement",
+    async (model) => {
+      const h = buildQueue();
+      h.repository.getSession.mockReturnValue(createSession({ model }));
+      h.repository.getNextPendingMessage.mockReturnValue(createMessage());
+      h.wsManager.getSandboxSocket.mockReturnValue({ readyState: 1 } as WebSocket);
 
-    await h.queue.processMessageQueue();
+      await h.queue.processMessageQueue();
 
-    const event = h.repository.startMessageProcessing.mock.calls[0][2];
-    expect(event).toEqual(
-      expect.objectContaining({
-        origin,
-        author: expect.objectContaining({
-          avatar: "https://avatars.githubusercontent.com/u/255062780?v=4",
-        }),
-      })
-    );
-    expect(serverMessageSchema.parse({ type: "sandbox_event", event })).toEqual({
-      type: "sandbox_event",
-      event: expect.objectContaining({ origin }),
-    });
-    expect(h.broadcast).toHaveBeenCalledWith({ type: "sandbox_event", event });
-  });
+      expect(h.getProviderAuthenticationError).toHaveBeenCalledWith("openai/gpt-6-sol");
+      expect(h.wsManager.send).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ type: "prompt", model: "openai/gpt-6-sol" })
+      );
+    }
+  );
+
+  it.each([
+    { kind: "review", authorType: "human" },
+    { kind: "review", authorType: "bot" },
+    { kind: "pr_comment", authorType: "human" },
+  ])(
+    "preserves valid Autofix origin on the canonical dispatch-time user event: %j",
+    async (fields) => {
+      const h = buildQueue();
+      h.repository.getParticipantById.mockReturnValue(
+        createParticipant({ scm_user_id: "255062780", scm_login: "open-inspect[bot]" })
+      );
+      const origin = {
+        ...fields,
+        feedbackUrl: "https://github.com/acme/widgets/pull/42#pullrequestreview-1234",
+      } as const;
+      h.repository.getNextPendingMessage.mockReturnValue(
+        createMessage({ source: "github", origin_context: JSON.stringify(origin) })
+      );
+      h.wsManager.getSandboxSocket.mockReturnValue({ readyState: 1 } as WebSocket);
+
+      await h.queue.processMessageQueue();
+
+      const event = h.repository.startMessageProcessing.mock.calls[0][2];
+      expect(event).toEqual(
+        expect.objectContaining({
+          origin,
+          author: expect.objectContaining({
+            avatar: "https://avatars.githubusercontent.com/u/255062780?v=4",
+          }),
+        })
+      );
+      expect(serverMessageSchema.parse({ type: "sandbox_event", event })).toEqual({
+        type: "sandbox_event",
+        event: expect.objectContaining({ origin }),
+      });
+      expect(h.broadcast).toHaveBeenCalledWith({ type: "sandbox_event", event });
+    }
+  );
+
+  it.each([
+    "{",
+    "null",
+    "[]",
+    JSON.stringify({ kind: "review", authorType: "human" }),
+    JSON.stringify({ kind: "review", authorType: "human", feedbackUrl: "invalid" }),
+    JSON.stringify({ kind: "pr_comment", authorType: "bot", feedbackUrl: "https://example.test" }),
+  ])(
+    "drops malformed Autofix origin context from the dispatch-time user event: %s",
+    async (originContext) => {
+      const h = buildQueue();
+      h.repository.getNextPendingMessage.mockReturnValue(
+        createMessage({
+          source: "github",
+          origin_context: originContext,
+        })
+      );
+      h.wsManager.getSandboxSocket.mockReturnValue({ readyState: 1 } as WebSocket);
+
+      await h.queue.processMessageQueue();
+
+      const event = h.repository.startMessageProcessing.mock.calls[0][2];
+      expect(event).not.toHaveProperty("origin");
+      expect(h.log.error).toHaveBeenCalledWith("prompt.invalid_origin_context", {
+        message_id: "msg-1",
+      });
+    }
+  );
 
   it("fails an unavailable prompt model before spawning or dispatching", async () => {
     const h = buildQueue();
@@ -1038,6 +1525,27 @@ describe("SessionMessageQueue", () => {
       type: "prompt_queue_updated",
       promptQueue: expect.any(Array),
     });
+  });
+
+  it("tells the sandbox lifecycle a prompt was dispatched only once the send succeeds", async () => {
+    const h = buildQueue();
+    h.repository.getNextPendingMessage.mockReturnValue(createMessage({ id: "msg-42" }));
+    h.wsManager.getSandboxSocket.mockReturnValue({ readyState: 1 } as WebSocket);
+
+    await h.queue.processMessageQueue();
+
+    expect(h.sandboxLifecycle.onPromptDispatched).toHaveBeenCalledOnce();
+  });
+
+  it("does not report a dispatch when the sandbox send fails", async () => {
+    const h = buildQueue();
+    h.repository.getNextPendingMessage.mockReturnValueOnce(createMessage({ id: "msg-unsent" }));
+    h.wsManager.getSandboxSocket.mockReturnValue({ readyState: 1 } as WebSocket);
+    h.wsManager.send.mockReturnValue(false);
+
+    await h.queue.processMessageQueue();
+
+    expect(h.sandboxLifecycle.onPromptDispatched).not.toHaveBeenCalled();
   });
 
   it("leaves the prompt pending and timeline untouched when sandbox send fails", async () => {
@@ -1225,6 +1733,32 @@ describe("SessionMessageQueue", () => {
       return h.queue.processMessageQueue();
     }
 
+    it("preserves the execution deadline and start callback when circuit-breaker reset throws", async () => {
+      const h = buildQueue();
+      h.sandboxLifecycle.onPromptDispatched.mockImplementation(() => {
+        throw new Error("Circuit-breaker storage unavailable");
+      });
+
+      const result = await dispatchPrompt(h).catch((error: unknown) => error);
+
+      expect(h.repository.startMessageProcessing).toHaveBeenCalledOnce();
+      expect(h.wsManager.send).toHaveBeenCalledExactlyOnceWith(
+        expect.anything(),
+        expect.objectContaining({ type: "prompt", messageId: "msg-1" })
+      );
+      const startedAt = h.repository.startMessageProcessing.mock.calls[0][1];
+      expect(h.setAlarm).toHaveBeenCalledExactlyOnceWith(startedAt + EXECUTION_TIMEOUT_MS);
+      expect(result).toBeUndefined();
+      expect(h.repository.updateMessageToPending).not.toHaveBeenCalled();
+      expect(h.sandboxLifecycle.terminateUnresponsiveSandbox).not.toHaveBeenCalled();
+      expect(h.callbackService.notifyStarted).toHaveBeenCalledExactlyOnceWith("msg-1");
+      expect(h.log.warn).toHaveBeenCalledWith("prompt.circuit_breaker_reset_failed", {
+        event: "prompt.circuit_breaker_reset_failed",
+        message_id: "msg-1",
+        error: "Circuit-breaker storage unavailable",
+      });
+    });
+
     it("schedules the execution deadline when no alarm is set", async () => {
       const h = buildQueue();
       const before = Date.now();
@@ -1296,6 +1830,150 @@ describe("SessionMessageQueue", () => {
     });
   });
 
+  it("returns no stop preparation when there is no processing prompt", () => {
+    const h = buildQueue();
+    h.repository.getProcessingMessageWithCreatedAt.mockReturnValue(null);
+
+    expect(h.executionStop.prepare("Session cost limit reached", 1000)).toBeNull();
+    expect(h.repository.recordMessageCompletion).not.toHaveBeenCalled();
+    expect(h.repository.markMessageAwaitingStopConfirmation).not.toHaveBeenCalled();
+    expect(h.alarmDeadlines.setPendingEarliest).not.toHaveBeenCalled();
+  });
+
+  it("atomically establishes budget stop intent before delivery", async () => {
+    const h = buildQueue();
+    const sandboxWs = { readyState: 1 } as WebSocket;
+    h.wsManager.getSandboxSocket.mockReturnValue(sandboxWs);
+    h.repository.getProcessingMessageWithCreatedAt.mockReturnValue({
+      id: "msg-budget",
+      created_at: 900,
+    });
+    const preparation = h.executionStop.prepare("Session cost limit reached", 1000);
+    expect(preparation).not.toBeNull();
+    if (!preparation) throw new Error("Expected a prepared stop");
+    await h.executionStop.deliver(preparation);
+
+    expect(h.repository.recordMessageCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({ error: "Session cost limit reached" }),
+      expect.any(Number),
+      "processing"
+    );
+    expect(h.repository.markMessageAwaitingStopConfirmation).toHaveBeenCalledWith(
+      "msg-budget",
+      expect.any(Number)
+    );
+    expect(h.alarmDeadlines.setPendingEarliest).toHaveBeenCalledWith(expect.any(Number));
+    expect(h.wsManager.send).toHaveBeenCalledWith(sandboxWs, { type: "stop" });
+  });
+
+  it("continues budget stop delivery when alarm scheduling fails", async () => {
+    const h = buildQueue();
+    const sandboxWs = { readyState: 1 } as WebSocket;
+    h.wsManager.getSandboxSocket.mockReturnValue(sandboxWs);
+    h.repository.getProcessingMessageWithCreatedAt.mockReturnValue({
+      id: "msg-budget",
+      created_at: 900,
+    });
+    h.setAlarm.mockRejectedValue(new Error("alarm unavailable"));
+
+    const preparation = h.executionStop.prepare("Session cost limit reached", 1000);
+    expect(preparation).not.toBeNull();
+    if (!preparation) throw new Error("Expected a prepared stop");
+    await expect(h.executionStop.deliver(preparation)).resolves.toBeUndefined();
+
+    expect(h.sessionStatus.reconcileAfterExecution).toHaveBeenCalledWith(false);
+    expect(h.wsManager.send).toHaveBeenCalledWith(sandboxWs, { type: "stop" });
+    expect(h.sandboxLifecycle.terminateUnresponsiveSandbox).toHaveBeenCalledWith(
+      "stop_alarm_failed"
+    );
+    expect(h.log.error).toHaveBeenCalledWith(
+      "Stop confirmation alarm failed",
+      expect.objectContaining({ error: expect.any(Error) })
+    );
+  });
+
+  it.each(["alarm", "send"] as const)(
+    "does not terminate the next prompt after a confirmed stop and delayed %s failure",
+    async (failure) => {
+      const h = buildQueue();
+      const sandboxWs = { readyState: 1 } as WebSocket;
+      h.wsManager.getSandboxSocket.mockReturnValue(sandboxWs);
+      h.repository.getProcessingMessageWithCreatedAt.mockReturnValue({
+        id: "msg-stopped",
+        created_at: 900,
+      });
+      if (failure === "alarm") {
+        h.setAlarm.mockRejectedValueOnce(new Error("alarm unavailable"));
+      } else {
+        h.wsManager.send.mockReturnValueOnce(false);
+      }
+      let releaseStatus!: () => void;
+      h.sessionStatus.reconcileAfterExecution.mockReturnValueOnce(
+        new Promise<void>((resolve) => {
+          releaseStatus = resolve;
+        })
+      );
+
+      const stopping = h.executionStop.stop();
+      try {
+        await vi.waitFor(() => expect(h.setAlarm).toHaveBeenCalledOnce());
+        // Completion (including a natural completion after a failed send) releases
+        // the stop fence while the original handler still waits on projection.
+        h.repository.clearMessageAwaitingStopConfirmation("msg-stopped");
+        h.repository.getNextPendingMessage.mockReturnValue(createMessage({ id: "msg-next" }));
+        await h.queue.processMessageQueue();
+        expect(h.wsManager.send).toHaveBeenCalledWith(
+          sandboxWs,
+          expect.objectContaining({ type: "prompt", messageId: "msg-next" })
+        );
+        h.repository.getProcessingMessage.mockReturnValue({ id: "msg-next" });
+        h.repository.clearMessageAwaitingStopConfirmation.mockClear();
+      } finally {
+        releaseStatus();
+        await stopping;
+      }
+
+      expect(h.sandboxLifecycle.terminateUnresponsiveSandbox).not.toHaveBeenCalled();
+      expect(h.repository.clearMessageAwaitingStopConfirmation).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(["message", "deadline"] as const)(
+    "does not terminate for an alarm failure after the stop %s changes",
+    async (changed) => {
+      const h = buildQueue();
+      h.wsManager.getSandboxSocket.mockReturnValue({ readyState: 1 } as WebSocket);
+      h.repository.getProcessingMessageWithCreatedAt.mockReturnValue({
+        id: "msg-stopped",
+        created_at: 900,
+      });
+      h.setAlarm.mockRejectedValueOnce(new Error("alarm unavailable"));
+      let releaseStatus!: () => void;
+      h.sessionStatus.reconcileAfterExecution.mockReturnValueOnce(
+        new Promise<void>((resolve) => {
+          releaseStatus = resolve;
+        })
+      );
+
+      const stopping = h.executionStop.stop();
+      const original = h.repository.getMessageAwaitingStopConfirmation();
+      try {
+        expect(original).not.toBeNull();
+        if (!original) throw new Error("Expected a pending stop");
+        h.repository.markMessageAwaitingStopConfirmation(
+          changed === "message" ? "msg-next" : original.id,
+          changed === "deadline" ? original.deadline + 1 : original.deadline
+        );
+      } finally {
+        releaseStatus();
+        await stopping;
+      }
+
+      expect(h.sandboxLifecycle.terminateUnresponsiveSandbox).not.toHaveBeenCalled();
+      expect(h.repository.clearMessageAwaitingStopConfirmation).not.toHaveBeenCalled();
+    }
+  );
+
   it("delegates stop finalization before broadcasting idle and stopping the sandbox", async () => {
     const h = buildQueue();
     const sandboxWs = { readyState: 1 } as WebSocket;
@@ -1305,7 +1983,7 @@ describe("SessionMessageQueue", () => {
       created_at: 900,
     });
 
-    await h.queue.stopExecution();
+    await h.executionStop.stop();
 
     expect(h.repository.recordMessageCompletion).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1344,7 +2022,7 @@ describe("SessionMessageQueue", () => {
       })
     );
 
-    await h.queue.stopExecution();
+    await h.executionStop.stop();
     expect(h.broadcast).not.toHaveBeenCalledWith({
       type: "sandbox_event",
       event: expect.objectContaining({ type: "execution_complete" }),
@@ -1367,7 +2045,7 @@ describe("SessionMessageQueue", () => {
     h.repository.getNextPendingMessage.mockReturnValue(createMessage({ id: "msg-next" }));
     h.wsManager.getSandboxSocket.mockReturnValue({ readyState: 1 } as WebSocket);
 
-    await h.queue.stopExecution();
+    await h.executionStop.stop();
 
     expect(h.repository.updateMessageToProcessing).not.toHaveBeenCalledWith(
       "msg-next",
@@ -1390,13 +2068,13 @@ describe("SessionMessageQueue", () => {
     h.repository.getNextPendingMessage.mockReturnValue(createMessage({ id: "msg-next" }));
     h.wsManager.getSandboxSocket.mockReturnValue(null);
 
-    await h.queue.stopExecution();
+    await h.executionStop.stop();
 
     expect(h.sandboxLifecycle.terminateUnresponsiveSandbox).toHaveBeenCalledWith(
       "stop_send_failed"
     );
     expect(h.repository.getNextPendingMessage).toHaveBeenCalled();
-    expect(h.repository.clearMessageAwaitingStopConfirmation).not.toHaveBeenCalled();
+    expect(h.repository.clearMessageAwaitingStopConfirmation).toHaveBeenCalledWith("msg-running");
   });
 
   it("terminates the sandbox when the connected socket rejects the stop send", async () => {
@@ -1408,7 +2086,7 @@ describe("SessionMessageQueue", () => {
     h.wsManager.getSandboxSocket.mockReturnValue({ readyState: 1 } as WebSocket);
     h.wsManager.send.mockReturnValue(false);
 
-    await h.queue.stopExecution();
+    await h.executionStop.stop();
 
     expect(h.sandboxLifecycle.terminateUnresponsiveSandbox).toHaveBeenCalledWith(
       "stop_send_failed"
@@ -1425,13 +2103,57 @@ describe("SessionMessageQueue", () => {
       })
       .mockReturnValue(null);
 
-    await h.queue.recoverStopConfirmationTimeout();
+    await h.executionStop.recoverStopConfirmationTimeout();
 
     expect(h.sandboxLifecycle.terminateUnresponsiveSandbox).toHaveBeenCalledWith(
       "stop_confirmation_timeout"
     );
     expect(h.repository.clearMessageAwaitingStopConfirmation).not.toHaveBeenCalled();
     expect(h.repository.getNextPendingMessage).toHaveBeenCalled();
+  });
+
+  it("retains the stop marker and does not advance the queue when the retirement fence rejects", async () => {
+    const h = buildQueue();
+    const deadline = Date.now() - 1;
+    h.repository.markMessageAwaitingStopConfirmation("msg-stopped", deadline);
+    h.sandboxLifecycle.terminateUnresponsiveSandbox.mockRejectedValue(
+      new Error("retirement fence unavailable")
+    );
+
+    await expect(h.executionStop.recoverStopConfirmationTimeout()).rejects.toThrow(
+      "retirement fence unavailable"
+    );
+
+    expect(h.repository.getMessageAwaitingStopConfirmation()).toEqual({
+      id: "msg-stopped",
+      deadline,
+    });
+    expect(h.repository.clearMessageAwaitingStopConfirmation).not.toHaveBeenCalled();
+    expect(h.repository.getNextPendingMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not recover an expired stop while dispatch is held", async () => {
+    let dispatchAllowed = false;
+    const mayDispatch = vi.fn(() => dispatchAllowed);
+    const h = buildQueue(mayDispatch);
+    h.repository.markMessageAwaitingStopConfirmation("msg-stopped", Date.now() - 1);
+
+    await h.queue.processMessageQueue();
+
+    expect(h.sandboxLifecycle.terminateUnresponsiveSandbox).not.toHaveBeenCalled();
+    expect(h.repository.clearMessageAwaitingStopConfirmation).not.toHaveBeenCalled();
+    expect(h.repository.getNextPendingMessage).not.toHaveBeenCalled();
+
+    dispatchAllowed = true;
+    await h.queue.processMessageQueue();
+
+    expect(h.sandboxLifecycle.terminateUnresponsiveSandbox).toHaveBeenCalledWith(
+      "stop_confirmation_timeout"
+    );
+    expect(h.repository.clearMessageAwaitingStopConfirmation).toHaveBeenCalledWith("msg-stopped");
+    expect(mayDispatch.mock.invocationCallOrder[1]).toBeLessThan(
+      h.sandboxLifecycle.terminateUnresponsiveSandbox.mock.invocationCallOrder[0]
+    );
   });
 
   it("re-arms a future stop confirmation deadline when an earlier alarm fired", async () => {
@@ -1442,7 +2164,7 @@ describe("SessionMessageQueue", () => {
       deadline,
     });
 
-    await h.queue.recoverStopConfirmationTimeout();
+    await h.executionStop.recoverStopConfirmationTimeout();
 
     expect(h.sandboxLifecycle.terminateUnresponsiveSandbox).not.toHaveBeenCalled();
     expect(h.setAlarm).toHaveBeenCalledExactlyOnceWith(deadline);
@@ -1454,7 +2176,7 @@ describe("SessionMessageQueue", () => {
       .mockReturnValueOnce({ id: "msg-stopped", deadline: Date.now() - 1 })
       .mockReturnValue(null);
 
-    await h.queue.resumeAfterSandboxTermination();
+    await h.executionStop.resumeAfterSandboxTermination();
 
     expect(h.repository.clearMessageAwaitingStopConfirmation).toHaveBeenCalledWith("msg-stopped");
   });
@@ -1474,21 +2196,10 @@ describe("SessionMessageQueue", () => {
     expect(h.wsManager.send).not.toHaveBeenCalled();
   });
 
-  it("suppresses session status reconcile when stopExecution is called with suppress flag", async () => {
-    const h = buildQueue();
-    h.repository.getProcessingMessageWithCreatedAt.mockReturnValue({
-      id: "msg-10",
-      created_at: 900,
-    });
-    await h.queue.stopExecution({ suppressStatusReconcile: true });
-
-    expect(h.sessionStatus.reconcileAfterExecution).not.toHaveBeenCalled();
-  });
-
   it("does not finalize or stop when no message is processing", async () => {
     const h = buildQueue();
 
-    await h.queue.stopExecution();
+    await h.executionStop.stop();
     await h.queue.failStuckProcessingMessage();
 
     expect(h.repository.recordMessageCompletion).not.toHaveBeenCalled();
@@ -1524,6 +2235,63 @@ describe("SessionMessageQueue", () => {
       expect.any(Number),
       "processing"
     );
+  });
+
+  it("fails the named pending prompt with the boot failure and leaves the rest queued", async () => {
+    const h = buildQueue();
+    h.repository.getMessageById.mockReturnValue(
+      createMessage({ id: "msg-head", status: "pending" })
+    );
+    h.repository.listPendingMessagesWithCreatedAt.mockReturnValue([
+      { id: "msg-head", created_at: 700 },
+      { id: "msg-next", created_at: 800 },
+    ]);
+
+    await h.queue.failPendingMessage(
+      "msg-head",
+      "Sandbox boot exceeded 30 minutes while running setup.sh"
+    );
+    await h.backgroundTasks.settle();
+
+    expect(h.repository.getMessageById).toHaveBeenCalledWith("msg-head");
+    expect(h.repository.recordMessageCompletion).toHaveBeenCalledOnce();
+    expect(h.repository.recordMessageCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: "msg-head",
+        error: "Sandbox boot exceeded 30 minutes while running setup.sh",
+      }),
+      expect.any(Number),
+      "pending"
+    );
+    expect(h.broadcast).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "prompt_queue_updated" })
+    );
+    expect(h.sessionStatus.reconcileAfterExecution).toHaveBeenCalledWith(false);
+    expect(h.sandboxLifecycle.spawnSandbox).not.toHaveBeenCalled();
+  });
+
+  it("leaves a prompt alone once it is no longer pending", async () => {
+    // Cancelled, or dispatched onto a replacement, between the alarm
+    // identifying it and the lifecycle giving up: the failure is not its.
+    const h = buildQueue();
+    h.repository.getMessageById.mockReturnValue(
+      createMessage({ id: "msg-head", status: "processing" })
+    );
+
+    await h.queue.failPendingMessage("msg-head", "boot budget");
+
+    expect(h.repository.recordMessageCompletion).not.toHaveBeenCalled();
+    expect(h.sessionStatus.reconcileAfterExecution).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when the named prompt no longer exists", async () => {
+    const h = buildQueue();
+    h.repository.getMessageById.mockReturnValue(null);
+
+    await h.queue.failPendingMessage("msg-gone", "boot budget");
+
+    expect(h.repository.recordMessageCompletion).not.toHaveBeenCalled();
+    expect(h.sessionStatus.reconcileAfterExecution).not.toHaveBeenCalled();
   });
 
   it("reconciles session status when failing a stuck processing message", async () => {
@@ -1573,7 +2341,7 @@ describe("SessionMessageQueue", () => {
 
   it("redrives a pending prompt after fatal sandbox termination completes", async () => {
     const h = buildQueue();
-    let resolveTermination!: (terminated: boolean) => void;
+    let resolveTermination!: (outcome: SandboxAlarmResult) => void;
     h.sandboxLifecycle.terminateFailedSandbox.mockReturnValue(
       new Promise((resolve) => {
         resolveTermination = resolve;
@@ -1585,7 +2353,7 @@ describe("SessionMessageQueue", () => {
     await Promise.resolve();
     expect(h.sandboxLifecycle.spawnSandbox).not.toHaveBeenCalled();
 
-    resolveTermination(true);
+    resolveTermination("sandbox_terminated");
     await handling;
     await h.backgroundTasks.settle();
 
@@ -1593,7 +2361,241 @@ describe("SessionMessageQueue", () => {
     expect(h.sandboxLifecycle.spawnSandbox).toHaveBeenCalledOnce();
   });
 
+  it("fails the boot prompt instead of redriving once retries are exhausted", async () => {
+    const h = buildQueue();
+    const pending = createMessage({ id: "msg-pending", status: "pending" });
+    h.repository.getNextPendingMessage.mockReturnValue(pending);
+    h.repository.getMessageById.mockReturnValue(pending);
+    h.sandboxLifecycle.terminateFailedSandbox.mockResolvedValue({
+      kind: "fatal_report_unrecoverable",
+      reason: "git sync failed",
+    });
+
+    await h.queue.handleFatalSandboxFailure("git sync failed");
+    await h.backgroundTasks.settle();
+
+    expect(h.repository.recordMessageCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: "msg-pending",
+        success: false,
+        error: "git sync failed",
+      }),
+      expect.any(Number),
+      "pending"
+    );
+    expect(h.callbackService.notifyComplete).toHaveBeenCalledWith(
+      "msg-pending",
+      false,
+      "git sync failed"
+    );
+    expect(h.sandboxLifecycle.spawnSandbox).not.toHaveBeenCalled();
+  });
+
+  it("leaves a queued follow-up alone when the failed sandbox was serving a prompt", async () => {
+    const h = buildQueue();
+    const running = createMessage({ id: "msg-running", status: "processing" });
+    const followUp = createMessage({ id: "msg-follow-up", status: "pending" });
+    h.repository.getProcessingMessage.mockReturnValue(running);
+    h.repository.getProcessingMessageWithCreatedAt.mockReturnValue(running);
+    h.repository.getNextPendingMessage.mockReturnValue(followUp);
+    h.repository.getMessageById.mockReturnValue(followUp);
+    h.sandboxLifecycle.terminateFailedSandbox.mockResolvedValue({
+      kind: "fatal_report_unrecoverable",
+      reason: "Sandbox crashed",
+    });
+
+    await h.queue.handleFatalSandboxFailure("Sandbox crashed");
+    await h.backgroundTasks.settle();
+
+    expect(h.repository.recordMessageCompletion).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ messageId: "msg-running", success: false }),
+      expect.any(Number),
+      "processing"
+    );
+  });
+
+  it("leaves a queued follow-up alone while a stopped prompt awaits confirmation", async () => {
+    const h = buildQueue();
+    const followUp = createMessage({ id: "msg-follow-up", status: "pending" });
+    h.repository.markMessageAwaitingStopConfirmation("msg-stopped", Date.now() + 10_000);
+    h.repository.getNextPendingMessage.mockReturnValue(followUp);
+    h.repository.getMessageById.mockReturnValue(followUp);
+    h.sandboxLifecycle.terminateFailedSandbox.mockResolvedValue({
+      kind: "fatal_report_unrecoverable",
+      reason: "Sandbox crashed",
+    });
+
+    await h.queue.handleFatalSandboxFailure("Sandbox crashed");
+    await h.backgroundTasks.settle();
+
+    expect(h.repository.recordMessageCompletion).not.toHaveBeenCalled();
+  });
+
+  it("neither fails nor redrives a pending prompt while the failed boot is held", async () => {
+    const h = buildQueue();
+    h.sandboxLifecycle.terminateFailedSandbox.mockResolvedValue("sandbox_failed");
+    h.repository.getNextPendingMessage.mockReturnValue(createMessage({ id: "msg-pending" }));
+
+    await h.queue.handleFatalSandboxFailure("Sandbox crashed");
+    await h.backgroundTasks.settle();
+
+    expect(h.repository.recordMessageCompletion).not.toHaveBeenCalled();
+    expect(h.sandboxLifecycle.spawnSandbox).not.toHaveBeenCalled();
+  });
+
+  it("leaves a pending prompt alone when the fatal report terminated nothing", async () => {
+    const h = buildQueue();
+    h.sandboxLifecycle.terminateFailedSandbox.mockResolvedValue("no_action");
+    h.repository.getNextPendingMessage.mockReturnValue(createMessage({ id: "msg-pending" }));
+
+    await h.queue.handleFatalSandboxFailure("Sandbox crashed");
+    await h.backgroundTasks.settle();
+
+    expect(h.sandboxLifecycle.terminateFailedSandbox).toHaveBeenCalledWith("Sandbox crashed");
+    expect(h.repository.recordMessageCompletion).not.toHaveBeenCalled();
+    expect(h.sandboxLifecycle.spawnSandbox).not.toHaveBeenCalled();
+  });
+
   describe("enqueuePromptFromApi", () => {
+    it("returns the prompt it already queued for a client request id it has seen", async () => {
+      const h = buildQueue();
+      h.repository.getMessageByClientRequestId.mockReturnValue(
+        createMessage({
+          id: "msg-existing",
+          client_request_id: "webhook:abc",
+          request_fingerprint: await fingerprintWebPrompt("part-1", { content: "same" }),
+        })
+      );
+
+      const queued = await h.queue.enqueuePromptFromApi({
+        content: "same",
+        authorId: "user-1",
+        source: "automation",
+        clientRequestId: "webhook:abc",
+      });
+
+      expect(queued).toMatchObject({ messageId: "msg-existing", deduplicated: true });
+      expect(h.repository.createMessageWithAttachments).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { limit: "a spent budget", session: { budget_exhausted: 1 }, queueDepth: 1 },
+      { limit: "a full queue", session: {}, queueDepth: MAX_UNFINISHED_PROMPTS },
+    ])(
+      "returns the prompt it already queued for a seen client request id despite $limit",
+      async ({ session, queueDepth }) => {
+        const h = buildQueue();
+        h.repository.getSession.mockReturnValue(createSession(session));
+        h.repository.getPendingOrProcessingCount.mockReturnValue(queueDepth);
+        h.repository.getMessageByClientRequestId.mockReturnValue(
+          createMessage({
+            id: "msg-existing",
+            client_request_id: "webhook:abc",
+            request_fingerprint: await fingerprintWebPrompt("part-1", { content: "same" }),
+          })
+        );
+
+        const queued = await h.queue.enqueuePromptFromApi({
+          content: "same",
+          authorId: "user-1",
+          source: "automation",
+          clientRequestId: "webhook:abc",
+        });
+
+        expect(queued.messageId).toBe("msg-existing");
+        expect(h.repository.createMessageWithAttachments).not.toHaveBeenCalled();
+      }
+    );
+
+    it("refuses new work under a client request id before participant changes", async () => {
+      const h = buildQueue();
+      h.repository.getPendingOrProcessingCount.mockReturnValue(MAX_UNFINISHED_PROMPTS);
+      h.repository.getMessageByClientRequestId.mockReturnValue(null);
+      h.participantService.getByUserId.mockReturnValue(null as unknown as ParticipantRow);
+
+      await expect(
+        h.queue.enqueuePromptFromApi({
+          content: "Continue",
+          authorId: "new-user",
+          source: "automation",
+          clientRequestId: "webhook:new",
+        })
+      ).rejects.toMatchObject({ name: "PromptQueueFullError" });
+      expect(h.participantService.create).not.toHaveBeenCalled();
+    });
+
+    it("rejects a client request id reused for a different prompt", async () => {
+      const h = buildQueue();
+      h.repository.getMessageByClientRequestId.mockReturnValue(
+        createMessage({
+          id: "msg-existing",
+          client_request_id: "webhook:abc",
+          request_fingerprint: "different",
+        })
+      );
+
+      await expect(
+        h.queue.enqueuePromptFromApi({
+          content: "changed",
+          authorId: "user-1",
+          source: "automation",
+          clientRequestId: "webhook:abc",
+        })
+      ).rejects.toMatchObject({ name: "PromptRequestConflictError" });
+      expect(h.repository.createMessageWithAttachments).not.toHaveBeenCalled();
+    });
+
+    it("rejects exhaustion before capacity checks or participant mutations", async () => {
+      const h = buildQueue();
+      h.repository.getSession.mockReturnValue(createSession({ budget_exhausted: 1 }));
+      h.repository.getPendingOrProcessingCount.mockReturnValue(MAX_UNFINISHED_PROMPTS);
+      h.participantService.getByUserId.mockReturnValue(null as unknown as ParticipantRow);
+
+      await expect(
+        h.queue.enqueuePromptFromApi({
+          content: "Continue",
+          authorId: "new-user",
+          source: "agent",
+        })
+      ).rejects.toMatchObject({ name: "BudgetExhaustedError" });
+
+      expect(h.repository.getPendingOrProcessingCount).not.toHaveBeenCalled();
+      expect(h.participantService.create).not.toHaveBeenCalled();
+    });
+
+    it("rejects a full queue before participant mutations", async () => {
+      const h = buildQueue();
+      h.repository.getPendingOrProcessingCount.mockReturnValue(MAX_UNFINISHED_PROMPTS);
+      h.participantService.getByUserId.mockReturnValue(null as unknown as ParticipantRow);
+
+      await expect(
+        h.queue.enqueuePromptFromApi({
+          content: "Continue",
+          authorId: "new-user",
+          source: "agent",
+        })
+      ).rejects.toMatchObject({ name: "PromptQueueFullError" });
+
+      expect(h.participantService.create).not.toHaveBeenCalled();
+      expect(h.repository.updateParticipantCoalesce).not.toHaveBeenCalled();
+    });
+
+    it("rejects a full queue on the WebSocket path before creating a participant", async () => {
+      const h = buildQueue();
+      h.repository.getPendingOrProcessingCount.mockReturnValue(MAX_UNFINISHED_PROMPTS);
+      h.repository.getParticipantById.mockReturnValue(null as unknown as ParticipantRow);
+      h.participantService.getByUserId.mockReturnValue(null as unknown as ParticipantRow);
+      const ws = {} as WebSocket;
+
+      await h.queue.handlePromptMessage(ws, createClientInfo(), { content: "Continue" });
+
+      expect(h.participantService.create).not.toHaveBeenCalled();
+      expect(h.wsManager.send).toHaveBeenCalledWith(
+        ws,
+        expect.objectContaining({ type: "error", code: "PROMPT_QUEUE_FULL" })
+      );
+    });
+
     it.each(["cancelled", "archived"] as const)(
       "rejects prompts for a %s session before inserting a message",
       async (status) => {
@@ -1644,9 +2646,6 @@ describe("SessionMessageQueue", () => {
           login: "octocat",
           name: "Octo Cat",
           email: "1001+octocat@users.noreply.github.com",
-          accessTokenEncrypted: null,
-          refreshTokenEncrypted: null,
-          tokenExpiresAt: null,
         },
       });
 
@@ -1666,7 +2665,7 @@ describe("SessionMessageQueue", () => {
       expect(h.participantService.create).toHaveBeenCalledWith("github:1001", "github:1001");
     });
 
-    it("updates stored SCM identity and tokens after successful enrichment", async () => {
+    it("updates stored SCM identity after successful enrichment", async () => {
       const h = buildQueue();
 
       await h.queue.enqueuePromptFromApi({
@@ -1678,20 +2677,15 @@ describe("SessionMessageQueue", () => {
           login: "octocat",
           name: "Trusted Octo Cat",
           email: "1001+octocat@users.noreply.github.com",
-          accessTokenEncrypted: "enc-access",
-          refreshTokenEncrypted: "enc-refresh",
-          tokenExpiresAt: 9999999,
         },
       });
 
-      expect(h.repository.updateParticipantCoalesce).toHaveBeenCalledWith("part-1", {
+      expect(h.repository.updateParticipantIdentity).toHaveBeenCalledWith("part-1", {
+        canonicalUserId: null,
         scmName: "Trusted Octo Cat",
         scmEmail: "1001+octocat@users.noreply.github.com",
         scmLogin: "octocat",
         scmUserId: "1001",
-        scmAccessTokenEncrypted: "enc-access",
-        scmRefreshTokenEncrypted: "enc-refresh",
-        scmTokenExpiresAt: 9999999,
       });
     });
 
@@ -1705,6 +2699,7 @@ describe("SessionMessageQueue", () => {
       });
 
       expect(h.repository.updateParticipantCoalesce).not.toHaveBeenCalled();
+      expect(h.repository.updateParticipantIdentity).not.toHaveBeenCalled();
     });
   });
 });

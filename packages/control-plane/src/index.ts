@@ -6,9 +6,7 @@
 
 import { handleControlPlaneHttp } from "./cloudflare/http-host";
 import { createLogger } from "./logger";
-import type { GitHubAutofixEnvelope } from "@open-inspect/shared";
-import { handleAutofixQueue } from "./autofix/handler";
-import { consumeImageBuildFinalizations } from "./image-builds/finalization-consumer";
+import { consumeJobBatch } from "./cloudflare/job-queue";
 import { createSessionRuntimeClient } from "./session/runtime-client";
 import {
   createRequestMetrics,
@@ -20,7 +18,7 @@ import type { SqlDatabase } from "./db/sql-database";
 import { createCloudflareBackgroundTasks } from "./cloudflare/background-tasks";
 import { createCloudflareEnv, type WorkerBindings } from "./cloudflare/platform";
 import { findScheduledJob } from "./scheduled-jobs";
-import { isAutofixQueue } from "./queue-routing";
+import type { Env } from "./types";
 
 const logger = createLogger("worker");
 
@@ -34,6 +32,7 @@ export default {
     ctx: ExecutionContext
   ): Promise<Response> {
     const url = new URL(request.url);
+    const env = createCloudflareEnv(bindings);
 
     // WebSocket upgrade for session
     const upgradeHeader = request.headers.get("Upgrade");
@@ -41,12 +40,12 @@ export default {
       const metrics = createRequestMetrics();
       // eslint-disable-next-line no-restricted-syntax -- composition root: construct the request-scoped database adapter
       const db = instrumentSqlDatabase(bindings.DB, metrics);
-      return handleWebSocket(request, bindings, url, db, metrics);
+      return handleWebSocket(request, env, url, db, metrics);
     }
 
     // Regular API request — Hono owns HTTP route selection while the neutral
     // admission/dispatch pipeline retains authentication and authorization.
-    return handleControlPlaneHttp(request, createCloudflareEnv(bindings), ctx);
+    return handleControlPlaneHttp(request, env, ctx);
   },
 
   /**
@@ -79,14 +78,18 @@ export default {
     );
   },
 
+  /**
+   * Queue consumer: delivers each message to the handler of the job kind
+   * the queue carries (see `jobs.ts`).
+   */
   async queue(batch: MessageBatch<unknown>, bindings: WorkerBindings): Promise<void> {
     const env = createCloudflareEnv(bindings);
-    if (!isAutofixQueue(batch.queue)) {
-      await consumeImageBuildFinalizations(batch, env);
-      return;
-    }
-    // eslint-disable-next-line no-restricted-syntax -- worker composition root: inject D1 once
-    await handleAutofixQueue(batch as MessageBatch<GitHubAutofixEnvelope>, env, env.DB);
+    await consumeJobBatch(batch, {
+      env,
+      // eslint-disable-next-line no-restricted-syntax -- queue composition root: the one consumer env.DB read
+      db: env.DB,
+      log: logger,
+    });
   },
 };
 
@@ -95,7 +98,7 @@ export default {
  */
 async function handleWebSocket(
   request: Request,
-  env: WorkerBindings,
+  env: Env,
   url: URL,
   db: SqlDatabase,
   metrics: RequestMetrics
@@ -126,14 +129,9 @@ async function handleWebSocket(
     ...metrics.summarize(),
   });
 
-  // Forward the upgrade to the Durable Object directly rather than through
-  // SessionRuntimeClient: the 101 must carry the object's own `webSocket`,
-  // which only this Cloudflare-side hop can return. Stays here by design.
-  const doId = env.SESSION.idFromName(sessionId);
-  const stub = env.SESSION.get(doId);
-
-  // Forward the WebSocket upgrade request to the DO
-  const response = await stub.fetch(request);
+  // Raw dispatch preserves the upgrade request and the object's own webSocket,
+  // while sharing the placement options used by every session runtime call.
+  const response = await env.SESSION(sessionId, request);
 
   // If it's a WebSocket upgrade response, return it directly
   // Add CORS headers for the upgrade response

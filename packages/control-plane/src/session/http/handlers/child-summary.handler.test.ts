@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { ChildSessionDetail } from "@open-inspect/shared/types/session-api";
 import { ChildSummaryHandler } from "./child-summary.handler";
 import {
   FINAL_RESPONSE_EVENT_PAGE_LIMIT,
@@ -25,16 +26,20 @@ function createSession(overrides: Partial<SessionRow> = {}): SessionRow {
     branch_name: "feature/test",
     base_sha: null,
     current_sha: null,
-    opencode_session_id: null,
+    agent_session_id: null,
+    harness: "opencode",
     model: "anthropic/claude-haiku-4-5",
     reasoning_effort: null,
     status: "active",
+    status_revision: 1,
     parent_session_id: null,
     spawn_source: "user",
     spawn_depth: 0,
     code_server_enabled: 0,
     vnc_enabled: 0,
     total_cost: 0,
+    max_cost_usd: null,
+    budget_exhausted: 0,
     sandbox_settings: null,
     environment_id: null,
     created_at: 1000,
@@ -68,6 +73,10 @@ function createSandbox(overrides: Partial<SandboxRow> = {}): SandboxRow {
     ttyd_url: null,
     ttyd_token: null,
     active_socket_id: null,
+    boot_phase: null,
+    boot_seq: null,
+    fenced: 0,
+    startup_rejected: 0,
     created_at: 1,
     ...overrides,
   };
@@ -114,6 +123,7 @@ function createMessage(overrides: Partial<MessageRow> = {}): MessageRow {
     status: "completed",
     error_message: null,
     stop_confirmation_deadline: null,
+    reported_cost_usd: 0,
     created_at: 1,
     started_at: 2,
     completed_at: 3,
@@ -153,6 +163,91 @@ function createHandler() {
 }
 
 describe("ChildSummaryHandler", () => {
+  it.each([false, true])(
+    "excludes stored-file links from child summaries (file event: %s)",
+    async (includeFileEvent) => {
+      const { handler, getSession, getSandbox, repository, artifactRepository } = createHandler();
+      getSession.mockReturnValue(createSession({ status: "completed" }));
+      getSandbox.mockReturnValue(null);
+      const metadata = {
+        objectKey: "sessions/public-session-1/files/f1",
+        filename: "report.csv",
+        mimeType: "text/csv",
+        sizeBytes: 12,
+        messageId: "m1",
+        caption: "Revenue",
+      };
+      artifactRepository.listArtifacts.mockReturnValue([
+        createArtifact({
+          id: "f1",
+          type: "file",
+          url: metadata.objectKey,
+          metadata: JSON.stringify(metadata),
+        }),
+        createArtifact({
+          id: "s1",
+          type: "screenshot",
+          url: "sessions/public-session-1/media/s1.png",
+          metadata: JSON.stringify({ caption: "Dashboard" }),
+        }),
+        createArtifact({ id: "v1", type: "video", url: "sessions/public-session-1/media/v1.mp4" }),
+        createArtifact({
+          id: "invalid-file",
+          type: "file",
+          url: "sessions/private/files/invalid-file",
+          metadata: "{}",
+        }),
+        createArtifact(),
+      ]);
+      repository.getLatestTerminalMessage.mockReturnValue(createMessage({ id: "m1" }));
+      const events = includeFileEvent
+        ? [
+            createEvent({
+              id: "file-event",
+              type: "artifact",
+              message_id: "m1",
+              created_at: 2,
+              data: JSON.stringify({
+                artifactType: "file",
+                artifactId: "f1",
+                url: metadata.objectKey,
+                metadata,
+              }),
+            }),
+          ]
+        : [];
+      repository.listEventPage
+        .mockReturnValueOnce({ events: [], hasMore: false, nextCursor: null })
+        .mockReturnValueOnce({ events, hasMore: false, nextCursor: null });
+
+      const response = (await handler
+        .getChildSummary(new URL("http://internal/internal/child-summary?include=result"))
+        .json()) as ChildSessionDetail;
+      expect(response.artifacts).toEqual([
+        { type: "pr", url: "https://example.com/pr/1", metadata: null },
+      ]);
+      const expectedFiles = [
+        { id: "f1", type: "file", available: true, filename: "report.csv", caption: "Revenue" },
+        { id: "s1", type: "screenshot", caption: "Dashboard" },
+        { id: "v1", type: "video" },
+        { id: "invalid-file", type: "file", available: false },
+      ];
+      expect(response.fileArtifacts).toEqual(expectedFiles);
+      expect(JSON.stringify(response.fileArtifacts)).not.toContain("sessions/");
+      repository.listEventPage.mockReturnValue({ events: [], hasMore: false, nextCursor: null });
+      const ordinary = (await handler.getChildSummary().json()) as ChildSessionDetail;
+      expect(ordinary.fileArtifacts).toEqual(expectedFiles);
+      expect(ordinary.finalResponse).toBeUndefined();
+      expect(response.finalResponse?.artifacts).toEqual([
+        { type: "pr", url: "https://example.com/pr/1", label: "Pull Request", metadata: null },
+      ]);
+      expect(response.finalResponse?.fileArtifacts).toEqual(
+        includeFileEvent ? [{ id: "f1", type: "file", available: true, metadata }] : []
+      );
+      expect(response.finalResponse?.mediaArtifacts).toEqual([]);
+    }
+  );
+
   it("returns 404 when session is missing for child summary", async () => {
     const { handler, getSession } = createHandler();
     getSession.mockReturnValue(null);
@@ -177,7 +272,12 @@ describe("ChildSummaryHandler", () => {
       nextCursor: null,
       events: [
         createEvent({ id: "e1", type: "token", data: '{"token":"x"}', created_at: 9 }),
-        createEvent({ id: "e2", type: "error", data: '{"message":"boom"}', created_at: 8 }),
+        createEvent({
+          id: "e2",
+          type: "error",
+          data: '{"message":"boom","outputTail":["legacy secret output"]}',
+          created_at: 8,
+        }),
         createEvent({ id: "e3", type: "heartbeat", data: '{"ok":true}', created_at: 7 }),
         createEvent({ id: "e4", type: "git_sync", data: '{"state":"done"}', created_at: 6 }),
         createEvent({ id: "e5", type: "push_error", data: '{"code":"denied"}', created_at: 5 }),
@@ -210,6 +310,7 @@ describe("ChildSummaryHandler", () => {
       },
       sandbox: { status: "ready" },
       hasUnfinishedPrompt: false,
+      fileArtifacts: [],
       artifacts: [
         {
           type: "pr",
@@ -464,7 +565,12 @@ describe("ChildSummaryHandler", () => {
     repository.getEventTimelinePage.mockReturnValue({
       events: [
         createEvent({ id: "e1", type: "tool_call", data: '{"tool":"Read"}', created_at: 10 }),
-        createEvent({ id: "e2", type: "tool_result", data: '{"result":"ok"}', created_at: 20 }),
+        createEvent({
+          id: "e2",
+          type: "tool_result",
+          data: '{"result":"ok","outputTail":["legacy secret output"]}',
+          created_at: 20,
+        }),
       ],
       hasMore: false,
       nextCursor: null,

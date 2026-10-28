@@ -1,12 +1,22 @@
 import { describe, it, expect } from "vitest";
 import { matchesConditions, validateConditions } from "../conditions";
+import {
+  hasSlackActorIncludeList,
+  hasValidSlackChannelCondition,
+  normalizeSlackChannelConditions,
+  parseSlackChannelCondition,
+} from "./conditions";
 import type { TriggerCondition } from "../types";
 import { conditionRegistry } from "../registry";
 import { buildMockEvent } from "../testing";
 import { SLACK_TEXT_MAX_LENGTH } from "./normalizer";
 
-const slackEvent = (overrides: { text?: string; channelId?: string; actorUserId?: string }) =>
-  buildMockEvent("slack", overrides);
+const slackEvent = (overrides: {
+  text?: string;
+  channelId?: string;
+  actorUserId?: string;
+  botId?: string;
+}) => buildMockEvent("slack", overrides);
 
 const match = (condition: TriggerCondition, event = slackEvent({ text: "please deploy now" })) =>
   matchesConditions([condition], event, conditionRegistry);
@@ -156,9 +166,82 @@ describe("slack_actor condition", () => {
       )
     ).toBe(true);
   });
+
+  it("include matches a bot by its bot id", () => {
+    expect(
+      match(
+        { type: "slack_actor", operator: "include", value: ["B1"] },
+        slackEvent({ actorUserId: undefined, botId: "B1" })
+      )
+    ).toBe(true);
+  });
+
+  it("exclude rejects a bot listed by its bot id", () => {
+    expect(
+      match(
+        { type: "slack_actor", operator: "exclude", value: ["B1"] },
+        slackEvent({ actorUserId: undefined, botId: "B1" })
+      )
+    ).toBe(false);
+  });
 });
 
 describe("validateConditions (slack)", () => {
+  it("requires a non-empty watched-channel condition", () => {
+    expect(hasValidSlackChannelCondition([])).toBe(false);
+    expect(
+      hasValidSlackChannelCondition([{ type: "slack_channel", operator: "any_of", value: [] }])
+    ).toBe(false);
+    expect(
+      hasValidSlackChannelCondition([{ type: "slack_channel", operator: "any_of", value: ["C1"] }])
+    ).toBe(true);
+  });
+
+  it("parses the complete channel condition and normalizes channel IDs", () => {
+    expect(
+      parseSlackChannelCondition({
+        type: "slack_channel",
+        operator: "any_of",
+        value: [" C1 ", "C2"],
+        ignored: "not persisted",
+      })
+    ).toEqual({
+      success: true,
+      condition: {
+        type: "slack_channel",
+        operator: "any_of",
+        value: ["C1", "C2"],
+      },
+    });
+    expect(
+      normalizeSlackChannelConditions([
+        { type: "slack_channel", operator: "any_of", value: [" C1 "] },
+      ])
+    ).toEqual([{ type: "slack_channel", operator: "any_of", value: ["C1"] }]);
+  });
+
+  it("rejects the wrong channel operator and whitespace-only IDs", () => {
+    expect(
+      parseSlackChannelCondition({
+        type: "slack_channel",
+        operator: "exclude",
+        value: ["C1"],
+      })
+    ).toEqual({
+      success: false,
+      error: "Slack Channel operator must be any_of",
+    });
+    expect(
+      hasValidSlackChannelCondition([
+        {
+          type: "slack_channel",
+          operator: "any_of",
+          value: [" "],
+        } as unknown as TriggerCondition,
+      ])
+    ).toBe(false);
+  });
+
   it("rejects an empty text_match pattern", () => {
     const errors = validateConditions(
       [{ type: "text_match", operator: "contains", value: { pattern: "" } }],
@@ -204,6 +287,30 @@ describe("validateConditions (slack)", () => {
     expect(errors.length).toBeGreaterThan(0);
   });
 
+  it("rejects a slack_channel condition with the wrong operator", () => {
+    const errors = validateConditions(
+      [
+        {
+          type: "slack_channel",
+          operator: "exclude",
+          value: ["C1"],
+        } as unknown as TriggerCondition,
+      ],
+      "slack",
+      conditionRegistry
+    );
+    expect(errors).toEqual(["Slack Channel operator must be any_of"]);
+  });
+
+  it("rejects whitespace-only slack_channel IDs", () => {
+    const errors = validateConditions(
+      [{ type: "slack_channel", operator: "any_of", value: [" "] }],
+      "slack",
+      conditionRegistry
+    );
+    expect(errors).toEqual(["Slack Channel requires at least one nonblank channel ID"]);
+  });
+
   it("rejects a slack_channel value that is a string, not an array", () => {
     // A bare string passes the TS type's `.length` check but would be iterated
     // character-by-character when the watched-channel index is built.
@@ -239,6 +346,15 @@ describe("validateConditions (slack)", () => {
     expect(errors.length).toBeGreaterThan(0);
   });
 
+  it("rejects a text_match value that is an array (no throw)", () => {
+    const errors = validateConditions(
+      [{ type: "text_match", operator: "contains", value: [] } as unknown as TriggerCondition],
+      "slack",
+      conditionRegistry
+    );
+    expect(errors.length).toBeGreaterThan(0);
+  });
+
   it("rejects a text_match pattern that is not a string", () => {
     const errors = validateConditions(
       [
@@ -262,5 +378,28 @@ describe("validateConditions (slack)", () => {
     );
     expect(errors).toHaveLength(1);
     expect(errors[0]).toContain("does not apply to github");
+  });
+});
+
+describe("hasSlackActorIncludeList", () => {
+  const channel: TriggerCondition = { type: "slack_channel", operator: "any_of", value: ["C1"] };
+
+  it("needs a non-empty Slack User include condition", () => {
+    expect(hasSlackActorIncludeList([channel])).toBe(false);
+    expect(
+      hasSlackActorIncludeList([
+        channel,
+        { type: "slack_actor", operator: "exclude", value: ["B1"] },
+      ])
+    ).toBe(false);
+    expect(
+      hasSlackActorIncludeList([channel, { type: "slack_actor", operator: "include", value: [] }])
+    ).toBe(false);
+    expect(
+      hasSlackActorIncludeList([
+        channel,
+        { type: "slack_actor", operator: "include", value: ["B1"] },
+      ])
+    ).toBe(true);
   });
 });

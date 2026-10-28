@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { enforceRoutePrincipal } from "./routing/route-admission";
+import { enforceRoutePrincipal, parseVerifiedSandboxId } from "./routing/route-admission";
 import {
+  fakeSessionRuntimeDispatch,
   handleRequest,
   matchRoute,
   routeContracts as routes,
@@ -8,19 +9,150 @@ import {
   TEST_SERVICE_SECRETS,
 } from "./router.test-support";
 import { serviceAllowsPermission } from "./authorization/service-permissions";
-import { SCOPED_PERMISSION_PAIRS } from "@open-inspect/shared/rbac";
 
 function routeFor(method: string, path: string) {
   return matchRoute(routes, method, path)?.route;
 }
 
 describe("route policy table", () => {
+  it("declares narrow actorless GitHub routing with a repository permission", () => {
+    expect(routeFor("GET", "/github/route")).toMatchObject({
+      authentication: { kind: "service" },
+      authorization: {
+        kind: "active-user",
+        allOf: [{ kind: "permission", permission: "repositories.read" }],
+        service: { kind: "actor", actorlessGrants: [{ service: "github-bot" }] },
+        auditAllowed: false,
+      },
+      supportedScmProviders: ["github"],
+      cacheControl: "private, no-store",
+    });
+    expect(routeFor("POST", "/github/route")).toBeUndefined();
+  });
+
+  it("does not expose a member-facing team activity route", () => {
+    expect(routeFor("GET", "/teams/team-1/activity")).toBeUndefined();
+    expect(routeFor("GET", "/audit-events")?.authorization).toMatchObject({
+      allOf: [{ kind: "permission", permission: "workspace.audit.read" }],
+      service: { kind: "deny" },
+    });
+  });
+
   it("publishes the complete canonical route catalog", () => {
-    expect(routes).toHaveLength(171);
+    expect(routes).toHaveLength(237);
 
     const paths = routes.map((route) => route.path);
-    expect(new Set(paths).size).toBe(130);
-    expect(new Set(routes.map((route) => `${route.method}:${route.path}`)).size).toBe(171);
+    expect(new Set(paths).size).toBe(181);
+    expect(new Set(routes.map((route) => `${route.method}:${route.path}`)).size).toBe(237);
+    expect(routeFor("POST", "/sessions/session-1/sandbox-memory/search")).toMatchObject({
+      authentication: { kind: "sandbox" },
+      supportedScmProviders: "all",
+      cacheControl: "private, no-store",
+    });
+  });
+
+  it("gates member merges on the merge grant, with member reads for previews", () => {
+    expect(routeFor("POST", "/members/merge/preview")?.authorization).toMatchObject({
+      kind: "active-user",
+      allOf: [{ permission: "workspace.members.merge" }, { permission: "workspace.members.read" }],
+      service: { kind: "deny" },
+    });
+    expect(routeFor("POST", "/members/merge")?.authorization).toMatchObject({
+      kind: "active-user",
+      allOf: [{ permission: "workspace.members.merge" }],
+      service: { kind: "deny" },
+    });
+  });
+
+  it("gates run analytics with analytics.read", () => {
+    const route = routeFor("GET", "/analytics/runs");
+    expect(route?.authorization).toMatchObject({
+      kind: "active-user",
+      allOf: [{ permission: "analytics.read" }],
+    });
+  });
+
+  it("gates collaborator candidates on always-enforced human session management", () => {
+    expect(routeFor("GET", "/sessions/session-1/collaborator-candidates")).toMatchObject({
+      authentication: { kind: "user" },
+      authorization: {
+        kind: "active-user",
+        allOf: [
+          {
+            kind: "session",
+            action: "manageCollaborators",
+            sessionIdParam: "id",
+            enforceAlways: true,
+          },
+        ],
+        service: { kind: "deny" },
+        auditAllowed: false,
+      },
+      supportedScmProviders: "all",
+      cacheControl: "private, no-store",
+    });
+  });
+
+  it("requires human team membership and session read permission for team sessions", () => {
+    expect(routeFor("GET", "/teams/team-1/sessions")).toMatchObject({
+      authentication: { kind: "user" },
+      authorization: {
+        kind: "active-user",
+        allOf: [
+          { kind: "team", teamIdParam: "id", need: "member" },
+          { kind: "permission", permission: "sessions.read" },
+        ],
+        service: { kind: "deny" },
+        auditAllowed: false,
+      },
+      cacheControl: "private, no-store",
+    });
+  });
+
+  it("requires target-aware member removal admission", () => {
+    expect(routeFor("DELETE", "/teams/team-1/members/user-1")?.authorization).toMatchObject({
+      allOf: [{ kind: "team", need: "removeMember", targetUserIdParam: "userId" }],
+      service: { kind: "deny" },
+      auditAllowed: true,
+    });
+  });
+
+  it.each(["/teams/team-1", "/teams/team-1/members"])(
+    "does not audit allowed directory reads at %s",
+    (path) => {
+      expect(routeFor("GET", path)?.authorization).toMatchObject({ auditAllowed: false });
+    }
+  );
+
+  it("still audits allowed team capability writes", () => {
+    expect(routeFor("PATCH", "/teams/team-1")?.authorization).toMatchObject({
+      allOf: [{ kind: "team", need: "canEditMetadata" }],
+      auditAllowed: true,
+    });
+  });
+
+  it.each([
+    ["GET", "/teams/team-1/secrets"],
+    ["PUT", "/teams/team-1/secrets"],
+    ["DELETE", "/teams/team-1/secrets/TOKEN"],
+  ])("requires human team secret management for %s %s", (method, path) => {
+    expect(routeFor(method, path)).toMatchObject({
+      authentication: { kind: "user" },
+      authorization: {
+        kind: "active-user",
+        allOf: [{ kind: "team", teamIdParam: "id", need: "canManageSecrets" }],
+        service: { kind: "deny" },
+      },
+      supportedScmProviders: "all",
+      cacheControl: "private, no-store",
+    });
+  });
+
+  it("gates a single-session export with session read and sessions.export", () => {
+    expect(routeFor("GET", "/sessions/session-1/export")?.authorization).toMatchObject({
+      kind: "active-user",
+      allOf: [{ kind: "session", action: "read" }, { permission: "sessions.export" }],
+    });
   });
 
   it("declares every path in the literal-or-parameter grammar", () => {
@@ -34,6 +166,7 @@ describe("route policy table", () => {
 
   it.each([
     ["GET", "/sessions/inbox", "/sessions/:id"],
+    ["GET", "/sessions/export", "/sessions/:id"],
     ["GET", "/model-provider-accounts/legacy-credentials", "/model-provider-accounts/:id"],
   ])("orders the static overlap %s %s before %s", (method, staticPath, dynamicPath) => {
     const staticIndex = routes.findIndex(
@@ -81,9 +214,16 @@ describe("route policy table", () => {
       } else if (authorization.kind === "active-global") {
         expect(["user", "user-or-service"]).toContain(authentication);
       } else {
-        expect(["user", "user-or-service", "user-or-service-with-sandbox-fallback"]).toContain(
-          authentication
-        );
+        expect([
+          "user",
+          "user-or-service",
+          "user-or-service-with-sandbox-fallback",
+          "service",
+        ]).toContain(authentication);
+        if (authentication === "service") {
+          expect(route.path).toBe("/github/route");
+          expect(route.serviceActorClaims).toBeDefined();
+        }
         expect(authorization.allOf.length).toBeGreaterThan(0);
         for (const requirement of authorization.allOf) {
           if (requirement.kind === "automation") {
@@ -101,12 +241,52 @@ describe("route policy table", () => {
     }
   });
 
+  it("requires session admission on every active-user session item route", () => {
+    const exceptions: string[] = [];
+    for (const route of routes) {
+      if (!route.path.startsWith("/sessions/:id") || route.authorization.kind !== "active-user")
+        continue;
+      const identity = `${route.method} ${route.path}`;
+      if (exceptions.includes(identity)) continue;
+      expect(
+        route.authorization.allOf.some((requirement) => requirement.kind === "session"),
+        identity
+      ).toBe(true);
+      if (route.path.includes(":childId")) {
+        expect(
+          route.authorization.allOf.some(
+            (requirement) =>
+              requirement.kind === "session" && requirement.sessionIdParam === "childId"
+          ),
+          identity
+        ).toBe(true);
+      }
+    }
+    expect(exceptions).toEqual([]);
+  });
+
   it.each([
     ["GET", "/repos", [{ service: "slack-bot" }, { service: "linear-bot" }]],
     ["GET", "/repos/acme/widgets/metadata", [{ service: "github-bot" }]],
     ["GET", "/environments", [{ service: "slack-bot" }, { service: "linear-bot" }]],
     ["GET", "/environments/env-1", [{ service: "github-bot" }]],
-    ["GET", "/integration-settings/slack", [{ service: "slack-bot", pathParams: { id: "slack" } }]],
+    ["GET", "/github/route", [{ service: "github-bot" }]],
+    [
+      "GET",
+      "/integration-settings/slack",
+      [
+        { service: "slack-bot", pathParams: { id: "slack" } },
+        { service: "linear-bot", pathParams: { id: "linear" } },
+      ],
+    ],
+    [
+      "GET",
+      "/integration-settings/linear",
+      [
+        { service: "slack-bot", pathParams: { id: "slack" } },
+        { service: "linear-bot", pathParams: { id: "linear" } },
+      ],
+    ],
     [
       "GET",
       "/integration-settings/github/resolved/acme/widgets",
@@ -116,7 +296,12 @@ describe("route policy table", () => {
       ],
     ],
     ["GET", "/integration-settings/slack/watched-channels", [{ service: "slack-bot" }]],
-    ["GET", "/model-preferences", [{ service: "slack-bot" }]],
+    ["GET", "/model-preferences", [{ service: "slack-bot" }, { service: "github-bot" }]],
+    ["GET", "/automations", [{ service: "slack-bot" }]],
+    ["GET", "/automations/auto-1", [{ service: "slack-bot" }]],
+    ["GET", "/automations/auto-1/invocations", [{ service: "slack-bot" }]],
+    ["GET", "/automations/auto-1/runs/run-1", [{ service: "slack-bot" }]],
+    ["GET", "/integration-settings/slack/channels", [{ service: "slack-bot" }]],
     ["GET", "/sessions/session-1/events", [{ service: "slack-bot" }, { service: "linear-bot" }]],
     ["GET", "/sessions/session-1/artifacts", [{ service: "slack-bot" }, { service: "linear-bot" }]],
   ])("declares the exact actorless grants for %s %s", (method, path, expected) => {
@@ -130,16 +315,34 @@ describe("route policy table", () => {
     }
   });
 
+  it.each([
+    ["slack", "slack-bot"],
+    ["linear", "linear-bot"],
+  ] as const)("admits only the %s bot to its channel-binding lookup", (provider, service) => {
+    expect(routeFor("GET", `/channel-bindings/${provider}/C1`)?.authorization).toEqual({
+      kind: "service",
+      services: [service],
+      actor: "optional",
+      auditAllowed: true,
+    });
+  });
+
   it("does not declare actorless grants on other routes", () => {
     const expected = new Set([
       routeFor("GET", "/repos"),
       routeFor("GET", "/repos/acme/widgets/metadata"),
       routeFor("GET", "/environments"),
       routeFor("GET", "/environments/env-1"),
+      routeFor("GET", "/github/route"),
       routeFor("GET", "/integration-settings/slack"),
       routeFor("GET", "/integration-settings/github/resolved/acme/widgets"),
       routeFor("GET", "/integration-settings/slack/watched-channels"),
       routeFor("GET", "/model-preferences"),
+      routeFor("GET", "/automations"),
+      routeFor("GET", "/automations/auto-1"),
+      routeFor("GET", "/automations/auto-1/invocations"),
+      routeFor("GET", "/automations/auto-1/runs/run-1"),
+      routeFor("GET", "/integration-settings/slack/channels"),
       routeFor("GET", "/sessions/session-1/events"),
       routeFor("GET", "/sessions/session-1/artifacts"),
       routeFor("POST", "/sessions/session-1/stop"),
@@ -167,10 +370,6 @@ describe("route policy table", () => {
               serviceAllowsPermission(grant.service, requirement.permission),
               `${grant.service} must allow ${requirement.permission} for ${route.method} ${route.path}`
             ).toBe(true);
-          } else if (requirement.kind === "scoped-permission") {
-            expect(
-              serviceAllowsPermission(grant.service, SCOPED_PERMISSION_PAIRS[requirement.stem].own)
-            ).toBe(true);
           }
         }
       }
@@ -188,7 +387,10 @@ describe("route policy table", () => {
     });
     expect(routeFor("GET", "/model-preferences")?.authorization).toMatchObject({
       kind: "active-global",
-      service: { kind: "actor", actorlessGrants: [{ service: "slack-bot" }] },
+      service: {
+        kind: "actor",
+        actorlessGrants: [{ service: "slack-bot" }, { service: "github-bot" }],
+      },
     });
     expect(routeFor("GET", "/sessions")?.authorization).toMatchObject({
       kind: "active-user",
@@ -196,6 +398,11 @@ describe("route policy table", () => {
       service: { kind: "actor" },
     });
     expect(routeFor("GET", "/sessions/inbox")?.authorization).toMatchObject({
+      kind: "active-user",
+      allOf: [{ kind: "permission", permission: "sessions.read" }],
+      service: { kind: "deny" },
+    });
+    expect(routeFor("POST", "/sessions/inbox/read-state")?.authorization).toMatchObject({
       kind: "active-user",
       allOf: [{ kind: "permission", permission: "sessions.read" }],
       service: { kind: "deny" },
@@ -210,9 +417,18 @@ describe("route policy table", () => {
       },
       cacheControl: "private, no-store",
     });
+    expect(routeFor("POST", "/sessions/batch-archive")).toMatchObject({
+      authentication: { kind: "user" },
+      authorization: {
+        kind: "active-user",
+        allOf: [{ kind: "permission", permission: "sessions.bulk_archive" }],
+        service: { kind: "deny" },
+        auditAllowed: true,
+      },
+    });
     expect(routeFor("POST", "/sessions/session-1/ws-token")?.authorization).toMatchObject({
       kind: "active-user",
-      allOf: [{ kind: "permission", permission: "sessions.read" }],
+      allOf: [{ kind: "session", action: "read" }],
     });
     expect(routeFor("POST", "/sessions/session-1/stop")?.authorization).toMatchObject({
       service: { kind: "actor", actorlessGrants: [{ service: "linear-bot" }] },
@@ -224,14 +440,26 @@ describe("route policy table", () => {
     expect(routeFor("POST", "/sessions/parent/children")?.authorization).toMatchObject({
       kind: "active-user",
       allOf: [
+        { kind: "session", action: "collaborate" },
         { kind: "permission", permission: "sessions.create" },
-        { kind: "permission", permission: "sessions.collaborate" },
       ],
     });
     expect(routeFor("GET", "/sessions/parent/children/child")?.authorization).toMatchObject({
       kind: "active-user",
-      allOf: [{ kind: "permission", permission: "sessions.read" }],
+      allOf: [
+        { kind: "session", action: "read", sessionIdParam: "id" },
+        { kind: "session", action: "read", sessionIdParam: "childId" },
+      ],
     });
+    expect(routeFor("POST", "/sessions/parent/children/child/cancel")?.authorization).toMatchObject(
+      {
+        kind: "active-user",
+        allOf: [
+          { kind: "session", action: "read", sessionIdParam: "id" },
+          { kind: "session", action: "lifecycle", sessionIdParam: "childId" },
+        ],
+      }
+    );
     expect(routeFor("POST", "/internal/github-event")?.authorization).toMatchObject({
       kind: "service",
       services: ["github-bot"],
@@ -280,6 +508,7 @@ describe("route policy table", () => {
     ["GET", "/health", "public"],
     ["POST", "/webhooks/sentry/automation-1", "handler-authenticated"],
     ["POST", "/webhooks/automation/automation-1", "handler-authenticated"],
+    ["GET", "/webhooks/automation/automation-1/invocations/invocation-1", "handler-authenticated"],
     ["POST", "/image-builds/build-complete", "handler-authenticated"],
     ["POST", "/image-builds/build-failed", "handler-authenticated"],
     ["GET", "/api/auth/get-session", "web-service"],
@@ -293,6 +522,14 @@ describe("route policy table", () => {
       "user",
     ],
     ["DELETE", `/model-provider-accounts/openai/device-authorizations/${"0".repeat(64)}`, "user"],
+    ["POST", "/model-provider-accounts/anthropic/authorization-codes", "user"],
+    ["GET", `/model-provider-accounts/anthropic/authorization-codes/${"0".repeat(64)}`, "user"],
+    [
+      "POST",
+      `/model-provider-accounts/anthropic/authorization-codes/${"0".repeat(64)}/complete`,
+      "user",
+    ],
+    ["DELETE", `/model-provider-accounts/anthropic/authorization-codes/${"0".repeat(64)}`, "user"],
     ["GET", "/model-provider-accounts/legacy-credentials", "user"],
     ["GET", "/model-provider-account-defaults", "user"],
     ["PUT", "/model-provider-account-defaults/openai", "user"],
@@ -330,6 +567,7 @@ describe("route policy table", () => {
     ["POST", "/sessions/session-1/xai-token-refresh"],
     ["GET", "/sessions/session-1/sandbox-skills"],
     ["POST", "/sessions/session-1/provider-auth/openai/access-token"],
+    ["POST", "/sessions/session-1/provider-auth/anthropic/runtime-credential"],
   ])("requires the bound sandbox for %s %s", (method, path) => {
     const { route, params } = matchRoute(routes, method, path)!;
     expect(route.authentication.kind).toBe("sandbox");
@@ -343,6 +581,8 @@ describe("route policy table", () => {
   it.each([
     ["GET", "/sessions/session-1"],
     ["GET", "/sessions/inbox"],
+    ["POST", "/sessions/inbox/read-state"],
+    ["POST", "/sessions/batch-archive"],
     ["GET", "/sessions/session-1/sandbox-access"],
     ["PATCH", "/sessions/session-1/read-state"],
     ["GET", "/sessions/session-1/skills"],
@@ -378,7 +618,14 @@ describe("route policy table", () => {
       routeFor("POST", "/model-provider-accounts/openai/device-authorizations")?.cacheControl
     ).toBe("private, no-store");
     expect(
+      routeFor("POST", "/model-provider-accounts/anthropic/authorization-codes")?.cacheControl
+    ).toBe("private, no-store");
+    expect(
       routeFor("POST", "/sessions/session-1/provider-auth/openai/access-token")?.cacheControl
+    ).toBe("no-store");
+    expect(
+      routeFor("POST", "/sessions/session-1/provider-auth/anthropic/runtime-credential")
+        ?.cacheControl
     ).toBe("no-store");
   });
 
@@ -415,6 +662,19 @@ describe("route policy table", () => {
       "gitlab",
     ]);
   });
+});
+
+describe("parseVerifiedSandboxId", () => {
+  it("extracts a non-empty sandbox id from the verification response", () => {
+    expect(parseVerifiedSandboxId({ sandboxId: "sandbox-1", ignored: true })).toBe("sandbox-1");
+  });
+
+  it.each([null, "sandbox-1", ["sandbox-1"], { sandboxId: "" }, { sandboxId: 123 }, {}])(
+    "treats %j as an absent sandbox id",
+    (value) => {
+      expect(parseVerifiedSandboxId(value)).toBeNull();
+    }
+  );
 });
 
 describe("route policy dispatch ordering", () => {
@@ -500,6 +760,32 @@ describe("route policy dispatch ordering", () => {
     expect(response.status).toBe(503);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
   });
+
+  it.each(["null", '"sandbox-1"', "[]", "{}", '{"sandboxId":""}', '{"sandboxId":123}', "not-json"])(
+    "does not issue provider credentials for a verified response without an identity: %s",
+    async (body) => {
+      const testEnv = {
+        ...env("github"),
+        SESSION: fakeSessionRuntimeDispatch(async () => new Response(body)),
+      };
+      const response = await handleRequest(
+        new Request(
+          "https://test.local/sessions/session-1/provider-auth/anthropic/runtime-credential",
+          {
+            method: "POST",
+            headers: { Authorization: "Bearer sandbox-token", "X-Sandbox-ID": "sandbox-1" },
+          }
+        ),
+        testEnv as never,
+        TEST_BACKGROUND_TASK_CONTEXT
+      );
+
+      expect(response.status).toBe(403);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      await expect(response.json()).resolves.toEqual({ error: "Sandbox identity unavailable" });
+      expect(testEnv.DB.prepare).not.toHaveBeenCalled();
+    }
+  );
 });
 
 describe("route principal policy", () => {

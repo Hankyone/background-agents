@@ -1,3 +1,4 @@
+import type { HarnessId } from "@open-inspect/shared/harnesses";
 import type { McpServerConfig } from "@open-inspect/shared/types/integrations";
 import { computeHmacHex } from "@open-inspect/shared/auth";
 import type { SourceControlProviderName } from "../source-control";
@@ -8,7 +9,7 @@ import {
   type RestoreConfig,
   type SessionRepositoryInfo,
 } from "./provider";
-import { resolveServicePorts } from "./providers/port-resolution";
+import { resolveSandboxPortPlan, type SandboxPortPlan } from "./providers/port-resolution";
 
 /**
  * Shared assembly for the sandbox environment contract.
@@ -39,6 +40,8 @@ export interface SessionConfigPayload {
   session_id: string;
   repo_owner: string | null;
   repo_name: string | null;
+  /** Agent harness the runtime must boot. */
+  harness: HarnessId;
   provider: string;
   model: string;
   /** Omitted from the serialized payload when undefined. */
@@ -47,6 +50,13 @@ export interface SessionConfigPayload {
   branch?: string | null;
   /** Ordered member list; only present for multi-repo sessions. */
   repositories?: SessionRepositoryConfigPayload[];
+  /**
+   * Ask the runtime to connect its bridge before the repository boot and to
+   * report boot phases over it. Always true from this control plane, which
+   * treats the runtime's `ready` event, not the socket, as readiness. A
+   * runtime that predates the flag ignores it and boots in its old order.
+   */
+  bridge_early_connect: true;
 }
 
 /** Provider-agnostic inputs needed to assemble a {@link SessionConfigPayload}. */
@@ -54,6 +64,7 @@ export interface SessionConfigInput {
   sessionId: string;
   repoOwner: string | null;
   repoName: string | null;
+  harness: HarnessId;
   provider: string;
   model: string;
   mcpServers?: McpServerConfig[];
@@ -74,9 +85,11 @@ export function buildSessionConfig(input: SessionConfigInput): SessionConfigPayl
     session_id: input.sessionId,
     repo_owner: input.repoOwner,
     repo_name: input.repoName,
+    harness: input.harness,
     provider: input.provider,
     model: input.model,
     mcp_servers: input.mcpServers,
+    bridge_early_connect: true,
   };
   if (input.branch !== undefined) {
     payload.branch = input.branch;
@@ -105,16 +118,34 @@ export const IMAGE_BUILD_MODE_ENV_VAR = "IMAGE_BUILD_MODE";
 export const IMAGE_BUILD_EXECUTION_TIMEOUT_ENV_KEY = "OI_IMAGE_BUILD_EXECUTION_TIMEOUT_SECONDS";
 
 /**
- * Every env var `BootMode.from_env` (sandbox_runtime/runtime_config.py) reads to
- * decide how the runtime boots. Control-plane-owned: providers set these
- * themselves when the mode applies, so they are stripped from the user layer.
- * Keep in sync with that enum.
+ * Marker (`=== "true"`) that holds a freshly created build sandbox dormant:
+ * the baked entrypoint composes nothing until the control plane launches the
+ * build on it. Mirrors `DEFERRED_START_ENV_VAR` in
+ * `sandbox_runtime/image_build_context_start.py`.
+ */
+export const DEFERRED_START_ENV_VAR = "OI_DEFERRED_START";
+
+/**
+ * Entrypoint argument that launches an image build from a context written to
+ * the process's stdin, for providers whose image capture would otherwise bake
+ * build credentials into the container's configuration. Mirrors
+ * `IMAGE_BUILD_CONTEXT_START_ARGUMENT` in the runtime module above.
+ */
+export const IMAGE_BUILD_CONTEXT_START_ARGUMENT = "--image-build-context-stdin-v1";
+
+/**
+ * Control-plane-owned boot controls: every env var `BootMode.from_env`
+ * (sandbox_runtime/runtime_config.py) reads to decide how the runtime boots,
+ * plus the deferred-start marker that decides whether it boots at all.
+ * Providers set these themselves when the mode applies, so they are stripped
+ * from the user layer. Keep in sync with that enum and the launcher module.
  */
 export const BOOT_MODE_ENV_KEYS = [
   IMAGE_BUILD_MODE_ENV_VAR,
   "RESTORED_FROM_SNAPSHOT",
   "FROM_REPO_IMAGE",
   "REPO_IMAGE_SHA",
+  DEFERRED_START_ENV_VAR,
 ] as const;
 
 /**
@@ -141,9 +172,9 @@ export interface ImageBuildCallbackEnvValues {
   failureCallbackUrl: string;
   token: string;
   /**
-   * Omitted from the returned map when absent: OpenComputer and E2B bake the
-   * callback env at create time, before the provider session id exists, and
-   * deliver the id separately when starting the runtime.
+   * Omitted from the returned map when absent: E2B bakes the callback env at
+   * create time, before the provider session id exists, and delivers the id
+   * separately when starting the runtime.
    */
   providerSessionId?: string;
 }
@@ -179,7 +210,7 @@ export const RESERVED_REPO_IMAGE_CALLBACK_ENV_KEYS: readonly string[] = [
   IMAGE_BUILD_EXECUTION_TIMEOUT_ENV_KEY,
 ];
 /** One-shot clone token used only by image-build sandboxes. */
-export const VCS_CLONE_TOKEN_ENV_VAR = "VCS_CLONE_TOKEN";
+const VCS_CLONE_TOKEN_ENV_VAR = "VCS_CLONE_TOKEN";
 
 /** Host/username pair git pairs with the brokered clone token in the sandbox. */
 export interface ScmCloneIdentity {
@@ -258,18 +289,16 @@ export interface SandboxEnvVarsOptions {
   codeServerPassword?: string;
   /** Precomputed VNC password, present only when VNC is enabled. */
   vncPassword?: string;
-  /**
-   * Overrides `config.userEnvVars` as the user layer when a provider composes
-   * it differently (OpenComputer layers provider LLM credentials underneath
-   * user secrets). System vars still overlay whatever is passed here.
-   */
-  baseEnvVars?: Record<string, string>;
+  /** Reuse the provider's validated plan when it also exposes service ports. */
+  portPlan?: SandboxPortPlan;
+  /** Override terminal state inherited from a captured provider image when disabled. */
+  emitDisabledTerminalEnv?: boolean;
 }
 
 /**
  * Build the per-session env map delivered to the sandbox runtime — the one
  * canonical assembly shared by the REST-style providers (Daytona, E2B,
- * OpenComputer, Vercel), which used to hand-roll near-identical copies.
+ * Vercel), which used to hand-roll near-identical copies.
  *
  * User env vars (repo secrets) come first, system vars are overlaid so they
  * can't be shadowed. Provider-specific additions (platform paths, image-mode
@@ -280,9 +309,13 @@ export function buildSandboxEnvVars(
   config: CreateSandboxConfig | RestoreConfig,
   options: SandboxEnvVarsOptions
 ): Record<string, string> {
-  const envVars: Record<string, string> = { ...(options.baseEnvVars ?? config.userEnvVars ?? {}) };
+  const envVars: Record<string, string> = { ...(config.userEnvVars ?? {}) };
+  delete envVars.CODE_SERVER_PORT;
+  delete envVars.CODE_SERVER_PASSWORD;
   delete envVars.VNC_PASSWORD;
   delete envVars.NOVNC_PORT;
+  delete envVars.TERMINAL_ENABLED;
+  delete envVars.TTYD_PROXY_PORT;
   // Boot mode is the control plane's to decide. These are applied by the caller
   // after this returns (only when the corresponding mode is real), so unlike the
   // system keys below they are not overlaid and a repo secret of the same name
@@ -291,6 +324,16 @@ export function buildSandboxEnvVars(
   for (const marker of BOOT_MODE_ENV_KEYS) delete envVars[marker];
 
   const sessionConfig = buildSessionConfig(config);
+  const portPlan =
+    options.portPlan ??
+    resolveSandboxPortPlan(
+      {
+        codeServer: config.codeServerEnabled === true,
+        terminal: config.sandboxSettings?.terminalEnabled === true,
+        vnc: config.vncEnabled === true,
+      },
+      config.sandboxSettings
+    );
 
   Object.assign(envVars, {
     PYTHONUNBUFFERED: "1",
@@ -303,17 +346,24 @@ export function buildSandboxEnvVars(
     [SESSION_CONFIG_ENV_VAR]: JSON.stringify(sessionConfig),
   });
 
-  if (config.codeServerEnabled) {
-    envVars.CODE_SERVER_PORT = String(resolveServicePorts(config.sandboxSettings).codeServerPort);
+  if (portPlan.codeServerPort !== undefined) {
+    envVars.CODE_SERVER_PORT = String(portPlan.codeServerPort);
   }
 
   if (options.codeServerPassword) {
     envVars.CODE_SERVER_PASSWORD = options.codeServerPassword;
   }
 
-  if (config.vncEnabled && options.vncPassword) {
+  if (portPlan.vncPort !== undefined && options.vncPassword) {
     envVars.VNC_PASSWORD = options.vncPassword;
-    envVars.NOVNC_PORT = String(resolveServicePorts(config.sandboxSettings).vncPort);
+    envVars.NOVNC_PORT = String(portPlan.vncPort);
+  }
+
+  if (portPlan.terminalPort !== undefined) {
+    envVars.TERMINAL_ENABLED = "true";
+    envVars.TTYD_PROXY_PORT = String(portPlan.terminalPort);
+  } else if (options.emitDisabledTerminalEnv) {
+    envVars.TERMINAL_ENABLED = "";
   }
 
   if (config.agentSlackNotifyEnabled) {
@@ -330,8 +380,7 @@ export function buildSandboxEnvVars(
   // installation tokens) — exactly the failure that broke long-running and
   // resumed sessions before brokered credentials landed. User-defined secrets
   // are passed through verbatim, though, so a user-supplied VCS_CLONE_TOKEN
-  // survives — OpenComputer deliberately preserves one on prebuilt-image
-  // boots (see its provider tests).
+  // survives.
 
   return envVars;
 }
@@ -343,7 +392,7 @@ export function buildSandboxEnvVars(
  * timestamp (`Date.now()`) as `now` so the impure input is visible at the
  * call site and one config yields one name per trigger attempt;
  * `labels` are the canonical build identity shared by providers (tags on
- * Vercel, labels on OpenComputer). Providers with extra or legacy label
+ * Vercel, metadata on E2B). Providers with extra or legacy label
  * conventions spread and extend `labels`.
  *
  * The `build-env-` prefix is deliberately scope-agnostic legacy: it predates
@@ -377,9 +426,7 @@ export interface ImageBuildEnvVarsOptions {
   /** One-shot clone token delivered as `VCS_CLONE_TOKEN`. */
   cloneToken?: string;
   /**
-   * User env vars (repo secrets), or a provider-composed base layer
-   * (OpenComputer layers provider LLM credentials underneath user secrets).
-   * Reserved image-build keys are scrubbed from this layer so user-defined
+   * User env vars (repo secrets). Reserved image-build keys are scrubbed from this layer so user-defined
    * secrets can never hijack the build callback contract.
    */
   baseEnvVars?: Record<string, string>;
@@ -387,8 +434,8 @@ export interface ImageBuildEnvVarsOptions {
 
 /**
  * Build the env map for an image-build sandbox — the build-mode sibling of
- * {@link buildSandboxEnvVars}, shared by the Vercel and OpenComputer
- * providers (which used to hand-roll byte-identical copies) and mirrored by
+ * {@link buildSandboxEnvVars}, shared by the Vercel and E2B
+ * providers and mirrored by
  * Modal's Python `ModalBuildSessionService.create` in
  * `packages/modal-infra/src/sandbox/build_session.py`.
  *

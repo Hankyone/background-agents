@@ -2,32 +2,36 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { seedActiveUser, sqlDatabase } from "./helpers";
 import { AutomationStore, type AutomationRow } from "../../src/db/automation-store";
+import { GitHubAutomationStore } from "../../src/db/github-automation-store";
 import type { AutomationRunStatus } from "@open-inspect/shared/types/automations";
+import type { GitHubAutomationEvent } from "@open-inspect/shared/triggers";
 import { cleanD1Tables } from "./cleanup";
+import { seedTeam } from "./ownership-test-helpers";
 import { makeRunRow, seedRun, fetchRuns } from "./run-helpers";
-import {
-  AutomationExecutionUnauthorizedError,
-  Scheduler,
-  resolveAutomationProviderAuth,
-} from "../../src/scheduler/scheduler";
+import { createScheduler as createAutomationScheduler } from "../../src/scheduler/factory";
+import { resolveAutomationProviderAuth } from "../../src/scheduler/launch-admission";
+import { AutomationExecutionUnauthorizedError } from "../../src/scheduler/contracts";
 import { AutomationModelProviderAuthStore } from "../../src/db/automation-model-provider-auth";
 import { ModelProviderAccountStore } from "../../src/db/model-provider-accounts";
 import { ProviderDefaultStore } from "../../src/db/provider-account-defaults";
 import { createCloudflareEnv } from "../../src/cloudflare/platform";
 
 function createScheduler(schedulerEnv = createCloudflareEnv(env)) {
-  return new Scheduler(env.DB, schedulerEnv, { submit() {} });
+  return createAutomationScheduler(env.DB, schedulerEnv, { submit() {} });
 }
 
 function makeAutomation(overrides?: Partial<AutomationRow>): AutomationRow {
   const now = Date.now();
   return {
     id: `auto-${Math.random().toString(36).slice(2, 8)}`,
+    owner_team_id: null,
     name: "Test Automation",
     instructions: "Run tests",
     trigger_type: "schedule",
     schedule_cron: "0 9 * * *",
+    schedule_once_at: null,
     schedule_tz: "UTC",
+    harness: "opencode",
     model: "anthropic/claude-sonnet-4-6",
     reasoning_effort: null,
     enabled: 1,
@@ -52,6 +56,20 @@ describe("Scheduler (integration)", () => {
     await env.DB.exec(
       "DELETE FROM model_provider_account_defaults; DELETE FROM model_provider_accounts;"
     );
+  });
+
+  it("resolves a Codex automation without configured OpenAI auth to the API key", async () => {
+    const automation = makeAutomation({
+      id: "codex-auth-missing",
+      harness: "codex",
+      model: "openai/gpt-6.1-sol",
+    });
+    await new AutomationStore(env.DB).create(automation);
+    expect(await resolveAutomationProviderAuth(env.DB, automation.id, "codex")).toContainEqual({
+      provider: "openai",
+      authMode: "api_key",
+      selectionSource: "api_key_fallback",
+    });
   });
 
   describe("automation provider auth resolution", () => {
@@ -189,6 +207,76 @@ describe("Scheduler (integration)", () => {
       // Verify consecutive failures were reset
       const automation = await store.getById("auto-rc1");
       expect(automation!.consecutive_failures).toBe(0);
+    });
+
+    it("corrects a sweep-declared timeout when the real success callback arrives", async () => {
+      const store = new AutomationStore(env.DB);
+      const now = Date.now();
+      // The sweep already struck this invocation on its way to auto-pause.
+      await store.create(makeAutomation({ id: "auto-rc-late", consecutive_failures: 2 }));
+
+      const sweptRun = makeRunRow("auto-rc-late", {
+        id: "run-rc-late",
+        session_id: "sess-late",
+        status: "failed",
+        failure_reason: "execution_timeout",
+        started_at: now - 60_000,
+        completed_at: now - 1000,
+      });
+      await seedRun(sweptRun);
+      const struck = await env.DB.prepare(
+        `UPDATE automation_invocations SET failure_counted_at = ? WHERE id = ?`
+      )
+        .bind(now - 1000, sweptRun.invocation_id)
+        .run();
+      expect(struck.meta.changes).toBe(1);
+
+      await createScheduler().runComplete({
+        automationId: "auto-rc-late",
+        runId: "run-rc-late",
+        sessionId: "sess-late",
+        messageId: "msg-late",
+        success: true,
+      });
+
+      const run = await store.getRunById("auto-rc-late", "run-rc-late");
+      expect(run!.status).toBe("completed");
+      expect(run!.failure_reason).toBeNull();
+      // The correction stops at the run row: invocation accounting is
+      // unordered, so the sweep's strike stands until the next fully
+      // successful firing resets the streak.
+      expect((await store.getById("auto-rc-late"))!.consecutive_failures).toBe(2);
+      const invocation = await store.getInvocationById(sweptRun.invocation_id);
+      expect(invocation!.failure_counted_at).toBe(now - 1000);
+    });
+
+    it("leaves an observed failure final when a late success callback arrives", async () => {
+      const store = new AutomationStore(env.DB);
+      const now = Date.now();
+      await store.create(makeAutomation({ id: "auto-rc-obs", consecutive_failures: 1 }));
+
+      await seedRun(
+        makeRunRow("auto-rc-obs", {
+          id: "run-rc-obs",
+          session_id: "sess-obs",
+          status: "failed",
+          failure_reason: "Sandbox crashed",
+          started_at: now - 60_000,
+          completed_at: now - 1000,
+        })
+      );
+
+      await createScheduler().runComplete({
+        automationId: "auto-rc-obs",
+        runId: "run-rc-obs",
+        sessionId: "sess-obs",
+        messageId: "msg-obs",
+        success: true,
+      });
+
+      const run = await store.getRunById("auto-rc-obs", "run-rc-obs");
+      expect(run!.status).toBe("failed");
+      expect(run!.failure_reason).toBe("Sandbox crashed");
     });
 
     it("marks run as failed and increments failures on failure", async () => {
@@ -331,14 +419,13 @@ describe("Scheduler (integration)", () => {
       expect(automation!.consecutive_failures).toBe(1);
     });
 
-    it("recovers timed-out running runs during sweep", async () => {
+    it("recovers running runs whose execution deadline has passed", async () => {
       const store = new AutomationStore(env.DB);
       const now = Date.now();
       await store.create(
         makeAutomation({ id: "auto-t2", next_run_at: now + 86400000, enabled: 1 })
       );
 
-      // Default EXECUTION_TIMEOUT_MS is 90 minutes
       const twoHoursAgo = now - 2 * 60 * 60 * 1000;
       await seedRun(
         makeRunRow("auto-t2", {
@@ -347,6 +434,7 @@ describe("Scheduler (integration)", () => {
           session_id: "sess-timeout",
           scheduled_at: twoHoursAgo,
           started_at: twoHoursAgo,
+          execution_deadline_at: now - 1000,
           created_at: twoHoursAgo,
         })
       );
@@ -357,6 +445,36 @@ describe("Scheduler (integration)", () => {
       const run = await store.getRunById("auto-t2", "run-timeout-t2");
       expect(run!.status).toBe("failed");
       expect(run!.failure_reason).toBe("execution_timeout");
+    });
+
+    it("leaves a run alone past the old 90-minute mark while its deadline is in the future", async () => {
+      const store = new AutomationStore(env.DB);
+      const now = Date.now();
+      await store.create(
+        makeAutomation({ id: "auto-t2b", next_run_at: now + 86400000, enabled: 1 })
+      );
+
+      // Three hours of real work under an eight-hour sandbox timeout: the old
+      // sweep failed this at 90 minutes while the session was still producing.
+      const threeHoursAgo = now - 3 * 60 * 60 * 1000;
+      await seedRun(
+        makeRunRow("auto-t2b", {
+          id: "run-long-t2b",
+          status: "running",
+          session_id: "sess-long",
+          scheduled_at: threeHoursAgo,
+          started_at: threeHoursAgo,
+          execution_deadline_at: threeHoursAgo + 8 * 60 * 60 * 1000,
+          created_at: threeHoursAgo,
+        })
+      );
+
+      await createScheduler().tick();
+
+      const run = await store.getRunById("auto-t2b", "run-long-t2b");
+      expect(run!.status).toBe("running");
+      expect(run!.failure_reason).toBeNull();
+      expect((await store.getById("auto-t2b"))!.consecutive_failures).toBe(0);
     });
 
     it("skips overdue automations with active runs (concurrency guard)", async () => {
@@ -643,6 +761,7 @@ describe("Scheduler (integration)", () => {
         id,
         automation_id: "auto-slot-ownership",
         source: "schedule" as const,
+        actor_kind: "system" as const,
         scheduled_at: slot,
         trigger_key: null,
         concurrency_key: null,
@@ -815,6 +934,7 @@ describe("Scheduler (integration)", () => {
           id: invocationId,
           automation_id: automationId,
           source: "manual",
+          actor_kind: "person",
           scheduled_at: null,
           trigger_key: null,
           concurrency_key: null,
@@ -834,6 +954,7 @@ describe("Scheduler (integration)", () => {
           failure_reason: child.status === "failed" ? "seeded failure" : null,
           scheduled_at: now,
           started_at: child.status === "starting" ? null : now,
+          execution_deadline_at: child.status === "running" ? now + 60_000 : null,
           completed_at: child.status === "failed" || child.status === "completed" ? now : null,
           created_at: now + index,
           repo_owner: null,
@@ -841,6 +962,7 @@ describe("Scheduler (integration)", () => {
           repo_id: null,
           base_branch: null,
           environment_id: null,
+          first_prompt_pending: 0,
         })),
         overlapScope: { kind: "automation" },
       });
@@ -938,6 +1060,164 @@ describe("Scheduler (integration)", () => {
 
       const automation = await store.getById("auto-f2r");
       expect(automation!.consecutive_failures).toBe(0);
+    });
+
+    describe("neutral-denial recovery", () => {
+      const automationId = "auto-neutral-recovery";
+      const deniedEvent: GitHubAutomationEvent = {
+        source: "github",
+        eventType: "pull_request.opened",
+        repositoryId: 101,
+        repoOwner: "acme",
+        repoName: "app",
+        triggerKey: "github:101:pr:7:opened",
+        concurrencyKey: "github:101:pr:7",
+        contextBlock: "Pull request #7 opened.",
+        meta: {},
+      };
+
+      beforeEach(async () => {
+        await seedTeam("team-neutral-recovery");
+        await new AutomationStore(env.DB).create(
+          makeAutomation({
+            id: automationId,
+            owner_team_id: "team-neutral-recovery",
+            consecutive_failures: 2,
+          })
+        );
+      });
+
+      it("recovers a missed success reset through a newer conditional GitHub denial", async () => {
+        const store = new AutomationStore(env.DB);
+        const now = Date.now();
+        const success = makeRunRow(automationId, {
+          status: "completed",
+          created_at: now - 60_000,
+          completed_at: now - 59_000,
+        });
+        await seedRun(success);
+        expect(
+          await new GitHubAutomationStore(env.DB).recordGitHubGrantDenied(automationId, deniedEvent)
+        ).toBe(true);
+        const history = await store.listInvocations(automationId, { limit: 10, offset: 0 });
+        const denied = history.invocations[0];
+        expect(denied).toMatchObject({
+          status: "unauthorized",
+          skipReason: null,
+          runs: [
+            expect.objectContaining({ status: "unauthorized", failureReason: "repo_not_granted" }),
+          ],
+        });
+        expect(denied.createdAt).toBeGreaterThan(success.created_at);
+        expect(await store.getInvocationById(denied.id)).toMatchObject({
+          skip_reason: null,
+          failure_counted_at: null,
+        });
+        expect(await store.getInvocationRunAggregate(denied.id)).toMatchObject({
+          total: 1,
+          active: 0,
+          failed: 0,
+          completed: 0,
+          skipped: 0,
+        });
+        expect(await store.getStaleFailureResetCandidates(now - 120_000, 10)).toEqual([
+          { automation_id: automationId, invocation_id: success.invocation_id },
+        ]);
+
+        expect(await createScheduler().tick()).toEqual({ processed: 0, skipped: 0, failed: 0 });
+
+        expect(await store.getById(automationId)).toMatchObject({
+          enabled: 1,
+          consecutive_failures: 0,
+        });
+        expect(await store.listInvocations(automationId, { limit: 10, offset: 0 })).toEqual(
+          history
+        );
+        expect(await store.getInvocationById(denied.id)).toMatchObject({
+          failure_counted_at: null,
+        });
+      });
+
+      it("does not reset a streak with only unauthorized and skipped history", async () => {
+        const store = new AutomationStore(env.DB);
+        const now = Date.now();
+        await seedRun(
+          makeRunRow(automationId, {
+            status: "skipped",
+            skip_reason: "concurrent_run_active",
+            created_at: now - 60_000,
+            completed_at: now - 59_000,
+          })
+        );
+        expect(
+          await new GitHubAutomationStore(env.DB).recordGitHubGrantDenied(automationId, deniedEvent)
+        ).toBe(true);
+
+        expect(await store.getStaleFailureResetCandidates(now - 120_000, 10)).toEqual([]);
+        expect(await createScheduler().tick()).toEqual({ processed: 0, skipped: 0, failed: 0 });
+        expect(await store.getById(automationId)).toMatchObject({
+          enabled: 1,
+          consecutive_failures: 2,
+        });
+      });
+
+      it.each([
+        ["starting", false],
+        ["starting", true],
+        ["running", false],
+        ["running", true],
+        ["failed", false],
+        ["failed", true],
+      ] as const)(
+        "keeps a newer %s invocation as a reset barrier (unauthorized sibling: %s)",
+        async (status, unauthorizedSibling) => {
+          const store = new AutomationStore(env.DB);
+          const now = Date.now();
+          await seedRun(
+            makeRunRow(automationId, {
+              status: "completed",
+              created_at: now - 60_000,
+              completed_at: now - 59_000,
+            })
+          );
+          const barrier = makeRunRow(automationId, {
+            status,
+            created_at: now - 30_000,
+            started_at: status === "running" ? now - 30_000 : null,
+            execution_deadline_at: status === "running" ? now + 60_000 : null,
+            completed_at: status === "failed" ? now - 29_000 : null,
+            failure_reason: status === "failed" ? "seeded failure" : null,
+          });
+          await seedRun(barrier);
+          if (unauthorizedSibling) {
+            await seedRun(
+              makeRunRow(automationId, {
+                invocation_id: barrier.invocation_id,
+                status: "unauthorized",
+                failure_reason: "repo_not_granted",
+                created_at: now - 30_000,
+                completed_at: now - 29_000,
+              })
+            );
+          }
+          expect(
+            await new GitHubAutomationStore(env.DB).recordGitHubGrantDenied(
+              automationId,
+              deniedEvent
+            )
+          ).toBe(true);
+
+          expect(await store.getStaleFailureResetCandidates(now - 120_000, 10)).toEqual([
+            { automation_id: automationId, invocation_id: barrier.invocation_id },
+          ]);
+          expect(await createScheduler().tick()).toEqual({ processed: 0, skipped: 0, failed: 0 });
+          expect(await store.getById(automationId)).toMatchObject({
+            consecutive_failures: status === "failed" ? 3 : 2,
+            enabled: status === "failed" ? 0 : 1,
+          });
+          expect(await store.getRunById(automationId, barrier.id)).toMatchObject({ status });
+        }
+      );
     });
   });
 });

@@ -1,6 +1,12 @@
 {
-  "runtimeVersion": "v61-sandbox-sbin-path",
-  "generation": 61,
-  "minimumCompatibleGeneration": 60,
-  "minimumRebuildGeneration": 60
+  "runtimeVersion": "v79-persistent-model-prices",
+  "generation": 79,
+  "minimumCompatibleGeneration": 62,
+  "minimumPreservationGeneration": 71,
+  "minimumRebuildGeneration": 79,
+  "harnessMinimumGeneration": {
+    "claude": 76,
+    "opencode": 76,
+    "codex": 79
+  }
 }

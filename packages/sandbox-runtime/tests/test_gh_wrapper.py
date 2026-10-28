@@ -10,22 +10,26 @@ through to whatever was already in the env.
 
 We rebuild the wrapper here with the real gh and the helper invocation
 pointed at fakes so the actual control flow runs under a real shell.
+The Codex regression instead runs the real helper against a synthetic fresh
+credential cache, replacing only the gh executable and Python interpreter path.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import shlex
 import subprocess
-from typing import TYPE_CHECKING
+import sys
+import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from sandbox_runtime import repository_sync
+from sandbox_runtime.harness.codex.env import clean_codex_env
 from sandbox_runtime.repository_sync import GH_WRAPPER_BODY, RepositorySynchronizer
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 # Fake "real gh": echoes the token env vars and argv so a test can see which
 # token (if any) the wrapper handed to gh and confirm it never hit argv.
@@ -67,29 +71,77 @@ def _build_wrapper(tmp_path: Path, *, token_cmd_body: str) -> Path:
     return wrapper
 
 
-def _run(wrapper: Path, env_extra: dict[str, str]) -> str:
+def _run(
+    wrapper: Path, env_extra: dict[str, str], args: list[str] | None = None
+) -> subprocess.CompletedProcess[str]:
     env = {"PATH": os.environ["PATH"], **env_extra}
-    result = subprocess.run(
-        [str(wrapper), "api", "user"],
+    return subprocess.run(
+        [str(wrapper), *(args if args is not None else ["api", "user"])],
         capture_output=True,
         text=True,
         env=env,
-        check=True,
+        check=False,
     )
-    return result.stdout
 
 
 def test_exports_minted_token_as_gh_token(tmp_path: Path) -> None:
     wrapper = _build_wrapper(tmp_path, token_cmd_body=PRINTS_FRESH_TOKEN)
-    out = _run(wrapper, {"VCS_HOST": "github.com"})
+    out = _run(wrapper, {"VCS_HOST": "github.com"}).stdout
     assert "GH_TOKEN=ghs_fresh" in out
     assert "ARGS=api user" in out
+
+
+@pytest.mark.parametrize("session_id_field", ["sessionId", "session_id"])
+def test_codex_environment_supports_real_gh_credential_helper(
+    tmp_path: Path, session_id_field: str
+) -> None:
+    """Run the real helper with a synthetic fresh cache, without network or inline env fixes."""
+    cache_dir = tmp_path / "credentials"
+    cache_dir.mkdir()
+    (cache_dir / "scm-creds.json").write_text(
+        json.dumps(
+            {
+                "username": "x-access-token",
+                "password": "synthetic-cached-token",
+                "expires_at_epoch_ms": int((time.time() + 3600) * 1000),
+            }
+        )
+    )
+    real_gh = tmp_path / "real-gh"
+    real_gh.write_text(REAL_GH_DECISION)
+    real_gh.chmod(0o755)
+    assert REAL_GH_ANCHOR in GH_WRAPPER_BODY
+    assert HELPER_ANCHOR in GH_WRAPPER_BODY
+    wrapper = tmp_path / "gh"
+    wrapper.write_text(
+        GH_WRAPPER_BODY.replace(REAL_GH_ANCHOR, f'REAL_GH="{real_gh}"').replace(
+            HELPER_ANCHOR,
+            f"{shlex.quote(sys.executable)} -m sandbox_runtime.credentials.git_credential_helper gh-token",
+        )
+    )
+    wrapper.chmod(0o755)
+    env = clean_codex_env(
+        {
+            "PATH": os.environ["PATH"],
+            "PYTHONPATH": str(Path(repository_sync.__file__).parents[1]),
+            "CONTROL_PLANE_URL": "https://control-plane.example.invalid",
+            "SANDBOX_AUTH_TOKEN": "synthetic-sandbox-token",
+            "SESSION_CONFIG": json.dumps({session_id_field: "session-1"}),
+            "OI_SCM_CRED_CACHE_DIR": str(cache_dir),
+        },
+        tmp_path / "codex-home",
+    )
+    result = _run(wrapper, env)
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert "GH_TOKEN=synthetic-cached-token" in result.stdout
+    assert "ARGS=api user" in result.stdout
 
 
 def test_minted_token_never_reaches_argv(tmp_path: Path) -> None:
     """P1-2: the token must reach gh via the environment, never via argv."""
     wrapper = _build_wrapper(tmp_path, token_cmd_body=PRINTS_FRESH_TOKEN)
-    out = _run(wrapper, {"VCS_HOST": "github.com"})
+    out = _run(wrapper, {"VCS_HOST": "github.com"}).stdout
     args_line = next(line for line in out.splitlines() if line.startswith("ARGS="))
     assert "ghs_fresh" not in args_line
 
@@ -97,7 +149,7 @@ def test_minted_token_never_reaches_argv(tmp_path: Path) -> None:
 def test_no_export_when_helper_prints_nothing(tmp_path: Path) -> None:
     """Helper declined to mint → gh runs with the pre-existing env untouched."""
     wrapper = _build_wrapper(tmp_path, token_cmd_body=PRINTS_NOTHING)
-    out = _run(wrapper, {"VCS_HOST": "github.com", "GITHUB_TOKEN": "user_token"})
+    out = _run(wrapper, {"VCS_HOST": "github.com", "GITHUB_TOKEN": "user_token"}).stdout
     assert "GH_TOKEN=\n" in out
     assert "GITHUB_TOKEN=user_token" in out
 
@@ -105,9 +157,49 @@ def test_no_export_when_helper_prints_nothing(tmp_path: Path) -> None:
 def test_falls_through_when_helper_fails(tmp_path: Path) -> None:
     """A nonzero helper (swallowed by `|| true`) leaves the existing env for gh."""
     wrapper = _build_wrapper(tmp_path, token_cmd_body=EXITS_NONZERO)
-    out = _run(wrapper, {"VCS_HOST": "github.com", "GITHUB_TOKEN": "stale_token"})
+    out = _run(wrapper, {"VCS_HOST": "github.com", "GITHUB_TOKEN": "stale_token"}).stdout
     assert "GH_TOKEN=\n" in out
     assert "GITHUB_TOKEN=stale_token" in out
+
+
+def test_blocks_pr_create(tmp_path: Path) -> None:
+    wrapper = _build_wrapper(tmp_path, token_cmd_body=PRINTS_NOTHING)
+    result = _run(wrapper, {"VCS_HOST": "github.com"}, ["pr", "create", "--title", "x"])
+    assert result.returncode == 1
+    assert "gh pr create" in result.stderr
+    assert "create-pull-request" in result.stderr
+
+
+def test_blocks_pr_new_alias(tmp_path: Path) -> None:
+    """`gh pr new` is an alias for `gh pr create` and must be blocked the same way."""
+    wrapper = _build_wrapper(tmp_path, token_cmd_body=PRINTS_NOTHING)
+    result = _run(wrapper, {"VCS_HOST": "github.com"}, ["pr", "new", "--title", "x"])
+    assert result.returncode == 1
+    assert "gh pr new" in result.stderr
+    assert "create-pull-request" in result.stderr
+
+
+def test_blocks_pr_create_with_repo_flag_value(tmp_path: Path) -> None:
+    """--repo's value must not be miscounted as a positional, shifting "create" out."""
+    wrapper = _build_wrapper(tmp_path, token_cmd_body=PRINTS_NOTHING)
+    result = _run(wrapper, {"VCS_HOST": "github.com"}, ["pr", "--repo", "octo/repo", "create"])
+    assert result.returncode == 1
+    assert "gh pr create" in result.stderr
+
+
+def test_blocks_pr_create_with_repo_flag_before_pr(tmp_path: Path) -> None:
+    """-R/--repo can precede "pr" entirely; its value must still be skipped."""
+    wrapper = _build_wrapper(tmp_path, token_cmd_body=PRINTS_NOTHING)
+    result = _run(wrapper, {"VCS_HOST": "github.com"}, ["-R", "octo/repo", "pr", "create"])
+    assert result.returncode == 1
+    assert "gh pr create" in result.stderr
+
+
+def test_allows_other_pr_subcommands(tmp_path: Path) -> None:
+    wrapper = _build_wrapper(tmp_path, token_cmd_body=PRINTS_NOTHING)
+    result = _run(wrapper, {"VCS_HOST": "github.com"}, ["pr", "list"])
+    assert result.returncode == 0
+    assert "ARGS=pr list" in result.stdout
 
 
 def test_runtime_installs_canonical_wrapper(

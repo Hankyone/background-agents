@@ -1,90 +1,59 @@
 "use client";
 
-import { useState } from "react";
-import { mutate } from "swr";
 import { toast } from "sonner";
-import { MODEL_OPTIONS, DEFAULT_ENABLED_MODELS } from "@open-inspect/shared/models";
-import { MODEL_PREFERENCES_KEY, useEnabledModels } from "@/hooks/use-enabled-models";
+import { MODEL_OPTIONS, type ValidModel } from "@open-inspect/shared/models";
+import { useEnabledModels } from "@/hooks/use-enabled-models";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import { browserApiFetch } from "@/lib/browser-api-fetch";
 
 export function ModelsSettings() {
-  const { enabledModels: storedEnabledModels, loading } = useEnabledModels();
-  const [enabledModels, setEnabledModels] = useState<Set<string>>(
-    () => new Set(DEFAULT_ENABLED_MODELS)
-  );
-  const [initialized, setInitialized] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [dirty, setDirty] = useState(false);
+  const {
+    enabledModels: storedEnabledModels,
+    loading,
+    error,
+    saving,
+    updateModels,
+  } = useEnabledModels();
+  const enabledModels = new Set(storedEnabledModels);
 
-  // Sync SWR data into local state once on initial load
-  if (!loading && !initialized) {
-    setEnabledModels(new Set(storedEnabledModels));
-    setInitialized(true);
-  }
-
-  const toggleModel = (modelId: string) => {
-    setEnabledModels((prev) => {
-      const next = new Set(prev);
-      if (next.has(modelId)) {
-        if (next.size <= 1) return prev;
-        next.delete(modelId);
-      } else {
-        next.add(modelId);
-      }
-      return next;
-    });
-    setDirty(true);
+  const toggleModel = (modelId: ValidModel) => {
+    const enabled = !enabledModels.has(modelId);
+    if (!enabled && enabledModels.size <= 1) return;
+    void savePreferences([{ modelId, enabled }]);
   };
 
   const toggleCategory = (category: (typeof MODEL_OPTIONS)[number], enable: boolean) => {
-    setEnabledModels((prev) => {
-      const next = new Set(prev);
-      for (const model of category.models) {
-        if (enable) {
-          next.add(model.id);
-        } else {
-          next.delete(model.id);
-        }
+    const next = new Set(enabledModels);
+    for (const model of category.models) {
+      if (enable) {
+        next.add(model.id);
+      } else {
+        next.delete(model.id);
       }
-      if (next.size === 0) return prev;
-      return next;
-    });
-    setDirty(true);
+    }
+    if (next.size === 0) return;
+    void savePreferences(
+      category.models.map((model) => ({ modelId: model.id, enabled: next.has(model.id) }))
+    );
   };
 
-  const handleSave = async () => {
-    setSaving(true);
-
+  const savePreferences = async (changes: Parameters<typeof updateModels>[0]) => {
     try {
-      const res = await browserApiFetch("/api/model-preferences", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabledModels: Array.from(enabledModels) }),
-      });
-
-      if (res.ok) {
-        mutate(MODEL_PREFERENCES_KEY);
-        toast.success("Model preferences saved.");
-        setDirty(false);
-      } else {
-        const data = await res.json();
-        toast.error(data.error || "Failed to save preferences");
-      }
-    } catch {
-      toast.error("Failed to save preferences");
-    } finally {
-      setSaving(false);
+      await updateModels(changes);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to save preferences");
     }
   };
 
   if (loading) {
+    return <ModelsSettingsSkeleton />;
+  }
+
+  if (error) {
     return (
-      <div className="flex items-center gap-2 text-muted-foreground">
-        <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
-        Loading model preferences...
-      </div>
+      <p role="alert" className="text-sm text-destructive">
+        Unable to load model preferences. Please reload to try again.
+      </p>
     );
   }
 
@@ -92,7 +61,8 @@ export function ModelsSettings() {
     <div>
       <h2 className="text-xl font-semibold text-foreground mb-1">Enabled Models</h2>
       <p className="text-sm text-muted-foreground mb-6">
-        Choose which models appear in the model selector across the web UI and Slack bot.
+        Choose which models appear in the model selector across the web UI and Slack bot. Changes
+        are saved automatically.
       </p>
 
       <div className="space-y-6">
@@ -144,10 +114,46 @@ export function ModelsSettings() {
         })}
       </div>
 
-      <div className="mt-6">
-        <Button onClick={handleSave} disabled={saving || !dirty}>
-          {saving ? "Saving..." : "Save"}
-        </Button>
+      <p role="status" className="mt-6 text-sm text-muted-foreground">
+        {saving ? "Saving..." : ""}
+      </p>
+    </div>
+  );
+}
+
+/** Mirrors the loaded list; the model catalog is static, so every group and row is known. */
+function ModelsSettingsSkeleton() {
+  return (
+    <div
+      role="status"
+      aria-label="Loading model preferences"
+      className="animate-pulse motion-reduce:animate-none"
+    >
+      <div className="h-5 w-40 bg-muted rounded mt-1 mb-2" />
+      <div className="mb-6 py-0.5">
+        <div className="h-4 w-11/12 bg-muted rounded" />
+      </div>
+
+      <div className="space-y-6">
+        {MODEL_OPTIONS.map((group) => (
+          <div key={group.category}>
+            <div className="flex items-center justify-between mb-3">
+              <div className="h-4 w-28 bg-muted rounded" />
+              <div className="h-6 w-16 bg-muted rounded" />
+            </div>
+            <div className="space-y-2">
+              {group.models.map((model) => (
+                <div
+                  key={model.id}
+                  className="flex items-center justify-between px-4 py-3 border border-border"
+                >
+                  <div className="h-4 w-64 max-w-[70%] bg-muted rounded my-1" />
+                  <div className="h-5 w-9 shrink-0 bg-muted rounded-full" />
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );

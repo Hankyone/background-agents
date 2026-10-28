@@ -10,7 +10,9 @@ import {
 import { generateInternalToken } from "@open-inspect/shared/auth";
 import { GlobalSecretsStore } from "../../src/db/global-secrets";
 import { UserStore } from "../../src/db/user-store";
+import { REPOS_CACHE_KEY, reposCacheIdentity } from "../../src/routes/repos";
 import { cleanD1Tables } from "./cleanup";
+import { enrollSlackActor, initNamedSession, seedSandboxAuth } from "./helpers";
 
 const SERVICE_SECRET: Record<ServiceName, string> = {
   web: "test-service-secret-web",
@@ -70,15 +72,17 @@ describe("sig1 service-credential authentication", () => {
     ["slack-bot", "/integration-settings/slack", 200],
     ["slack-bot", "/integration-settings/slack/watched-channels", 200],
     ["slack-bot", "/model-preferences", 200],
+    ["github-bot", "/model-preferences", 200],
   ] as const)(
     "allows actorless %s metadata/config read %s",
     async (service, path, expectedStatus) => {
       if (path === "/repos") {
         await env.REPOS_CACHE.put(
-          "repos:list:v2",
+          REPOS_CACHE_KEY,
           JSON.stringify({
             repos: [],
             cachedAt: new Date().toISOString(),
+            scmIdentity: await reposCacheIdentity(env),
             freshUntil: Date.now() + 60_000,
           })
         );
@@ -139,7 +143,44 @@ describe("sig1 service-credential authentication", () => {
     expect(response.status).toBe(401);
   });
 
+  it("does not downgrade a failed service credential to a valid sandbox bearer", async () => {
+    const sessionName = `sig1-no-sandbox-downgrade-${crypto.randomUUID()}`;
+    const sandboxToken = `sandbox-${crypto.randomUUID()}`;
+    const { stub } = await initNamedSession(sessionName);
+    await seedSandboxAuth(stub, {
+      authToken: sandboxToken,
+      sandboxId: "sandbox-no-downgrade",
+    });
+    const url = `https://test.local/sessions/${sessionName}/tunnel-urls`;
+
+    const sandbox = await SELF.fetch(url, {
+      headers: { Authorization: `Bearer ${sandboxToken}` },
+    });
+    expect(sandbox.status).toBe(200);
+
+    const failedService = await signedFetch({
+      service: "linear-bot",
+      method: "GET",
+      url,
+      mutateHeaders(headers) {
+        headers.Authorization = `Bearer ${sandboxToken}`;
+        headers[SERVICE_SIGNATURE_HEADER] = headers[SERVICE_SIGNATURE_HEADER].replace(/.$/, (c) =>
+          c === "0" ? "1" : "0"
+        );
+      },
+    });
+    expect(failedService.status).toBe(401);
+  });
+
   it("accepts a signed request with a query string regardless of param order", async () => {
+    await new UserStore(env.DB).resolveOrCreateUser(
+      {
+        provider: "linear",
+        providerUserId: "query-order",
+        providerEmail: "query-order@linear.test",
+      },
+      () => {}
+    );
     const createdBy = "a".repeat(32);
     const signedUrl = `https://test.local/sessions?limit=5&createdBy=${createdBy}`;
     const headers = await buildServiceAuthHeaders({
@@ -262,6 +303,8 @@ describe("sig1 service-credential authentication", () => {
   });
 
   it("persists bot creator attribution and permits cross-actor collaboration", async () => {
+    await enrollSlackActor("slack:U0001");
+    await enrollSlackActor("slack:U0002");
     const created = await signedFetch({
       service: "slack-bot",
       method: "POST",
@@ -294,6 +337,26 @@ describe("sig1 service-credential authentication", () => {
       })
     );
 
+    const ownList = await signedFetch({
+      service: "slack-bot",
+      method: "GET",
+      url: "https://test.local/sessions?createdBy=me",
+      actor: "slack:U0001",
+    });
+    expect(ownList.status).toBe(200);
+    await expect(ownList.json()).resolves.toMatchObject({
+      sessions: [expect.objectContaining({ id: createdBody.sessionId, userId: identity!.userId })],
+    });
+
+    const otherActorList = await signedFetch({
+      service: "slack-bot",
+      method: "GET",
+      url: "https://test.local/sessions?createdBy=me",
+      actor: "slack:U0002",
+    });
+    expect(otherActorList.status).toBe(200);
+    await expect(otherActorList.json()).resolves.toMatchObject({ sessions: [] });
+
     const collaboratorList = await signedFetch({
       service: "slack-bot",
       method: "GET",
@@ -308,7 +371,7 @@ describe("sig1 service-credential authentication", () => {
     const collaborator = await signedFetch({
       service: "slack-bot",
       method: "POST",
-      url: `https://test.local/sessions/${createdBody.sessionId}/prompt`,
+      url: `https://test.local/sessions/${createdBody.sessionId}/prompt?channel=slack:C1`,
       actor: "slack:U0002",
       body: JSON.stringify({ content: "Cross-session prompt" }),
     });
@@ -334,6 +397,7 @@ describe("sig1 service-credential authentication", () => {
       actor: "linear:U-CREATOR",
       body: JSON.stringify({
         title: "Linear callback session",
+        actorEmail: "creator@linear.test",
         model: "anthropic/claude-haiku-4-5",
       }),
     });
@@ -375,6 +439,7 @@ describe("sig1 service-credential authentication", () => {
   });
 
   it("denies suspended canonical bot actors and actorless broad requests", async () => {
+    await enrollSlackActor("slack:U-SUSPENDED");
     await signedFetch({
       service: "slack-bot",
       method: "POST",
@@ -406,6 +471,7 @@ describe("sig1 service-credential authentication", () => {
   });
 
   it("intersects an actor role with the service ceiling", async () => {
+    await enrollSlackActor("slack:U-VIEWER");
     await signedFetch({
       service: "slack-bot",
       method: "GET",
@@ -754,11 +820,14 @@ describe("sig1 service-credential authentication", () => {
 
   it("does not relink a known actor when a session body carries a conflicting email", async () => {
     const users = new UserStore(env.DB);
-    const knownActor = await users.resolveOrCreateUser({
-      provider: "slack",
-      providerUserId: "U-KNOWN-IMMUTABLE",
-      displayName: "Known Actor",
-    });
+    const knownActor = await users.resolveOrCreateUser(
+      {
+        provider: "slack",
+        providerUserId: "U-KNOWN-IMMUTABLE",
+        displayName: "Known Actor",
+      },
+      () => {}
+    );
     const conflictingViewer = await users.createUser({
       displayName: "Conflicting Viewer",
       email: "conflicting-viewer@corp.test",

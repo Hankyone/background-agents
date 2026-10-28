@@ -59,8 +59,8 @@ variable "modal_token_id" {
   default     = ""
 
   validation {
-    condition     = var.sandbox_provider != "modal" || length(var.modal_token_id) > 0
-    error_message = "modal_token_id must be set when sandbox_provider = 'modal'."
+    condition     = !contains(["modal", "modal-vm"], var.sandbox_provider) || length(var.modal_token_id) > 0
+    error_message = "modal_token_id must be set when sandbox_provider is 'modal' or 'modal-vm'."
   }
 }
 
@@ -71,8 +71,8 @@ variable "modal_token_secret" {
   default     = ""
 
   validation {
-    condition     = var.sandbox_provider != "modal" || length(var.modal_token_secret) > 0
-    error_message = "modal_token_secret must be set when sandbox_provider = 'modal'."
+    condition     = !contains(["modal", "modal-vm"], var.sandbox_provider) || length(var.modal_token_secret) > 0
+    error_message = "modal_token_secret must be set when sandbox_provider is 'modal' or 'modal-vm'."
   }
 }
 
@@ -82,8 +82,8 @@ variable "modal_workspace" {
   default     = ""
 
   validation {
-    condition     = var.sandbox_provider != "modal" || length(var.modal_workspace) > 0
-    error_message = "modal_workspace must be set when sandbox_provider = 'modal'."
+    condition     = !contains(["modal", "modal-vm"], var.sandbox_provider) || length(var.modal_workspace) > 0
+    error_message = "modal_workspace must be set when sandbox_provider is 'modal' or 'modal-vm'."
   }
 }
 
@@ -93,8 +93,8 @@ variable "modal_environment" {
   default     = "main"
 
   validation {
-    condition     = var.sandbox_provider != "modal" || (length(trimspace(var.modal_environment)) > 0 && can(regex("^[^:/\\\\]+$", var.modal_environment)))
-    error_message = "modal_environment must be set and must not contain colons, slashes, or backslashes when sandbox_provider = 'modal'."
+    condition     = !contains(["modal", "modal-vm"], var.sandbox_provider) || (length(trimspace(var.modal_environment)) > 0 && can(regex("^[^:/\\\\]+$", var.modal_environment)))
+    error_message = "modal_environment must be set and must not contain colons, slashes, or backslashes when sandbox_provider is 'modal' or 'modal-vm'."
   }
 }
 
@@ -104,8 +104,8 @@ variable "modal_environment_web_suffix" {
   default     = ""
 
   validation {
-    condition     = var.sandbox_provider != "modal" || can(regex("^$|^[a-z0-9-]+$", var.modal_environment_web_suffix))
-    error_message = "modal_environment_web_suffix must be empty or contain only lowercase letters, digits, and dashes when sandbox_provider = 'modal'."
+    condition     = !contains(["modal", "modal-vm"], var.sandbox_provider) || can(regex("^$|^[a-z0-9-]+$", var.modal_environment_web_suffix))
+    error_message = "modal_environment_web_suffix must be empty or contain only lowercase letters, digits, and dashes when sandbox_provider is 'modal' or 'modal-vm'."
   }
 }
 
@@ -201,6 +201,28 @@ variable "github_bot_username" {
   default     = ""
 }
 
+variable "github_bot_default_model" {
+  description = "Model the GitHub bot starts a session with when the repository's integration config does not pin one. A canonical \"provider/model\" id, or a bare \"claude-\"/\"gpt-\" id the bots normalize into that provider's namespace."
+  type        = string
+  default     = "anthropic/claude-haiku-4-5"
+  nullable    = false
+
+  # Each side of the id must name something, and name it without whitespace:
+  # "anthropic/", "claude-" and "/x" all pass a naive prefix or slash check
+  # while naming no model, and "anthropic/ claude-haiku-4-5" survives a
+  # trimspace check with the space still in the value. Either shape reaches the
+  # model provider verbatim. The same rule rejects a blank value, so an unset
+  # CI variable fails at plan time instead of deploying a bot that cannot start
+  # a session.
+  validation {
+    condition = can(regex(
+      "^(?:[^/[:space:]]+/[^/[:space:]]+|(?:claude-|gpt-)[^/[:space:]]+)$",
+      var.github_bot_default_model
+    ))
+    error_message = "github_bot_default_model must be a canonical \"provider/model\" id such as \"anthropic/claude-haiku-4-5\", or a bare \"claude-\"/\"gpt-\" id, naming a model with no whitespace on each side of any slash."
+  }
+}
+
 # =============================================================================
 # Slack App Credentials
 # =============================================================================
@@ -228,6 +250,24 @@ variable "slack_signing_secret" {
   type        = string
   sensitive   = true
   default     = ""
+}
+
+variable "slack_bot_default_model" {
+  description = "Model the Slack bot starts a session with when the requesting user has no saved model preference. A canonical \"provider/model\" id, or a bare \"claude-\"/\"gpt-\" id the bots normalize into that provider's namespace."
+  type        = string
+  default     = "claude-haiku-4-5"
+  nullable    = false
+
+  # See github_bot_default_model: a prefix or slash with nothing after it names
+  # no model, whitespace anywhere in the id reaches the provider verbatim, and a
+  # blank value must fail at plan time rather than deploy.
+  validation {
+    condition = can(regex(
+      "^(?:[^/[:space:]]+/[^/[:space:]]+|(?:claude-|gpt-)[^/[:space:]]+)$",
+      var.slack_bot_default_model
+    ))
+    error_message = "slack_bot_default_model must be a canonical \"provider/model\" id such as \"anthropic/claude-haiku-4-5\", or a bare \"claude-\"/\"gpt-\" id, naming a model with no whitespace on each side of any slash."
+  }
 }
 
 # =============================================================================
@@ -267,38 +307,73 @@ variable "linear_api_key" {
   sensitive   = true
 }
 
+variable "linear_bot_default_model" {
+  description = "Model the Linear bot starts a session with when neither the repository's integration config, the requesting user's preference, nor a model label selects one. A canonical \"provider/model\" id, or a bare \"claude-\"/\"gpt-\" id the bots normalize into that provider's namespace."
+  type        = string
+  default     = "claude-sonnet-4-6"
+  nullable    = false
+
+  # See github_bot_default_model: a prefix or slash with nothing after it names
+  # no model, whitespace anywhere in the id reaches the provider verbatim, and a
+  # blank value must fail at plan time rather than deploy.
+  validation {
+    condition = can(regex(
+      "^(?:[^/[:space:]]+/[^/[:space:]]+|(?:claude-|gpt-)[^/[:space:]]+)$",
+      var.linear_bot_default_model
+    ))
+    error_message = "linear_bot_default_model must be a canonical \"provider/model\" id such as \"anthropic/claude-haiku-4-5\", or a bare \"claude-\"/\"gpt-\" id, naming a model with no whitespace on each side of any slash."
+  }
+}
+
 # =============================================================================
 # API Keys
 # =============================================================================
 
 variable "anthropic_api_key" {
-  description = "Anthropic API key for Claude"
+  description = "Deployment-wide Anthropic API key injected into Modal session sandboxes. Daytona, E2B and Vercel read model keys only from the scoped secret store, as do Modal image builds. Also serves the Slack and Linear bot classifiers when classification_anthropic_api_key is blank. Optional: leave blank to supply model credentials as scoped secrets, which override this value on every provider."
   type        = string
   sensitive   = true
+  default     = ""
+  nullable    = false
+}
+
+variable "classification_anthropic_api_key" {
+  description = "Anthropic API key used specifically by the Slack and Linear bot classifiers; never injected into sandboxes. Falls back to anthropic_api_key when blank. Set this and leave anthropic_api_key blank to keep the classifier key out of sandboxes."
+  type        = string
+  sensitive   = true
+  default     = ""
   nullable    = false
 
+  # Sandboxes tolerate a blank key — they fall back to the secret store — but a
+  # deployed Anthropic classifier has no such fallback. CI renders an unset
+  # secret as an empty string, which would otherwise deploy a credential-less
+  # classifier that rejects every message.
   validation {
-    condition     = trimspace(var.anthropic_api_key) != ""
-    error_message = "anthropic_api_key must be non-blank."
+    condition = (
+      (var.enable_slack_bot == false && var.enable_linear_bot == false) ||
+      local.classifier_provider != "anthropic" ||
+      trimspace(var.classification_anthropic_api_key) != "" ||
+      trimspace(var.anthropic_api_key) != ""
+    )
+    error_message = "classification_anthropic_api_key or anthropic_api_key must be non-blank when the Slack or Linear bot is enabled and classification_model is an Anthropic model."
   }
 }
 
 variable "classification_model" {
-  description = "Model backing the Slack and Linear bots' target classifiers. An \"anthropic/\"-prefixed or bare \"claude-\" id is served by anthropic_api_key; an \"openai/\"-prefixed or bare \"gpt-\" id is served by classification_openai_api_key."
+  description = "Model backing the Slack and Linear bots' target classifiers. An \"anthropic/\"-prefixed or bare \"claude-\" id is served by classification_anthropic_api_key (falling back to anthropic_api_key); an \"openai/\"-prefixed or bare \"gpt-\" id by classification_openai_api_key; a \"bedrock/<aws-region>/<inference-profile-id>\" id by classification_bedrock_api_key, through Claude in Amazon Bedrock in that Region."
   type        = string
   default     = "claude-haiku-4-5"
   nullable    = false
 
-  # Each prefix must be followed by an actual model id: a bare "claude-" or
-  # "openai/" satisfies startswith but names no model, and would reach the bots
-  # as a value their resolver accepts and then sends to the provider verbatim.
+  # Reads the constant pattern table, not local.classifier_provider: a
+  # variable's validation that references a local derived from the same
+  # variable is a dependency cycle.
   validation {
     condition = anytrue([
-      for prefix in ["anthropic/", "claude-", "openai/", "gpt-"] :
-      startswith(var.classification_model, prefix) &&
-      trimspace(substr(var.classification_model, length(prefix), -1)) != ""
+      for pattern in values(local.classifier_model_patterns) :
+      can(regex(pattern, var.classification_model))
     ])
-    error_message = "classification_model must be an Anthropic id (\"anthropic/...\" or \"claude-...\") or an OpenAI id (\"openai/...\" or \"gpt-...\"), naming a model after the prefix."
+    error_message = "classification_model must be an Anthropic id (\"anthropic/...\" or \"claude-...\") or an OpenAI id (\"openai/...\" or \"gpt-...\") naming a model after the prefix, or a Bedrock id (\"bedrock/<aws-region>/<inference-profile-id>\", such as \"bedrock/us-east-1/us.anthropic.claude-haiku-4-5-20251001-v1:0\")."
   }
 }
 
@@ -315,10 +390,55 @@ variable "classification_openai_api_key" {
   validation {
     condition = (
       (var.enable_slack_bot == false && var.enable_linear_bot == false) ||
-      !(startswith(var.classification_model, "openai/") || startswith(var.classification_model, "gpt-")) ||
+      local.classifier_provider != "openai" ||
       trimspace(var.classification_openai_api_key) != ""
     )
     error_message = "classification_openai_api_key must be non-blank when the Slack or Linear bot is enabled and classification_model is an OpenAI model."
+  }
+}
+
+variable "classification_bedrock_api_key" {
+  description = "Amazon Bedrock API key used by the Slack and Linear bot classifiers when classification_model is a \"bedrock/<aws-region>/<inference-profile-id>\" id; never injected into sandboxes. For the key type and IAM permissions it needs, see \"Classify on Amazon Bedrock (Optional)\" in docs/GETTING_STARTED.md."
+  type        = string
+  sensitive   = true
+  default     = ""
+  nullable    = false
+
+  # Fail closed once a deployed classifier is pointed at Bedrock: CI renders an
+  # unset secret as an empty string, which would otherwise deploy a
+  # credential-less classifier that rejects every message.
+  validation {
+    condition = (
+      (var.enable_slack_bot == false && var.enable_linear_bot == false) ||
+      local.classifier_provider != "bedrock" ||
+      trimspace(var.classification_bedrock_api_key) != ""
+    )
+    error_message = "classification_bedrock_api_key must be non-blank when the Slack or Linear bot is enabled and classification_model is a Bedrock model."
+  }
+}
+
+variable "classification_reasoning_effort" {
+  description = "Reasoning effort the Slack and Linear bot classifiers request from an OpenAI classification_model, sent as reasoning_effort (for example \"low\"). Blank sends none, so OpenAI applies the model's default."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  # Only the OpenAI transport sends reasoning_effort; an Anthropic or Bedrock
+  # classifier would silently ignore the setting.
+  validation {
+    condition = (
+      var.classification_reasoning_effort == "" ||
+      local.classifier_provider == "openai"
+    )
+    error_message = "classification_reasoning_effort applies only to an OpenAI classification_model. Leave it blank for an Anthropic or Bedrock model."
+  }
+
+  # Supported efforts differ by model, so OpenAI validates the value itself. A
+  # padded or mis-cased value would still reach it verbatim and fail every
+  # classification with HTTP 400, so reject anything but a lowercase word.
+  validation {
+    condition     = var.classification_reasoning_effort == "" || can(regex("^[a-z]+$", var.classification_reasoning_effort))
+    error_message = "classification_reasoning_effort must be blank or a lowercase OpenAI reasoning effort such as \"low\", with no surrounding whitespace."
   }
 }
 
@@ -361,8 +481,8 @@ variable "modal_api_secret" {
   default     = ""
 
   validation {
-    condition     = var.sandbox_provider != "modal" || length(var.modal_api_secret) > 0
-    error_message = "modal_api_secret must be set when sandbox_provider = 'modal'."
+    condition     = !contains(["modal", "modal-vm"], var.sandbox_provider) || length(var.modal_api_secret) > 0
+    error_message = "modal_api_secret must be set when sandbox_provider is 'modal' or 'modal-vm'."
   }
 }
 
@@ -374,6 +494,14 @@ variable "daytona_api_url" {
   validation {
     condition     = var.sandbox_provider != "daytona" || length(var.daytona_api_url) > 0
     error_message = "daytona_api_url must be set when sandbox_provider = 'daytona'."
+  }
+
+  # Daytona credentials outlive the backend that used them: the control plane
+  # keeps reclaiming sandboxes and snapshots after a provider switch, and it
+  # refuses to build a Daytona client unless both the URL and the key are set.
+  validation {
+    condition     = trimspace(var.daytona_api_key) == "" || length(trimspace(var.daytona_api_url)) > 0
+    error_message = "daytona_api_url must be set whenever daytona_api_key is set, so the control plane can still reclaim existing Daytona sandboxes after switching sandbox_provider."
   }
 }
 
@@ -390,7 +518,7 @@ variable "daytona_api_key" {
 }
 
 variable "daytona_base_snapshot" {
-  description = "Named Daytona snapshot used for fresh sandbox creation"
+  description = "Name prefix for the Terraform-managed Daytona base snapshot"
   type        = string
   default     = ""
 
@@ -400,39 +528,33 @@ variable "daytona_base_snapshot" {
   }
 }
 
+variable "daytona_base_snapshot_memory_gib" {
+  description = "Memory in GiB reserved by sandboxes created from the Daytona base snapshot"
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.daytona_base_snapshot_memory_gib >= 1 && var.daytona_base_snapshot_memory_gib == floor(var.daytona_base_snapshot_memory_gib)
+    error_message = "daytona_base_snapshot_memory_gib must be a positive integer."
+  }
+}
+
 variable "daytona_target" {
   description = "Optional Daytona target name"
   type        = string
   default     = ""
 }
 
-variable "opencomputer_api_url" {
-  description = "Base URL for the OpenComputer REST API (e.g. https://api.opencomputer.dev)"
+variable "daytona_toolbox_api_url" {
+  description = "Optional explicit Daytona toolbox proxy base URL. Leave empty to use the proxy each sandbox reports."
   type        = string
   default     = ""
-
-  validation {
-    condition     = var.sandbox_provider != "opencomputer" || length(trimspace(var.opencomputer_api_url)) > 0
-    error_message = "opencomputer_api_url must be set when sandbox_provider = 'opencomputer'."
-  }
 }
 
-variable "opencomputer_api_key" {
-  description = "API key for OpenComputer REST API (X-API-Key auth)"
-  type        = string
-  sensitive   = true
-  default     = ""
-
-  validation {
-    condition     = var.sandbox_provider != "opencomputer" || length(trimspace(var.opencomputer_api_key)) > 0
-    error_message = "opencomputer_api_key must be set when sandbox_provider = 'opencomputer'."
-  }
-}
-
-variable "opencomputer_template" {
-  description = "Optional manual OpenComputer template/snapshot name to pin. When empty, Terraform builds and manages the base snapshot from the runtime source (like the Vercel and Modal base images)."
-  type        = string
-  default     = ""
+variable "daytona_prebuilds_enabled" {
+  description = "Admit new Daytona image builds and let fresh sessions boot from one. Off by default: callbacks, finalization, status and cleanup keep working while it is, so closing it is the rollback control."
+  type        = bool
+  default     = false
 }
 
 variable "vercel_sandbox_token" {
@@ -545,6 +667,60 @@ variable "e2b_template_memory_mb" {
   default     = 4096
 }
 
+# -----------------------------------------------------------------------------
+# Boat (only required when sandbox_provider = "boat")
+# -----------------------------------------------------------------------------
+
+variable "boat_api_key" {
+  description = "Boat REST API key — runtime (control-plane → Boat API + sandbox access password HMAC) and snapshot build"
+  type        = string
+  sensitive   = true
+  default     = ""
+
+  validation {
+    condition     = var.sandbox_provider != "boat" || length(var.boat_api_key) > 0
+    error_message = "boat_api_key must be set when sandbox_provider = 'boat'."
+  }
+}
+
+variable "boat_api_url" {
+  description = "Boat REST API base URL"
+  type        = string
+  default     = "https://boat.dev/api/v1"
+}
+
+variable "boat_base_snapshot" {
+  description = "Prefix of the Boat base snapshots built by Terraform. Older bases under this prefix are pruned after Worker deployment, keeping the deployed base and the actually replaced base confirmed by Cloudflare deployment history. Use a unique prefix per deployment sharing a Boat account or organization wallet."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = var.sandbox_provider != "boat" || (
+      can(regex("^[a-z0-9][a-z0-9-]{0,45}$", var.boat_base_snapshot)) &&
+      var.boat_base_snapshot != "oi-img" &&
+      !startswith(var.boat_base_snapshot, "oi-img-")
+    )
+    error_message = "boat_base_snapshot must be 1-46 lowercase letters, digits or dashes, starting with a letter or digit, when sandbox_provider = 'boat'. It must not be 'oi-img' or start with 'oi-img-', which is reserved for control-plane prebuilt snapshots."
+  }
+}
+
+variable "boat_org" {
+  description = "Optional Boat organization sandboxes and the saved snapshot are billed to; empty uses the account's active wallet"
+  type        = string
+  default     = ""
+}
+
+variable "boat_sandbox_type" {
+  description = "Boat machine size for sessions that request no CPU or memory: 'small', 'default', 'large', or 'xlarge'. A request picks the smallest size that fits it."
+  type        = string
+  default     = "default"
+
+  validation {
+    condition     = var.sandbox_provider != "boat" || contains(["small", "default", "large", "xlarge"], var.boat_sandbox_type)
+    error_message = "boat_sandbox_type must be 'small', 'default', 'large', or 'xlarge' when sandbox_provider = 'boat'."
+  }
+}
+
 variable "nextauth_secret" {
   description = "Browser authentication secret used by the control plane (legacy Terraform input name; generate with: openssl rand -base64 32)"
   type        = string
@@ -561,20 +737,68 @@ variable "nextauth_secret" {
 # =============================================================================
 
 variable "sandbox_provider" {
-  description = "Sandbox backend for session execution: 'modal', 'daytona', 'vercel', 'opencomputer', or 'e2b'"
+  description = "Sandbox backend for session execution: 'modal', 'modal-vm', 'daytona', 'vercel', 'e2b', or 'boat'"
   type        = string
   default     = "modal"
 
   validation {
-    condition     = contains(["modal", "daytona", "vercel", "opencomputer", "e2b"], var.sandbox_provider)
-    error_message = "sandbox_provider must be 'modal', 'daytona', 'vercel', 'opencomputer', or 'e2b'."
+    condition     = contains(["modal", "modal-vm", "daytona", "vercel", "e2b", "boat"], var.sandbox_provider)
+    error_message = "sandbox_provider must be 'modal', 'modal-vm', 'daytona', 'vercel', 'e2b', or 'boat'."
+  }
+}
+
+variable "session_do_location_hint" {
+  description = "Best-effort Cloudflare location hint for new session Durable Objects; empty preserves automatic placement. Existing objects do not move."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = contains(["", "wnam", "enam", "sam", "weur", "eeur", "apac", "apac-ne", "apac-se", "oc", "afr", "me"], var.session_do_location_hint)
+    error_message = "session_do_location_hint must be empty or one of wnam, enam, sam, weur, eeur, apac, apac-ne, apac-se, oc, afr, me."
   }
 }
 
 variable "sandbox_inactivity_timeout_ms" {
-  description = "Milliseconds of sandbox inactivity before OpenInspect snapshots and stops the sandbox when no clients are connected."
+  description = "Regular sandbox inactivity timeout in milliseconds before OpenInspect preserves and stops the sandbox when no session-page WebSocket clients are connected."
   type        = number
   default     = 600000
+}
+
+variable "sandbox_unattended_inactivity_timeout_ms" {
+  description = "Sandbox inactivity timeout in milliseconds for automation, github-bot, and agent sessions without session-page WebSocket clients. The effective timeout is the minimum of this and sandbox_inactivity_timeout_ms."
+  type        = number
+  default     = 120000
+
+  validation {
+    condition = (
+      var.sandbox_unattended_inactivity_timeout_ms >= 60000 &&
+      var.sandbox_unattended_inactivity_timeout_ms <= 9007199254740991 &&
+      floor(var.sandbox_unattended_inactivity_timeout_ms) == var.sandbox_unattended_inactivity_timeout_ms
+    )
+    error_message = "sandbox_unattended_inactivity_timeout_ms must be a whole number between 60000 and 9007199254740991 ms, matching the control plane's safe-integer range."
+  }
+}
+
+variable "teams_enforcement" {
+  description = "Session team authorization mode; private visibility applies in every mode."
+  type        = string
+  default     = "shadow"
+
+  validation {
+    condition     = contains(["off", "shadow", "on"], var.teams_enforcement)
+    error_message = "teams_enforcement must be 'off', 'shadow', or 'on'."
+  }
+}
+
+variable "sandbox_boot_timeout_ms" {
+  description = "Milliseconds a sandbox whose bridge has connected may keep booting (clone, setup.sh, start.sh, agent start) before OpenInspect fails it and the prompt it was for."
+  type        = number
+  default     = 1800000
+
+  validation {
+    condition     = var.sandbox_boot_timeout_ms > 240000
+    error_message = "sandbox_boot_timeout_ms must exceed the 240000 ms connect watchdog."
+  }
 }
 
 variable "web_platform" {
@@ -585,6 +809,17 @@ variable "web_platform" {
   validation {
     condition     = contains(["vercel", "cloudflare"], var.web_platform)
     error_message = "web_platform must be 'vercel' or 'cloudflare'."
+  }
+}
+
+variable "web_serverless_region" {
+  description = "Vercel function region for the web project only; requires a web redeploy after apply. Unused when web_platform is cloudflare."
+  type        = string
+  default     = "iad1"
+
+  validation {
+    condition     = can(regex("^[a-z]{3}[0-9]$", var.web_serverless_region))
+    error_message = "web_serverless_region must be a Vercel region ID: three lowercase letters followed by one digit."
   }
 }
 
@@ -658,7 +893,7 @@ variable "r2_media_location" {
 }
 
 variable "r2_media_bucket_name" {
-  description = "Override the R2 media bucket name. Leave empty to use the default 'open-inspect-media-<deployment_name>'. Set this when the bucket must be pre-created out-of-band (e.g. when the Terraform credentials cannot create R2 buckets)."
+  description = "Name of the R2 media bucket Terraform creates and manages. Leave empty to use the default 'open-inspect-media-<deployment_name>'. Changing a managed bucket's name plans replacement, not an in-place rename. Cloudflare rejects deletion while objects remain; Terraform does not empty the bucket. An existing bucket must be imported into cloudflare_r2_bucket.media before applying. If that address already tracks another bucket, follow the migration steps in terraform.tfvars.example to migrate objects and replace the state entry first."
   type        = string
   default     = ""
 }
@@ -697,4 +932,16 @@ variable "unsafe_allow_all_users" {
   description = "Bypass Terraform's access-control safety check and allow any authenticated user to sign in when all allowlists are empty. Set to true only for intentionally open deployments."
   type        = bool
   default     = false
+}
+
+variable "docs_site_enabled" {
+  description = "Provision the public documentation site's Vercel project (packages/docs). Requires vercel_api_token and vercel_team_id. Deployment stays manual: the project has no git integration, so only the Deploy Docs workflow publishes it."
+  type        = bool
+  default     = false
+}
+
+variable "docs_custom_domain" {
+  description = "Production hostname for the documentation site, e.g. 'docs.example.com'. Leave unset to serve the project's vercel.app URL only. Requires docs_site_enabled = true."
+  type        = string
+  default     = null
 }

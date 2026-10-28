@@ -4,7 +4,10 @@ on:
   push:
     branches: [main]
     paths:
+      - ".env.example"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/terraform.yml"
+      - ".nvmrc"
       - ".prettierignore"
       - ".prettierrc"
       - "eslint.config.js"
@@ -14,19 +17,36 @@ on:
       - "packages/control-plane/**"
       - "packages/github-bot/**"
       - "packages/linear-bot/**"
-      - "packages/opencomputer-infra/**"
       - "packages/sandbox-runtime/**"
+      - "packages/sandbox-images/**"
+      - "packages/vercel-infra/**"
       - "packages/shared/**"
       - "packages/slack-bot/**"
       - "packages/web/**"
       - "scripts/**"
       - "terraform/d1/migrations/**"
+      # Unit tests hold the Worker's cron triggers and queue consumers equal
+      # to what Terraform declares, so a Terraform-only change must run them.
+      - "terraform/environments/production/**"
       - "vitest.workspace.ts"
       - "!**/*.md"
+      # Keep README translation checks active for documentation-only changes.
+      - "README.md"
+      - "README.zh-CN.md"
+      - "packages/sandbox-runtime/src/**"
+      - "packages/sandbox-images/**"
+      # Re-included after the exclusion above, which later patterns override: a
+      # unit test holds this document's quick start to the required variables.
+      - "docs/CONTROL_PLANE_CONTAINER.md"
+      # Re-include docs content and its package README after the Markdown exclusion.
+      - "packages/docs/**"
   pull_request:
     branches: [main]
     paths:
+      - ".env.example"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/terraform.yml"
+      - ".nvmrc"
       - ".prettierignore"
       - ".prettierrc"
       - "eslint.config.js"
@@ -36,15 +56,29 @@ on:
       - "packages/control-plane/**"
       - "packages/github-bot/**"
       - "packages/linear-bot/**"
-      - "packages/opencomputer-infra/**"
       - "packages/sandbox-runtime/**"
+      - "packages/sandbox-images/**"
+      - "packages/vercel-infra/**"
       - "packages/shared/**"
       - "packages/slack-bot/**"
       - "packages/web/**"
       - "scripts/**"
       - "terraform/d1/migrations/**"
+      # Unit tests hold the Worker's cron triggers and queue consumers equal
+      # to what Terraform declares, so a Terraform-only change must run them.
+      - "terraform/environments/production/**"
       - "vitest.workspace.ts"
       - "!**/*.md"
+      # Keep README translation checks active for documentation-only changes.
+      - "README.md"
+      - "README.zh-CN.md"
+      - "packages/sandbox-runtime/src/**"
+      - "packages/sandbox-images/**"
+      # Re-included after the exclusion above, which later patterns override: a
+      # unit test holds this document's quick start to the required variables.
+      - "docs/CONTROL_PLANE_CONTAINER.md"
+      # Re-include docs content and its package README after the Markdown exclusion.
+      - "packages/docs/**"
 
 permissions:
   contents: read
@@ -64,14 +98,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          # Minimum supported release: node:sqlite is available without an
-          # additional flag and --experimental-transform-types is present.
-          node-version: "22.13.0"
+          # Minimum supported release, matching `engines` in package.json.
+          # Every other job runs the version in .nvmrc.
+          node-version: "24.0.0"
           cache: "npm"
 
       - name: Install dependencies
@@ -83,11 +119,32 @@ jobs:
       - name: Test complexity reporter
         run: npm run test:lint-complexity
 
+      - name: Check SQL portability
+        run: npm run lint:sql-portability
+
+      - name: Test SQL portability check
+        run: npm run test:lint-sql-portability
+
+      - name: Test AWS deploy rollback
+        run: npm run test:deploy-aws
+
       - name: Test Owner bootstrap CLI
         run: npm run test:rbac-bootstrap-owner
 
       - name: Test user merge CLI
         run: npm run test:user-merge-cli
+
+      - name: Test Cloudflare logs CLI
+        run: npm run test:cf-logs-cli
+
+      - name: Test Terraform workflow contract
+        run: npm run test:terraform-workflow-contract
+
+      - name: Test Node version workflow contract
+        run: npm run test:node-version-workflow-contract
+
+      - name: Check README translations
+        run: npm run test:readme-translations
 
       - name: Check Prettier formatting
         run: npm run format:check
@@ -101,12 +158,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
           cache: "npm"
 
       - name: Install dependencies
@@ -124,12 +183,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
           cache: "npm"
 
       - name: Install dependencies
@@ -141,6 +202,31 @@ jobs:
       - name: Build web package
         run: npm run build -w @open-inspect/web
 
+      - name: Verify Mermaid browser isolation
+        run: npm run test:mermaid-browser -w @open-inspect/web
+
+  build-docs:
+    name: Build (Docs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build docs package
+        run: npm run build -w @open-inspect/docs
+
   test-cp-unit:
     name: Test (control-plane unit)
     runs-on: ubuntu-latest
@@ -149,12 +235,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
           cache: "npm"
 
       - name: Install dependencies
@@ -166,6 +254,9 @@ jobs:
       - name: Run shared tests
         run: npm test -w @open-inspect/shared
 
+      # Runs the node:sqlite lane of the session-core conformance suite
+      # (test/conformance). The Durable Object lane of the same suite runs in
+      # test-cp-integration; a session repository or migration has to pass both.
       - name: Run control-plane unit tests
         run: npm test -w @open-inspect/control-plane
 
@@ -176,15 +267,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: ["1/2", "2/2"]
+        shard: ["1/3", "2/3", "3/3"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
           cache: "npm"
 
       - name: Install dependencies
@@ -193,6 +286,8 @@ jobs:
       - name: Build shared package
         run: npm run build -w @open-inspect/shared
 
+      # Runs the Durable Object lane of the session-core conformance suite.
+      # The node:sqlite lane of the same suite runs in test-cp-unit.
       - name: Run control-plane integration tests
         run: npm run test:integration -w @open-inspect/control-plane -- --shard=${{ matrix.shard }}
 
@@ -202,12 +297,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
           cache: "npm"
 
       - name: Install dependencies
@@ -219,18 +316,42 @@ jobs:
       - name: Run web tests
         run: npm test -w @open-inspect/web
 
+  test-docs:
+    name: Test (docs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run docs tests
+        run: npm test -w @open-inspect/docs
+
   test-bots:
     name: Test (bots)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version-file: .nvmrc
           cache: "npm"
 
       - name: Install dependencies

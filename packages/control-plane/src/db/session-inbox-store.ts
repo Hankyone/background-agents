@@ -1,34 +1,55 @@
-import type {
-  SessionInboxCategory,
-  SessionInboxItem,
-  SessionListItem,
+import {
+  SESSION_INBOX_CATEGORIES,
+  type SessionInboxCategory,
+  type SessionInboxSession,
 } from "@open-inspect/shared/types/session-inbox";
+import type { SessionVisibility } from "@open-inspect/shared/types/teams";
 import type { SessionStatus, SpawnSource } from "@open-inspect/shared/types/sessions";
+import { buildSessionListPredicates, type SessionListFilters } from "./session-list-predicates";
 import { attachSessionListMetadata } from "./session-list-metadata";
 import type { SessionInboxCursor } from "./session-inbox-cursor";
 import { readStateFromRow, unreadSql, type ViewerReadStateRow } from "./session-read-state";
+import { assertD1QueryParameterLimit } from "./query-limits";
 import type { SqlDatabase, SqlStatement } from "./sql-database";
 
 /** Viewer, filtering, and pagination inputs for an inbox query. */
-export interface ListSessionInboxOptions {
+export interface ListSessionInboxOptions extends Pick<
+  SessionListFilters,
+  "createdByUserIds" | "teamIds" | "ownerFilter" | "visibility" | "scope" | "readScope" | "mode"
+> {
   category: SessionInboxCategory;
-  createdByUserIds?: readonly string[];
   excludeAutomatedSessions?: boolean;
   viewerUserId: string;
   limit: number;
   cursor: SessionInboxCursor | null;
 }
 
+/** The viewer and filters that decide which sessions an inbox query covers. */
+export type InboxFilterOptions = Omit<ListSessionInboxOptions, "category" | "limit" | "cursor">;
+
 export interface ListSessionInboxResult {
-  items: SessionInboxItem[];
+  items: Array<{
+    rootSession: ScopedInboxSession;
+    descendantSessions: ScopedInboxSession[];
+  }>;
   hasMore: boolean;
   nextCursor: SessionInboxCursor | null;
 }
+
+/** Persisted ownership is used for server capabilities, then stripped from the wire projection. */
+export type ScopedInboxSession = SessionInboxSession & {
+  userId: string | null;
+  ownerTeamId: string | null;
+  visibility: SessionVisibility;
+};
 
 export type ListSessionInboxSnapshotResult = Record<SessionInboxCategory, ListSessionInboxResult>;
 
 interface InboxSessionRow extends ViewerReadStateRow {
   id: string;
+  user_id: string | null;
+  owner_team_id: string | null;
+  visibility: SessionVisibility;
   title: string | null;
   repo_owner: string | null;
   repo_name: string | null;
@@ -51,11 +72,12 @@ interface InboxPageData {
   nextCursor: SessionInboxCursor | null;
 }
 
-const INBOX_CATEGORIES: SessionInboxCategory[] = ["needs_attention", "in_progress", "finished"];
-
-function toListItem(row: InboxSessionRow): SessionListItem {
+function toListItem(row: InboxSessionRow): ScopedInboxSession {
   return {
     id: row.id,
+    userId: row.user_id,
+    ownerTeamId: row.owner_team_id,
+    visibility: row.visibility,
     title: row.title,
     repoOwner: row.repo_owner,
     repoName: row.repo_name,
@@ -94,7 +116,7 @@ export class SessionInboxStore {
   ): Promise<ListSessionInboxSnapshotResult> {
     const result = await this.bindInboxSnapshotQuery(options).all<InboxSessionRow>();
     const rows = result.results ?? [];
-    const pages = INBOX_CATEGORIES.map((category) =>
+    const pages = SESSION_INBOX_CATEGORIES.map((category) =>
       this.buildPageData(
         options.limit,
         rows.filter((row) => row.category === category)
@@ -106,7 +128,7 @@ export class SessionInboxStore {
     );
     const sessionsById = new Map(sessionsWithMetadata.map((session) => [session.id, session]));
     return Object.fromEntries(
-      INBOX_CATEGORIES.map((category, index) => [
+      SESSION_INBOX_CATEGORIES.map((category, index) => [
         category,
         this.assemblePage(pages[index], sessionsById),
       ])
@@ -116,6 +138,19 @@ export class SessionInboxStore {
   /** Select one ordered category page plus one extra root for cursor metadata. */
   private bindInboxQuery(options: ListSessionInboxOptions): SqlStatement {
     const { sql, params } = this.inboxCtes(options);
+    const binds = [
+      ...params,
+      options.category,
+      ...(options.cursor
+        ? [
+            options.cursor.latestUpdatedAt,
+            options.cursor.latestUpdatedAt,
+            options.cursor.rootSessionId,
+          ]
+        : []),
+      options.limit + 1,
+    ];
+    assertD1QueryParameterLimit(binds.length);
     const cursorCondition = options.cursor
       ? `AND (latest_updated_at < ? OR (latest_updated_at = ? AND effective_root_session_id < ?))`
       : "";
@@ -131,25 +166,16 @@ export class SessionInboxStore {
            LIMIT ?
          )
          SELECT effective_sessions.*, selected_roots.latest_updated_at, selected_roots.category
-         FROM selected_roots
-         JOIN effective_sessions USING (effective_root_session_id)
+         -- CROSS JOIN pins the join order: walk the viewer's sessions once and
+         -- probe the selected roots, instead of rescanning every session per root.
+         FROM effective_sessions
+         CROSS JOIN selected_roots USING (effective_root_session_id)
          ORDER BY selected_roots.latest_updated_at DESC,
                   selected_roots.effective_root_session_id DESC,
                   effective_sessions.updated_at DESC,
                   effective_sessions.id DESC`
       )
-      .bind(
-        ...params,
-        options.category,
-        ...(options.cursor
-          ? [
-              options.cursor.latestUpdatedAt,
-              options.cursor.latestUpdatedAt,
-              options.cursor.rootSessionId,
-            ]
-          : []),
-        options.limit + 1
-      );
+      .bind(...binds);
   }
 
   /** Select the first page of every category through one shared recursive traversal. */
@@ -157,6 +183,7 @@ export class SessionInboxStore {
     options: Omit<ListSessionInboxOptions, "category" | "cursor">
   ): SqlStatement {
     const { sql, params } = this.inboxCtes(options);
+    assertD1QueryParameterLimit(params.length + 1);
     return this.db
       .prepare(
         `${sql},
@@ -175,8 +202,10 @@ export class SessionInboxStore {
            WHERE category_rank <= ?
          )
          SELECT effective_sessions.*, selected_roots.latest_updated_at, selected_roots.category
-         FROM selected_roots
-         JOIN effective_sessions USING (effective_root_session_id)
+         -- CROSS JOIN pins the join order: walk the viewer's sessions once and
+         -- probe the selected roots, instead of rescanning every session per root.
+         FROM effective_sessions
+         CROSS JOIN selected_roots USING (effective_root_session_id)
          ORDER BY selected_roots.category,
                   selected_roots.latest_updated_at DESC,
                   selected_roots.effective_root_session_id DESC,
@@ -186,24 +215,88 @@ export class SessionInboxStore {
       .bind(...params, options.limit + 1);
   }
 
-  /** Build the shared visibility, effective-root, and category aggregation CTEs. */
-  private inboxCtes(
-    options: Pick<
-      ListSessionInboxOptions,
-      "createdByUserIds" | "excludeAutomatedSessions" | "viewerUserId"
-    >
+  /**
+   * Mark every unread session the inbox lists under these filters as read for
+   * the viewer. Any unread session puts its hierarchy in needs attention, so
+   * this empties that category, including pages the client has not loaded.
+   * A `rootSessionId` limits marking to that session and its descendants
+   * under the same filters. Returns the number of sessions whose read state
+   * changed.
+   */
+  async markAllRead(options: InboxFilterOptions, rootSessionId?: string): Promise<number> {
+    const { sql, params } = this.eligibleSessionsCte(options, rootSessionId !== undefined);
+    const binds = [
+      ...params,
+      ...(rootSessionId === undefined ? [] : [rootSessionId]),
+      options.viewerUserId,
+      Date.now(),
+    ];
+    assertD1QueryParameterLimit(binds.length);
+    const result = await this.db
+      .prepare(
+        `WITH RECURSIVE ${sql}${
+          rootSessionId === undefined
+            ? ""
+            : `,
+            -- UNION rather than UNION ALL stops at a corrupt parent cycle.
+            requested_sessions(id) AS (
+              SELECT id FROM eligible_sessions WHERE id = ?
+              UNION
+              SELECT child.id
+              FROM requested_sessions
+              JOIN eligible_sessions child ON child.parent_session_id = requested_sessions.id
+            )`
+        }
+         INSERT INTO session_read_states
+           (user_id, session_id, last_read_message_id, updated_at)
+         SELECT ?, id, latest_terminal_message_id, ?
+         FROM eligible_sessions
+         WHERE unread = 1
+           ${rootSessionId === undefined ? "" : "AND id IN (SELECT id FROM requested_sessions)"}
+         ON CONFLICT(user_id, session_id) DO UPDATE SET
+           last_read_message_id = excluded.last_read_message_id,
+           updated_at = excluded.updated_at
+         WHERE session_read_states.last_read_message_id
+           != excluded.last_read_message_id`
+      )
+      .bind(...binds)
+      .run();
+    return result.meta.changes ?? 0;
+  }
+
+  /** The filtered, viewer-visible, unarchived sessions with viewer-specific unread state. */
+  private eligibleSessionsCte(
+    options: InboxFilterOptions,
+    materialized: boolean
   ): { sql: string; params: unknown[] } {
-    const { conditions, params } = this.eligibility(options);
+    const { where, params } = buildSessionListPredicates(options);
     return {
-      sql: `WITH RECURSIVE eligible_sessions AS (
+      sql: `eligible_sessions AS ${materialized ? "MATERIALIZED " : ""}(
               SELECT sessions.*, ${unreadSql("sessions")} AS unread
-              FROM sessions
+              -- Filter before viewer joins to keep shared predicates' columns unambiguous.
+              FROM (
+                SELECT * FROM sessions
+                ${where}
+              ) sessions
               LEFT JOIN users viewer ON viewer.id = ?
               LEFT JOIN session_read_states read_state
                 ON read_state.session_id = sessions.id
                AND read_state.user_id = viewer.id
-              WHERE ${conditions.join(" AND ")}
-            ),
+              WHERE sessions.status != 'archived'
+                AND sessions.root_session_id IS NOT NULL
+                ${options.excludeAutomatedSessions ? "AND sessions.spawn_source NOT IN ('automation', 'github-bot')" : ""}
+            )`,
+      params: [...params, options.viewerUserId],
+    };
+  }
+
+  /** Build the shared visibility, effective-root, and category aggregation CTEs. */
+  private inboxCtes(options: InboxFilterOptions): { sql: string; params: unknown[] } {
+    // The recursive step and later CTEs reuse this set. Inlining it rescans
+    // the viewer's sessions for every re-rooted row.
+    const eligible = this.eligibleSessionsCte(options, true);
+    return {
+      sql: `WITH RECURSIVE ${eligible.sql},
             -- Filtering can hide an ancestor. Re-root each resulting visible subtree
             -- while retaining the persisted root for uninterrupted lineages.
             rerooted_sessions(id, effective_root_session_id) AS (
@@ -242,25 +335,8 @@ export class SessionInboxStore {
               FROM effective_sessions
               GROUP BY effective_root_session_id
             )`,
-      params: [options.viewerUserId, ...params],
+      params: eligible.params,
     };
-  }
-
-  private eligibility(
-    options: Pick<ListSessionInboxOptions, "createdByUserIds" | "excludeAutomatedSessions">
-  ): { conditions: string[]; params: unknown[] } {
-    const conditions = ["sessions.status != 'archived'", "sessions.root_session_id IS NOT NULL"];
-    const params: unknown[] = [];
-    if (options.excludeAutomatedSessions) {
-      conditions.push("sessions.spawn_source NOT IN ('automation', 'github-bot')");
-    }
-    if (options.createdByUserIds?.length) {
-      conditions.push(
-        `sessions.user_id IN (${options.createdByUserIds.map(() => "?").join(", ")})`
-      );
-      params.push(...options.createdByUserIds);
-    }
-    return { conditions, params };
   }
 
   /** Group ordered SQL rows into complete lineages and derive cursor metadata. */
@@ -291,7 +367,7 @@ export class SessionInboxStore {
   /** Replace selected D1 rows with their metadata-enriched list items. */
   private assemblePage(
     page: InboxPageData,
-    sessionsById: Map<string, SessionListItem>
+    sessionsById: Map<string, ScopedInboxSession>
   ): ListSessionInboxResult {
     const items = page.roots.map(([rootId, lineage]) => {
       const rootRow = lineage.find(({ id }) => id === rootId) ?? lineage[0];

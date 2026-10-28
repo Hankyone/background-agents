@@ -1,7 +1,9 @@
 // Integration settings types
 
+import { harnessIdSchema } from "../harnesses";
 import { escapeRegExp } from "../regex";
 import { z } from "zod";
+import { teamSettingsSchema } from "./teams";
 
 export type IntegrationId = "github" | "linear" | "code-server" | "vnc" | "sandbox" | "slack";
 
@@ -56,6 +58,7 @@ export const GITHUB_AUTOFIX_DEFAULTS: ResolvedGitHubAutofixSettings = {
 export const githubBotSettingsSchema = z.strictObject({
   autoReviewOnOpen: z.boolean().optional(),
   model: z.string().optional(),
+  harness: harnessIdSchema.optional(),
   reasoningEffort: z.string().optional(),
   allowedTriggerUsers: z.array(z.string()).optional(),
   codeReviewInstructions: z.string().optional(),
@@ -104,8 +107,10 @@ export const scmGlobalConfigSchema: z.ZodType<ScmGlobalConfig> = z.strictObject(
 /** Repository SCM settings are field-level overrides; omitted fields inherit globally. */
 export type ScmRepoSettings = ScmSettings;
 
-/** Overridable behavior settings for the Linear bot. Used at both global (defaults) and per-repo (overrides) levels. */
+/** Overridable behavior settings for the Linear bot, shared by global defaults and repo overrides. */
 export const linearBotSettingsSchema = z.strictObject({
+  /** Preferred harness for new sessions; see `resolveHarnessForModel`. */
+  harness: harnessIdSchema.optional(),
   model: z.string().optional(),
   reasoningEffort: z.string().optional(),
   allowUserPreferenceOverride: z.boolean().optional(),
@@ -115,6 +120,17 @@ export const linearBotSettingsSchema = z.strictObject({
 });
 
 export type LinearBotSettings = z.infer<typeof linearBotSettingsSchema>;
+
+export const linearUnboundChannelsSchema = z.enum(["workspace", "reject"]);
+export type LinearUnboundChannels = z.infer<typeof linearUnboundChannelsSchema>;
+export const DEFAULT_LINEAR_UNBOUND_CHANNELS: LinearUnboundChannels = "workspace";
+
+/** Global Linear defaults include workspace-wide policy that repo overrides cannot change. */
+export const linearBotGlobalSettingsSchema = linearBotSettingsSchema.extend({
+  unboundChannels: linearUnboundChannelsSchema.optional(),
+});
+
+export type LinearBotGlobalSettings = z.infer<typeof linearBotGlobalSettingsSchema>;
 
 /**
  * Maximum length of a custom session-instructions value (Linear
@@ -210,6 +226,12 @@ export const DEFAULT_MAX_TOTAL_CHILD_SESSIONS = 15;
 /** Minimum configurable sandbox session lifetime, in milliseconds. */
 export const MIN_SANDBOX_TIMEOUT_MS = 1000;
 
+/** Default time reserved before provider expiry for final preservation. */
+export const DEFAULT_FINAL_SNAPSHOT_BUFFER_MS = 600_000;
+
+/** Minimum configurable final-preservation buffer, in milliseconds. */
+export const MIN_FINAL_SNAPSHOT_BUFFER_MS = 300_000;
+
 /** Whether a sandbox lifetime is a safe positive whole-second millisecond value. */
 export function isValidSandboxTimeoutMs(value: unknown): value is number {
   return (
@@ -233,14 +255,23 @@ export const DEFAULT_BUILD_TIMEOUT_SECONDS = 1800;
  */
 export const MAX_BUILD_TIMEOUT_SECONDS = 3600;
 
+/** Modal resource defaults; mirrored by the Python launch policy. */
+export const DEFAULT_MODAL_CPU_CORES = 0.125;
+export const DEFAULT_MODAL_MEMORY_MIB = 128;
+export const DEFAULT_MODAL_VM_CPU_CORES = 0.5;
+export const DEFAULT_MODAL_VM_MEMORY_MIB = 2048;
+export const DEFAULT_MODAL_VM_CPU_LIMIT_CORES = 2;
+export const DEFAULT_MODAL_VM_MEMORY_LIMIT_MIB = 4096;
+
 /**
  * Sandbox environment settings. Provider-agnostic: describes what the user
- * wants, not how it's done. Resource fields (`cpuCores`, `memoryMib`) are
+ * wants, not how it's done. Request fields (`cpuCores`, `memoryMib`) are
  * advisory and provider-dependent — Modal maps them directly, Vercel maps
- * them to vCPUs, and providers without resource reservations ignore them. We
- * only check they're positive; the provider enforces its own real limits. When
- * unset, the provider's own default applies. At repo scope, `null` explicitly
- * uses the provider default instead of inheriting a global resource default.
+ * them to vCPUs, and providers without resource reservations ignore them.
+ * Limits are caps supported only by Modal backends. The provider enforces its
+ * own real limits. When unset, the provider's own default applies. At repo or
+ * environment scope, `null` explicitly uses the provider default instead of
+ * inheriting a resource default.
  */
 export const sandboxSettingsSchema = z.strictObject({
   /** Extra ports to expose via tunnels (e.g., dev server ports 3000, 5173). */
@@ -261,13 +292,156 @@ export const sandboxSettingsSchema = z.strictObject({
   cpuCores: z.number().nullable().optional(),
   /** Memory to reserve for the sandbox, in MiB. */
   memoryMib: z.number().nullable().optional(),
+  /** CPU cap for Modal backends; null resets to the provider default. */
+  cpuLimitCores: z.number().nullable().optional(),
+  /** Memory cap in MiB for Modal backends; null resets to the provider default. */
+  memoryLimitMib: z.number().nullable().optional(),
   /** Requested sandbox session lifetime, in milliseconds. */
   sandboxTimeoutMs: z.number().optional(),
+  /** Time reserved before provider expiry for final sandbox preservation. */
+  finalSnapshotBufferMs: z.number().optional(),
   /** Repo-image build timeout (the build sandbox lifetime), in seconds. */
   buildTimeoutSeconds: z.number().optional(),
+  /** Maximum OpenCode-reported session cost in USD. */
+  maxSessionCostUsd: z.number().finite().positive().optional(),
 });
 
 export type SandboxSettings = z.infer<typeof sandboxSettingsSchema>;
+
+/** Every supported sandbox backend. Keep provider policy exhaustive over this union. */
+export const SANDBOX_PROVIDER_NAMES = [
+  "modal",
+  "modal-vm",
+  "daytona",
+  "vercel",
+  "e2b",
+  "boat",
+] as const;
+
+export type SandboxProviderName = (typeof SANDBOX_PROVIDER_NAMES)[number];
+
+const DEFAULT_SANDBOX_SETTING_CAPABILITIES = {
+  resources: true,
+  resourceLimits: false,
+  timeout: true,
+};
+const SANDBOX_SETTING_CAPABILITIES = {
+  modal: { ...DEFAULT_SANDBOX_SETTING_CAPABILITIES, resourceLimits: true },
+  "modal-vm": { ...DEFAULT_SANDBOX_SETTING_CAPABILITIES, resourceLimits: true },
+  daytona: { resources: false, resourceLimits: false, timeout: false },
+  vercel: DEFAULT_SANDBOX_SETTING_CAPABILITIES,
+  e2b: { resources: false, resourceLimits: false, timeout: true },
+  // Resource requests select the smallest Boat machine type that fits them.
+  boat: { resources: true, resourceLimits: false, timeout: true },
+} satisfies Record<
+  SandboxProviderName,
+  { resources: boolean; resourceLimits: boolean; timeout: boolean }
+>;
+
+export function isSandboxProviderName(provider: string): provider is SandboxProviderName {
+  return (SANDBOX_PROVIDER_NAMES as readonly string[]).includes(provider);
+}
+
+/** Unvalidated provider names support resources and timeouts, but not resource caps. */
+export function sandboxSettingCapabilities(provider: string): {
+  resources: boolean;
+  resourceLimits: boolean;
+  timeout: boolean;
+} {
+  const normalized = provider.trim().toLowerCase();
+  return isSandboxProviderName(normalized)
+    ? SANDBOX_SETTING_CAPABILITIES[normalized]
+    : DEFAULT_SANDBOX_SETTING_CAPABILITIES;
+}
+
+/** Whether the provider honors per-session CPU and memory settings. */
+export function supportsConfigurableSandboxResources(provider: string): boolean {
+  return sandboxSettingCapabilities(provider).resources;
+}
+
+/** Only Modal backends honor per-session resource caps. */
+export function supportsConfigurableSandboxResourceLimits(provider: string): boolean {
+  return sandboxSettingCapabilities(provider).resourceLimits;
+}
+
+/** Whether the provider honors a per-session sandbox lifetime. */
+export function supportsConfigurableSandboxTimeout(provider: string): boolean {
+  return sandboxSettingCapabilities(provider).timeout;
+}
+
+export type SandboxResources = Pick<
+  SandboxSettings,
+  "cpuCores" | "memoryMib" | "cpuLimitCores" | "memoryLimitMib"
+>;
+
+/** Compare supported caps against explicit requests or the selected provider's defaults. */
+export function validateSandboxResourceLimits(
+  settings: SandboxResources,
+  provider: SandboxProviderName
+): string | undefined {
+  if (!supportsConfigurableSandboxResourceLimits(provider)) {
+    return undefined;
+  }
+  const cpuCores =
+    settings.cpuCores ??
+    (provider === "modal-vm" ? DEFAULT_MODAL_VM_CPU_CORES : DEFAULT_MODAL_CPU_CORES);
+  const memoryMib =
+    settings.memoryMib ??
+    (provider === "modal-vm" ? DEFAULT_MODAL_VM_MEMORY_MIB : DEFAULT_MODAL_MEMORY_MIB);
+  if (settings.cpuLimitCores != null && settings.cpuLimitCores < cpuCores) {
+    return "cpuLimitCores must be greater than or equal to cpuCores";
+  }
+  if (settings.memoryLimitMib != null && settings.memoryLimitMib < memoryMib) {
+    return "memoryLimitMib must be greater than or equal to memoryMib";
+  }
+  return undefined;
+}
+
+export type ProviderSpecificSandboxSetting = keyof SandboxResources | "sandboxTimeoutMs";
+
+export function unsupportedSandboxSettings(
+  settings: SandboxSettings,
+  provider: string
+): ProviderSpecificSandboxSetting[] {
+  const unsupported: ProviderSpecificSandboxSetting[] = [];
+  if (!supportsConfigurableSandboxResources(provider)) {
+    if (settings.cpuCores !== undefined) unsupported.push("cpuCores");
+    if (settings.memoryMib !== undefined) unsupported.push("memoryMib");
+  }
+  if (!supportsConfigurableSandboxResourceLimits(provider)) {
+    if (settings.cpuLimitCores !== undefined) unsupported.push("cpuLimitCores");
+    if (settings.memoryLimitMib !== undefined) unsupported.push("memoryLimitMib");
+  }
+  if (!supportsConfigurableSandboxTimeout(provider) && settings.sandboxTimeoutMs !== undefined) {
+    unsupported.push("sandboxTimeoutMs");
+  }
+  return unsupported;
+}
+
+/** Remove settings the selected provider cannot honor from an effective session snapshot. */
+export function omitUnsupportedSandboxSettings(
+  settings: SandboxSettings,
+  provider: string
+): SandboxSettings {
+  const supported = { ...settings };
+  for (const setting of unsupportedSandboxSettings(settings, provider)) delete supported[setting];
+  return supported;
+}
+
+/** Validate the relationship only when both child-session limits are provided. */
+export function validateSandboxChildSessionLimits(
+  settings: Pick<SandboxSettings, "maxConcurrentChildSessions" | "maxTotalChildSessions">
+): string | undefined {
+  const { maxConcurrentChildSessions, maxTotalChildSessions } = settings;
+  if (
+    maxConcurrentChildSessions !== undefined &&
+    maxTotalChildSessions !== undefined &&
+    maxConcurrentChildSessions > maxTotalChildSessions
+  ) {
+    return "maxConcurrentChildSessions must be less than or equal to maxTotalChildSessions";
+  }
+  return undefined;
+}
 
 /**
  * Resolve the effective repo-image build timeout (seconds) from sandbox
@@ -285,6 +459,10 @@ export function resolveBuildTimeoutSeconds(settings: SandboxSettings | undefined
 }
 
 export type SlackMentionsPolicy = "allow" | "escape" | "strip";
+
+export const slackUnboundChannelsSchema = z.enum(["workspace", "reject"]);
+export type SlackUnboundChannels = z.infer<typeof slackUnboundChannelsSchema>;
+export const DEFAULT_SLACK_UNBOUND_CHANNELS: SlackUnboundChannels = "workspace";
 
 /** What a Slack routing rule points at: a repository or a saved environment. */
 export type SlackRoutingTargetType = "repository" | "environment";
@@ -344,8 +522,12 @@ export type SlackRepoSettings = z.infer<typeof slackRepoSettingsSchema>;
 
 /** Global Slack defaults: per-repo fields plus workspace-wide policy controls. */
 export const slackGlobalSettingsSchema = slackRepoSettingsSchema.extend({
+  /** Preferred harness for new sessions; see `resolveHarnessForModel`. */
+  harness: harnessIdSchema.optional(),
   model: z.string().optional(),
   mentionsPolicy: z.enum(["allow", "escape", "strip"]).optional(),
+  /** Ownership policy for Slack channels without a Team binding (global-only). */
+  unboundChannels: slackUnboundChannelsSchema.optional(),
   /** Workspace-wide keyword→repository routing rules (global-only, like mentionsPolicy). */
   routingRules: z.array(slackRoutingRuleSchema.strict()).optional(),
   /** Custom instructions appended to the first prompt of every Slack-initiated session. */
@@ -436,7 +618,7 @@ export const integrationSettingsSchemas = {
     repo: githubBotSettingsSchema,
   },
   linear: {
-    global: integrationGlobalSettingsSchema(linearBotSettingsSchema),
+    global: integrationGlobalSettingsSchema(linearBotGlobalSettingsSchema),
     repo: linearBotSettingsSchema,
   },
   "code-server": {
@@ -458,6 +640,13 @@ export const integrationSettingsSchemas = {
   scm: {
     global: scmGlobalConfigSchema,
     repo: scmSettingsSchema,
+  },
+  teams: {
+    global: z.strictObject({
+      enabledRepos: z.never().optional(),
+      defaults: teamSettingsSchema.optional(),
+    }),
+    repo: z.strictObject({}),
   },
 } as const;
 

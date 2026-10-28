@@ -4,8 +4,15 @@ import {
   type CreateMediaArtifactRequest,
 } from "@open-inspect/shared/types/session-api";
 import type { SessionArtifact } from "@open-inspect/shared/types/artifacts";
-import { sandboxEventSchema, type SandboxEvent } from "@open-inspect/shared/types/sandbox-events";
-import { isDeadSandboxStatus } from "../../../sandbox/lifecycle/decisions";
+import {
+  bootPhaseNameSchema,
+  sandboxIngressEventSchema,
+  type SandboxEvent,
+} from "@open-inspect/shared/types/sandbox-events";
+import {
+  isDeadSandboxStatus,
+  isSandboxReconnectBlockedStatus,
+} from "../../../sandbox/lifecycle/decisions";
 import {
   OpenAITokenNotConfiguredError,
   OpenAITokenStorageError,
@@ -20,15 +27,23 @@ import type { MessageRepository } from "../../message-repository";
 import type { ArtifactRepository } from "../../artifact-repository";
 import type { EventRepository } from "../../event-repository";
 import type { SessionCoreRepository } from "../../session-core-repository";
-import type { SandboxRepository } from "../../sandbox-repository";
+import type { SandboxStateReader } from "../../sandbox-ports";
 import type { SessionSandboxEventProcessor } from "../../sandbox-events/processor";
 import type { SandboxRow, SessionRow } from "../../types";
-import { assertArtifactType } from "../../artifacts";
 import { parseTunnelUrls } from "../../tunnel-urls";
 import { z } from "zod";
 
+/**
+ * A fatal runtime report. The phase fields are what the supervisor knew
+ * when the boot died; they are optional because runtimes that predate boot
+ * phases report only the error.
+ */
 const sandboxErrorRequestSchema = z.object({
   error: z.string().trim().min(1).max(1000),
+  phase: bootPhaseNameSchema.optional(),
+  bootSeq: z.number().int().optional(),
+  repoOwner: z.string().optional(),
+  repoName: z.string().optional(),
 });
 
 /**
@@ -43,7 +58,7 @@ export class SandboxHandler {
     private readonly eventRepository: EventRepository,
     private readonly artifactRepository: ArtifactRepository,
     private readonly sessionCoreRepository: SessionCoreRepository,
-    private readonly sandboxRepository: SandboxRepository,
+    private readonly sandboxRepository: SandboxStateReader,
     private readonly sandboxEventProcessor: SessionSandboxEventProcessor,
     private readonly messenger: SessionMessenger,
     private readonly refreshOpenAIToken: (session: SessionRow, log: Logger) => Promise<OpenAIToken>,
@@ -69,17 +84,17 @@ export class SandboxHandler {
       return Response.json({ error: "Invalid request body" }, { status: 400 });
     }
 
-    const result = sandboxEventSchema.safeParse(raw);
+    const result = sandboxIngressEventSchema.safeParse(raw);
     if (!result.success) {
       return Response.json({ error: "Invalid sandbox event" }, { status: 400 });
     }
 
-    const event: SandboxEvent = result.data;
+    const event = result.data;
     await this.sandboxEventProcessor.processSandboxEvent(event);
     return Response.json({ status: "ok" });
   }
 
-  async sandboxError(request: Request): Promise<Response> {
+  async sandboxError(request: Request, log: Logger): Promise<Response> {
     const authHeader = request.headers.get("Authorization");
     const token = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : null;
     const sandboxId = request.headers.get("X-Sandbox-ID");
@@ -90,7 +105,7 @@ export class SandboxHandler {
     if (sandbox.modal_sandbox_id && sandboxId !== sandbox.modal_sandbox_id) {
       return Response.json({ error: "Wrong sandbox" }, { status: 403 });
     }
-
+    const wasStoppedOrStale = isSandboxReconnectBlockedStatus(sandbox.status);
     if (!(await this.isValidSandboxToken(token, sandbox))) {
       return Response.json({ error: "Unauthorized" }, { status: 401 });
     }
@@ -114,10 +129,42 @@ export class SandboxHandler {
     ) {
       return Response.json({ error: "Sandbox credentials changed" }, { status: 403 });
     }
-    if (currentSandbox.status === "stopped" || currentSandbox.status === "stale") {
+    // Reports observed while stopped/stale stay stale across an in-place resume. A
+    // watchdog-failed generation can reconnect with the same credentials during
+    // authentication or body parsing; once live, its fatal report must fail it.
+    if (wasStoppedOrStale || isDeadSandboxStatus(currentSandbox.status)) {
+      log.warn("Ignoring fatal report from a sandbox that is no longer live", {
+        event: "sandbox.error_ignored",
+        sandbox_status: currentSandbox.status,
+        sandbox_status_at_report: sandbox.status,
+        error: result.data.error,
+      });
       return Response.json({ status: "ignored" });
     }
+    // Resume keeps the ID and credentials but starts a new generation.
+    if (currentSandbox.created_at !== sandbox.created_at) {
+      return Response.json({ error: "Sandbox generation changed" }, { status: 403 });
+    }
 
+    // The HTTP report is the reliable carrier of the failed phase: the
+    // bridge's own phase line over the socket is best-effort and may be lost
+    // when the socket closes first. Landing it here puts the phase and the
+    // failure metadata on the timeline for the failure the user sees; the
+    // sequence number de-duplicates it against the socket copy.
+    const { phase, bootSeq, repoOwner, repoName } = result.data;
+    if (phase !== undefined) {
+      await this.sandboxEventProcessor.processSandboxEvent({
+        type: "boot_progress",
+        phase,
+        status: "failed",
+        bootSeq: bootSeq ?? Number.MAX_SAFE_INTEGER,
+        ...(repoOwner !== undefined ? { repoOwner } : {}),
+        ...(repoName !== undefined ? { repoName } : {}),
+        detail: result.data.error,
+        sandboxId: currentSandbox.modal_sandbox_id ?? currentSandbox.id,
+        timestamp: this.now() / 1000,
+      });
+    }
     await this.failSandbox(result.data.error);
     return Response.json({ status: "ok" });
   }
@@ -150,7 +197,7 @@ export class SandboxHandler {
       return Response.json({ error: "No active prompt" }, { status: 409 });
     }
 
-    const artifactType = assertArtifactType(body.artifactType);
+    const artifactType = body.artifactType;
     const now = this.now();
     const timestampSeconds = now / 1000;
     const artifact: SessionArtifact = {
@@ -218,9 +265,14 @@ export class SandboxHandler {
 
     // Boot-time states (spawning/connecting) must authenticate — the git
     // credential broker is already called during the initial clone, before
-    // the WebSocket connect flips the status to ready.
-    if (isDeadSandboxStatus(sandbox.status)) {
-      log.warn("Sandbox token verification failed: sandbox is dead", {
+    // the WebSocket connect flips the status to ready. `failed` must too:
+    // the same gate the bridge uses, because a boot the connect watchdog
+    // gave up on is still allowed to connect and self-heal, and it cannot
+    // get there if the sandbox-authenticated calls it makes on the way
+    // (credentials, skills, tunnel URLs) are refused. A superseded
+    // generation is still rejected below by the token comparison.
+    if (isSandboxReconnectBlockedStatus(sandbox.status)) {
+      log.warn("Sandbox token verification failed: sandbox is stopped", {
         status: sandbox.status,
       });
       return Response.json({ valid: false, error: "Sandbox not active" }, { status: 410 });
@@ -233,7 +285,10 @@ export class SandboxHandler {
     }
 
     log.info("Sandbox token verified successfully");
-    return Response.json({ valid: true }, { status: 200 });
+    return Response.json(
+      { valid: true, sandboxId: sandbox.modal_sandbox_id ?? sandbox.id },
+      { status: 200 }
+    );
   }
 
   async openaiTokenRefresh(log: Logger): Promise<Response> {

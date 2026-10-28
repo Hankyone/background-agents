@@ -1,16 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import contextlib
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .boot_events import BootPhaseError, BootPhaseName, PhaseScope
 from .constants import REPO_MANIFEST_FILE_PATH
-from .repo_config import RepoConfigError, RepoEntry, dump_repo_manifest, parse_repositories
+from .repo_config import (
+    RepoConfigError,
+    RepoEntry,
+    dump_repo_manifest,
+    load_repo_manifest,
+    parse_repositories,
+)
 from .repository_sync import RepositorySyncStatus
 from .runtime_config import BootMode, RepositoryConfig
 
 if TYPE_CHECKING:
-    from .boot_warnings import BootWarningSink
+    from collections.abc import Iterator
+
+    from .boot_events import BootEventLog
     from .repository_hooks import RepositoryHooks
     from .repository_sync import RepositorySynchronizer
     from .tunnel_environment import TunnelEnvironment
@@ -33,7 +43,7 @@ class RepositoryBoot:
         self,
         config: RepositoryConfig,
         log: Any,
-        warnings: BootWarningSink,
+        warnings: BootEventLog,
         tunnel_environment: TunnelEnvironment,
         hooks: RepositoryHooks,
         synchronizer: RepositorySynchronizer,
@@ -81,6 +91,29 @@ class RepositoryBoot:
         ):
             return self.repo_path
         return self.workspace_path
+
+    def _adopt_persisted_base_shas(self) -> None:
+        """Keep the session-start commits an earlier boot of this disk discovered.
+
+        A restored checkout skips baseline discovery (HEAD may have moved), and
+        a provider that resumes with the create-time env hands over no base SHA
+        at all. The manifest the previous boot wrote carries the SHAs it found
+        after cloning; a repository that arrives without one takes it from
+        there. One it arrives with is kept.
+        """
+        persisted = {
+            (entry.owner.lower(), entry.name.lower()): entry.base_sha
+            for entry in load_repo_manifest(REPO_MANIFEST_FILE_PATH)
+            if entry.base_sha
+        }
+        if not persisted:
+            return
+        self.repositories = [
+            replace(entry, base_sha=persisted.get((entry.owner.lower(), entry.name.lower())))
+            if entry.base_sha is None
+            else entry
+            for entry in self.repositories
+        ]
 
     def _write_repo_manifest(self) -> None:
         try:
@@ -146,32 +179,46 @@ class RepositoryBoot:
             self.tunnel_environment.clear_stale_file()
         return expected_ports
 
+    @contextlib.contextmanager
+    def _phase(
+        self, boot_mode: BootMode, phase: BootPhaseName, repo: RepoEntry | None = None
+    ) -> Iterator[PhaseScope]:
+        """Report one boot phase, except in an image build, which nobody relays."""
+        if boot_mode is BootMode.BUILD:
+            yield PhaseScope()
+            return
+        with self.warnings.phase_scope(phase, repo=repo) as scope:
+            yield scope
+
     async def boot(
         self, boot_mode: BootMode, expected_tunnel_ports: list[int]
     ) -> RepositoryBootResult:
         if self.repo_config_error:
             raise RuntimeError(f"invalid repository config: {self.repo_config_error}")
+        if boot_mode is BootMode.SNAPSHOT_RESTORE:
+            self._adopt_persisted_base_shas()
         self._write_repo_manifest()
-        if self.repositories:
-            await self.synchronizer.ensure_credentials_configured()
-        sync_result = await self.synchronizer.sync(self.repositories, boot_mode)
-        self.repositories = list(sync_result.repositories)
-        git_sync_success = not sync_result.failures
-        if sync_result.failures:
-            if boot_mode in (BootMode.FRESH, BootMode.BUILD):
-                messages = []
-                if sync_result.timed_out:
-                    timed_out_names = ", ".join(
-                        f"{repo.owner}/{repo.name}" for repo in sync_result.timed_out
-                    )
-                    messages.append(f"git sync timed out for {timed_out_names}")
-                if sync_result.non_timeout_failures:
-                    failed_names = ", ".join(
-                        f"{repo.owner}/{repo.name}" for repo in sync_result.non_timeout_failures
-                    )
-                    messages.append(f"git sync failed for {failed_names}")
-                raise RuntimeError("; ".join(messages))
-            else:
+        with self._phase(boot_mode, "sync") as sync_phase:
+            if self.repositories:
+                await self.synchronizer.ensure_credentials_configured()
+            sync_result = await self.synchronizer.sync(self.repositories, boot_mode)
+            self.repositories = list(sync_result.repositories)
+            git_sync_success = not sync_result.failures
+            if sync_result.failures:
+                if boot_mode in (BootMode.FRESH, BootMode.BUILD):
+                    messages = []
+                    if sync_result.timed_out:
+                        timed_out_names = ", ".join(
+                            f"{repo.owner}/{repo.name}" for repo in sync_result.timed_out
+                        )
+                        messages.append(f"git sync timed out for {timed_out_names}")
+                    if sync_result.non_timeout_failures:
+                        failed_names = ", ".join(
+                            f"{repo.owner}/{repo.name}" for repo in sync_result.non_timeout_failures
+                        )
+                        messages.append(f"git sync failed for {failed_names}")
+                    raise RuntimeError("; ".join(messages))
+                sync_phase.warning = True
                 for outcome in sync_result.outcomes:
                     repo = outcome.repository
                     if outcome.status is RepositorySyncStatus.SUCCEEDED:
@@ -208,34 +255,44 @@ class RepositoryBoot:
         if self.repositories and boot_mode in (BootMode.FRESH, BootMode.BUILD):
             setup_success = True
             for repo in self.repositories:
-                if await self.hooks.run_setup(repo, boot_mode):
-                    continue
-                setup_success = False
-                if boot_mode is BootMode.BUILD:
-                    raise RuntimeError(
-                        f"setup hook failed for {repo.owner}/{repo.name} in build mode"
+                with self._phase(boot_mode, "setup", repo) as setup_phase:
+                    if await self.hooks.run_setup(repo, boot_mode):
+                        continue
+                    setup_success = False
+                    if boot_mode is BootMode.BUILD:
+                        raise RuntimeError(
+                            f"setup hook failed for {repo.owner}/{repo.name} in build mode"
+                        )
+                    setup_phase.warning = True
+                    self.warnings.record(
+                        "setup",
+                        f"setup.sh failed for {repo.owner}/{repo.name}; "
+                        "the session continues without it.",
+                        repo,
                     )
-                self.warnings.record(
-                    "setup",
-                    f"setup.sh failed for {repo.owner}/{repo.name}; the session continues without it.",
-                    repo,
-                )
 
         start_success: bool | None = None
         if self.repositories and boot_mode is not BootMode.BUILD:
             await self.tunnel_environment.wait_until_ready(expected_tunnel_ports)
             start_success = True
             for index, repo in enumerate(self.repositories):
-                if await self.hooks.run_start(repo, boot_mode):
-                    continue
-                start_success = False
-                if index == 0:
-                    raise RuntimeError(f"start hook failed for {repo.owner}/{repo.name}")
-                self.warnings.record(
-                    "start",
-                    f"start.sh failed for {repo.owner}/{repo.name}; the session continues without it.",
-                    repo,
-                )
+                with self._phase(boot_mode, "start", repo) as start_phase:
+                    if await self.hooks.run_start(repo, boot_mode):
+                        continue
+                    start_success = False
+                    if index == 0:
+                        raise BootPhaseError(
+                            f"start hook failed for {repo.owner}/{repo.name}",
+                            phase="start",
+                            repo=repo,
+                        )
+                    start_phase.warning = True
+                    self.warnings.record(
+                        "start",
+                        f"start.sh failed for {repo.owner}/{repo.name}; "
+                        "the session continues without it.",
+                        repo,
+                    )
 
         self._write_workspace_manifest()
         return RepositoryBootResult(

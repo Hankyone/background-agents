@@ -1,22 +1,33 @@
 import type { Logger } from "../../logger";
 import { evaluateExecutionTimeout } from "../../sandbox/lifecycle/decisions";
-import type { SandboxLifecycleManager } from "../../sandbox/lifecycle/manager";
+import type { SandboxAlarm } from "../../sandbox/lifecycle/ports";
 import type { AlarmScheduler } from "../../platform-ports";
 import type { SessionMessageQueue } from "../message-queue";
+import type { ExecutionStopCoordinator } from "../execution-stop-coordinator";
 import type { MessageRepository } from "../message-repository";
 import type { SessionTerminalMessageProjection } from "../terminal-message-projection";
+import { applySandboxRecovery } from "../sandbox-recovery";
+
+/** A prompt the lifecycle alarm interrupted; the watchdog names the cause when it has one. */
+const SANDBOX_INTERRUPTED_ERROR =
+  "Execution interrupted because the sandbox stopped or became unavailable.";
 
 export interface AlarmHandlerDeps {
-  repository: MessageRepository;
-  messageQueue: Pick<
-    SessionMessageQueue,
-    | "failStuckProcessingMessage"
-    | "recoverStopConfirmationTimeout"
-    | "resumeAfterSandboxTermination"
+  preserveBeforeWatchdogs?: (allowCaptureRetry: boolean) => Promise<"continue" | "hold_watchdogs">;
+  repository: Pick<
+    MessageRepository,
+    "getProcessingMessageWithStartedAt" | "getNextPendingMessage"
   >;
-  lifecycleManager: Pick<SandboxLifecycleManager, "handleAlarm">;
+  messageQueue: Pick<SessionMessageQueue, "failStuckProcessingMessage" | "failPendingMessage">;
+  executionStop: Pick<
+    ExecutionStopCoordinator,
+    "recoverStopConfirmationTimeout" | "resumeAfterSandboxTermination"
+  >;
+  lifecycleManager: SandboxAlarm;
   terminalMessageProjection: Pick<SessionTerminalMessageProjection, "flushPending">;
   alarmScheduler: AlarmScheduler;
+  /** Wakes queued work for a live runtime that nothing else will; idempotent. */
+  redriveIdleQueue?: () => Promise<void>;
   /** Resolved per use so it honors settings persisted after construction. */
   getExecutionTimeoutMs: () => number;
   now: () => number;
@@ -38,8 +49,23 @@ export interface AlarmHandler {
 export function createAlarmHandler(deps: AlarmHandlerDeps): AlarmHandler {
   return {
     async handle(): Promise<void> {
-      await deps.terminalMessageProjection.flushPending();
-      await deps.messageQueue.recoverStopConfirmationTimeout();
+      // Graceful shutdown must not wait behind a remote index projection or a
+      // generic stop timeout. Recheck below if projection I/O crosses D.
+      await deps.preserveBeforeWatchdogs?.(true);
+      let projectionFailure: { error: unknown } | undefined;
+      try {
+        await deps.terminalMessageProjection.flushPending();
+      } catch (error) {
+        // A malformed unread projection must not prevent lifecycle recovery.
+        // Rethrow after recovery so transient storage failures still retry.
+        projectionFailure = { error };
+      }
+      // Recheck shutdown deadlines without starting another retry in this delivery.
+      if ((await deps.preserveBeforeWatchdogs?.(false)) === "hold_watchdogs") {
+        if (projectionFailure) throw projectionFailure.error;
+        return;
+      }
+      await deps.executionStop.recoverStopConfirmationTimeout();
       // Execution timeout check: if a message has been in 'processing' longer than
       // the configured timeout, fail it. This is idempotent - if the message was
       // already failed (by lifecycle recovery or a prior alarm),
@@ -69,13 +95,25 @@ export function createAlarmHandler(deps: AlarmHandlerDeps): AlarmHandler {
         }
       }
 
+      // Identified before lifecycle handling, which may yield on provider
+      // I/O: the head can change in that gap, and the prompt a boot was for
+      // is the one that was waiting when the alarm fired.
+      const bootPrompt = deps.repository.getNextPendingMessage();
       const lifecycleResult = await deps.lifecycleManager.handleAlarm();
+      const heartbeatLost =
+        typeof lifecycleResult === "object" && lifecycleResult.kind === "heartbeat_lost"
+          ? lifecycleResult
+          : null;
       if (lifecycleResult !== "no_action") {
-        await deps.messageQueue.failStuckProcessingMessage();
+        await deps.messageQueue.failStuckProcessingMessage(
+          heartbeatLost?.reason ?? SANDBOX_INTERRUPTED_ERROR
+        );
       }
-      if (lifecycleResult === "sandbox_terminated") {
-        await deps.messageQueue.resumeAfterSandboxTermination();
-      }
+      await applySandboxRecovery(deps, bootPrompt, lifecycleResult);
+      // Last, so the watchdogs have already fenced any runtime they found
+      // stale: a lost queue kick is repeated only for a live runtime.
+      if (lifecycleResult === "no_action") await deps.redriveIdleQueue?.();
+      if (projectionFailure) throw projectionFailure.error;
     },
   };
 }

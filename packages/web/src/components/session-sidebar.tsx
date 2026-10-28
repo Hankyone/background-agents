@@ -2,22 +2,76 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useMemo, useCallback } from "react";
+import { useMemo, useCallback, useEffect, useState, type ReactNode } from "react";
 import { useAuthSession } from "@/lib/auth-session";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
 import { useIsMobile } from "@/hooks/use-media-query";
 import { useSidebarSessions } from "@/hooks/use-sidebar-sessions";
 import type { SessionItem } from "@/hooks/use-sidebar-sessions";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { SidebarIcon, PlusIcon, SearchIcon, ChevronRightIcon } from "@/components/ui/icons";
+import {
+  SidebarIcon,
+  PlusIcon,
+  SearchIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+} from "@/components/ui/icons";
 import { PRIMARY_APP_DESTINATIONS, SETTINGS_DESTINATION } from "@/components/app-destinations";
 import { Button } from "@/components/ui/button";
 import { useEnvironments } from "@/hooks/use-environments";
 import { SessionWithChildren } from "@/components/session-with-children";
+import { MarkAllReadButton } from "@/components/mark-all-read-button";
 import { UserMenu } from "@/components/sidebar-user-menu";
 import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
+import { buildSessionsHref } from "@/lib/session-discovery";
+import { useActiveTeam } from "@/hooks/use-active-team";
+import { TeamSwitcher } from "./team-switcher";
 
 export type { SessionItem } from "@/hooks/use-sidebar-sessions";
+/** Archived work is discovered on the Sessions page; unarchiving stays in Settings. */
+type SessionGroupId = "needs-attention" | "in-progress" | "recent";
+
+const DEFAULT_SESSION_GROUP_EXPANDED_STATE: Record<SessionGroupId, boolean> = {
+  "needs-attention": true,
+  "in-progress": true,
+  recent: true,
+};
+const SESSION_GROUP_EXPANDED_STORAGE_KEY_PREFIX = "open-inspect-session-sidebar-expanded:";
+/** Varied title widths so the placeholder rows read as a list rather than a block. */
+const SESSION_SKELETON_TITLE_WIDTHS = [
+  "w-3/4",
+  "w-1/2",
+  "w-2/3",
+  "w-5/6",
+  "w-3/5",
+  "w-2/3",
+  "w-1/2",
+];
+
+/** Mirrors a group header followed by `SessionListItem` rows so loading doesn't shift the list. */
+function SessionListSkeleton() {
+  return (
+    <div
+      role="status"
+      aria-label="Loading sessions"
+      className="animate-pulse motion-reduce:animate-none"
+    >
+      <div className="flex min-h-10 items-center px-4">
+        <div className="h-3 w-24 rounded bg-muted" />
+      </div>
+      {SESSION_SKELETON_TITLE_WIDTHS.map((titleWidth, index) => (
+        <div key={index} className="border-l-2 border-l-transparent px-4 py-2.5">
+          <div className="flex h-5 items-center">
+            <div className={`h-3.5 rounded bg-muted ${titleWidth}`} />
+          </div>
+          <div className="mt-0.5 flex h-4 items-center">
+            <div className="h-3 w-32 rounded bg-muted" />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 interface SidebarActionButtonProps {
   onClick?: () => void;
@@ -30,8 +84,8 @@ export function SearchSessionsButton({ onClick }: SidebarActionButtonProps) {
       variant="ghost"
       size="icon"
       onClick={onClick}
-      title={`Search sessions (${labels["open-command-menu"]})`}
-      aria-label={`Search sessions (${labels["open-command-menu"]})`}
+      title={`Quick search recent sessions (${labels["open-command-menu"]})`}
+      aria-label={`Quick search recent sessions (${labels["open-command-menu"]})`}
     >
       <SearchIcon className="w-4 h-4" />
     </Button>
@@ -60,6 +114,9 @@ interface SessionSidebarProps {
   onSessionSelect?: () => void;
 }
 
+/**
+ * Renders navigation and session groups, preserving each group's expanded state across visits.
+ */
 export function SessionSidebar({
   onNewSession,
   onSearchSessions,
@@ -69,17 +126,39 @@ export function SessionSidebar({
   const { labels } = useKeyboardShortcuts();
   const { data: authSession } = useAuthSession();
   const { hasPermission } = useCurrentUserAuthorization();
+  const { activeTeamId, scope, teams, loading: loadingTeams } = useActiveTeam();
+  const teamQuery = { teamIds: activeTeamId ? [activeTeamId] : undefined, scope };
   const pathname = usePathname();
   const router = useRouter();
   const isMobile = useIsMobile();
 
   const currentSessionId = pathname?.startsWith("/session/") ? pathname.split("/")[2] : null;
+  const [expandedGroups, setExpandedGroups] = useState(DEFAULT_SESSION_GROUP_EXPANDED_STATE);
+
+  useEffect(() => {
+    try {
+      setExpandedGroups({
+        "needs-attention":
+          localStorage.getItem(`${SESSION_GROUP_EXPANDED_STORAGE_KEY_PREFIX}needs-attention`) !==
+          "false",
+        "in-progress":
+          localStorage.getItem(`${SESSION_GROUP_EXPANDED_STORAGE_KEY_PREFIX}in-progress`) !==
+          "false",
+        recent:
+          localStorage.getItem(`${SESSION_GROUP_EXPANDED_STORAGE_KEY_PREFIX}recent`) !== "false",
+      });
+    } catch {
+      // Storage is optional; all groups stay expanded when unavailable.
+    }
+  }, []);
 
   const {
     needsAttention,
+    attentionUnreadCount,
     inProgress,
     finished,
     childrenMap,
+    unreadDescendantRootIds,
     loading,
     sessionsError,
     refreshSnapshot,
@@ -88,7 +167,18 @@ export function SessionSidebar({
     setSessionCreatorFilter,
     handleSessionArchived,
     handleMarkLatestMessageRead,
+    handleMarkHierarchyRead,
+    handleMarkAllAttentionRead,
   } = useSidebarSessions();
+  const activeTeamName = teams.find((team) => team.id === activeTeamId)?.name;
+  const attentionScopeLabel =
+    [
+      sessionCreatorFilter === "mine" ? "Mine" : null,
+      activeTeamName ??
+        (scope === "workspace" ? "Workspace" : scope === "all" ? "All teams" : null),
+    ]
+      .filter(Boolean)
+      .join(" · ") || undefined;
 
   // Archiving the session on screen leaves nothing to show, so fall back to the home page.
   const handleArchivedSession = useCallback(
@@ -104,7 +194,7 @@ export function SessionSidebar({
   // Environment provenance for the cards, resolved once for the whole list.
   // Names are looked up so a deleted environment (or one still loading)
   // simply drops the chip instead of showing a raw id.
-  const { environments } = useEnvironments();
+  const { environments } = useEnvironments({ teamId: activeTeamId });
   const environmentNamesById = useMemo(
     () => new Map(environments.map((environment) => [environment.id, environment.name])),
     [environments]
@@ -122,6 +212,7 @@ export function SessionSidebar({
   const SettingsDestinationIcon = SETTINGS_DESTINATION.icon;
 
   const renderSessionGroup = (
+    groupId: SessionGroupId,
     title: string,
     groupSessions: SessionItem[],
     pagination: {
@@ -131,56 +222,100 @@ export function SessionSidebar({
       error?: unknown;
       retry: () => Promise<unknown>;
     },
-    emphasize = false
+    emphasize = false,
+    headerAction?: ReactNode
   ) => {
     if (groupSessions.length === 0 && !pagination.error) return null;
 
+    const headingId = `session-group-${groupId}`;
+    const contentId = `${headingId}-content`;
+    const expanded = expandedGroups[groupId];
+
     return (
-      <section aria-labelledby={`session-group-${title.toLowerCase().replaceAll(" ", "-")}`}>
-        <div className="px-4 pb-1 pt-3">
-          <h2
-            id={`session-group-${title.toLowerCase().replaceAll(" ", "-")}`}
-            className={`text-xs font-medium uppercase tracking-wider ${
-              emphasize ? "text-foreground" : "text-secondary-foreground"
-            }`}
-          >
-            {title}
+      <section aria-labelledby={headingId}>
+        <div className="group relative transition-colors hover:bg-muted">
+          <h2 id={headingId}>
+            <button
+              type="button"
+              aria-expanded={expanded}
+              aria-controls={contentId}
+              className={`flex min-h-10 w-full items-center gap-1.5 px-4 text-left text-xs font-medium uppercase tracking-wider transition-colors hover:text-foreground ${
+                emphasize ? "text-foreground" : "text-secondary-foreground"
+              } ${headerAction ? "pr-12" : ""}`}
+              onClick={() => {
+                const nextExpanded = !expanded;
+                setExpandedGroups((previous) => ({
+                  ...previous,
+                  [groupId]: nextExpanded,
+                }));
+                try {
+                  localStorage.setItem(
+                    `${SESSION_GROUP_EXPANDED_STORAGE_KEY_PREFIX}${groupId}`,
+                    String(nextExpanded)
+                  );
+                } catch {
+                  // Continue with the in-memory preference when storage is unavailable.
+                }
+              }}
+            >
+              <span aria-hidden="true">
+                {expanded ? (
+                  <ChevronDownIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                ) : (
+                  <ChevronRightIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                )}
+              </span>
+              {title}
+            </button>
           </h2>
+          {headerAction && (
+            <div className="absolute inset-y-0 right-3 flex items-center">{headerAction}</div>
+          )}
         </div>
-        {groupSessions.map((session) => (
-          <SessionWithChildren
-            key={session.id}
-            session={session}
-            environmentName={
-              session.environmentId ? environmentNamesById.get(session.environmentId) : undefined
-            }
-            childrenMap={childrenMap}
-            currentSessionId={currentSessionId}
-            isMobile={isMobile}
-            onArchive={handleArchivedSession}
-            onSessionSelect={onSessionSelect}
-            onMarkLatestMessageRead={handleMarkLatestMessageRead}
-          />
-        ))}
-        {Boolean(pagination.error) && (
-          <div className="mx-3 my-1 flex items-center justify-between gap-2 px-1 py-2 text-xs text-destructive">
-            <span>Unable to load {title.toLowerCase()}</span>
-            <Button variant="ghost" size="sm" onClick={() => void pagination.retry()}>
-              Retry
-            </Button>
-          </div>
-        )}
-        {pagination.hasMore && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="mx-3 my-1 w-[calc(100%-1.5rem)] text-xs text-muted-foreground"
-            disabled={pagination.loadingMore}
-            onClick={pagination.loadMore}
-          >
-            {pagination.loadingMore ? "Loading..." : `Load more ${title.toLowerCase()}`}
-          </Button>
-        )}
+        <div id={contentId}>
+          {expanded && (
+            <>
+              {groupSessions.map((session) => (
+                <SessionWithChildren
+                  key={session.id}
+                  session={session}
+                  environmentName={
+                    session.environmentId
+                      ? environmentNamesById.get(session.environmentId)
+                      : undefined
+                  }
+                  childrenMap={childrenMap}
+                  hasUnreadDescendants={unreadDescendantRootIds.has(session.id)}
+                  currentSessionId={currentSessionId}
+                  isMobile={isMobile}
+                  onArchive={handleArchivedSession}
+                  onSessionSelect={onSessionSelect}
+                  onMarkLatestMessageRead={handleMarkLatestMessageRead}
+                  onMarkHierarchyRead={handleMarkHierarchyRead}
+                />
+              ))}
+              {Boolean(pagination.error) && (
+                <div className="mx-3 my-1 flex items-center justify-between gap-2 px-1 py-2 text-xs text-destructive">
+                  <span>Unable to load {title.toLowerCase()}</span>
+                  <Button variant="ghost" size="sm" onClick={() => void pagination.retry()}>
+                    Retry
+                  </Button>
+                </div>
+              )}
+              {pagination.hasMore && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="mx-3 my-1 w-[calc(100%-1.5rem)] text-xs text-muted-foreground"
+                  disabled={pagination.loadingMore}
+                  onClick={pagination.loadMore}
+                >
+                  {pagination.loadingMore ? "Loading..." : `Load more ${title.toLowerCase()}`}
+                </Button>
+              )}
+            </>
+          )}
+        </div>
       </section>
     );
   };
@@ -188,33 +323,38 @@ export function SessionSidebar({
   return (
     <aside className="w-72 h-dvh flex flex-col border-r border-border-muted bg-background">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border-muted">
-        <div className="flex min-w-0 items-center gap-2">
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={onToggle}
-            title={`Toggle sidebar (${labels["toggle-sidebar"]})`}
-            aria-label={`Toggle sidebar (${labels["toggle-sidebar"]})`}
-          >
-            <SidebarIcon className="w-4 h-4" />
-          </Button>
-          <SearchSessionsButton onClick={onSearchSessions} />
+      <div className="border-b border-border-muted">
+        <div className="flex items-center justify-between px-4 py-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={onToggle}
+              title={`Toggle sidebar (${labels["toggle-sidebar"]})`}
+              aria-label={`Toggle sidebar (${labels["toggle-sidebar"]})`}
+            >
+              <SidebarIcon className="w-4 h-4" />
+            </Button>
+            <SearchSessionsButton onClick={onSearchSessions} />
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {hasPermission("sessions.create") && <NewSessionButton onClick={onNewSession} />}
+            <Link
+              href={SETTINGS_DESTINATION.href}
+              onClick={handleNavigationSelect}
+              className={`p-1.5 transition ${
+                pathname === SETTINGS_DESTINATION.href
+                  ? "text-foreground bg-muted"
+                  : "text-muted-foreground hover:text-foreground hover:bg-muted"
+              }`}
+              title={SETTINGS_DESTINATION.label}
+            >
+              <SettingsDestinationIcon className="w-4 h-4" />
+            </Link>
+          </div>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {hasPermission("sessions.create") && <NewSessionButton onClick={onNewSession} />}
-          <Link
-            href={SETTINGS_DESTINATION.href}
-            onClick={handleNavigationSelect}
-            className={`p-1.5 transition ${
-              pathname === SETTINGS_DESTINATION.href
-                ? "text-foreground bg-muted"
-                : "text-muted-foreground hover:text-foreground hover:bg-muted"
-            }`}
-            title={SETTINGS_DESTINATION.label}
-          >
-            <SettingsDestinationIcon className="w-4 h-4" />
-          </Link>
+        <div className="px-4 pb-2 empty:hidden">
+          <TeamSwitcher onNavigate={handleNavigationSelect} />
         </div>
       </div>
 
@@ -225,10 +365,13 @@ export function SessionSidebar({
         ).map(({ href, label, icon: Icon }) => (
           <Link
             key={href}
-            href={href}
+            href={href === "/sessions" ? buildSessionsHref(teamQuery) : href}
             onClick={handleNavigationSelect}
+            aria-current={
+              pathname === href || pathname?.startsWith(`${href}/`) ? "page" : undefined
+            }
             className={`flex items-center gap-2 px-3 py-1.5 text-sm rounded-md transition ${
-              pathname?.startsWith(href)
+              pathname === href || pathname?.startsWith(`${href}/`)
                 ? "text-foreground bg-muted"
                 : "text-muted-foreground hover:text-foreground hover:bg-muted"
             }`}
@@ -269,9 +412,7 @@ export function SessionSidebar({
       {/* Session List */}
       <div className="flex-1 overflow-y-auto">
         {loading ? (
-          <div className="flex justify-center py-8">
-            <div className="animate-spin rounded-full h-6 w-6 border-2 border-current border-t-transparent text-muted-foreground" />
-          </div>
+          <SessionListSkeleton />
         ) : (
           <>
             {needsAttention.length === 0 && inProgress.length === 0 && finished.length === 0 ? (
@@ -290,24 +431,41 @@ export function SessionSidebar({
             ) : (
               <>
                 {renderSessionGroup(
+                  "needs-attention",
                   "Needs attention",
                   needsAttention,
                   sectionPagination.needsAttention,
-                  true
+                  true,
+                  // Rows can come from the stored selection before memberships confirm the
+                  // scope this confirmation names.
+                  needsAttention.length > 0 && !loadingTeams && (
+                    <MarkAllReadButton
+                      count={sectionPagination.needsAttention.hasMore ? null : attentionUnreadCount}
+                      scopeLabel={attentionScopeLabel}
+                      onConfirm={handleMarkAllAttentionRead}
+                    />
+                  )
                 )}
-                {renderSessionGroup("In progress", inProgress, sectionPagination.inProgress)}
-                {renderSessionGroup("Recent", finished, sectionPagination.finished)}
+                {renderSessionGroup(
+                  "in-progress",
+                  "In progress",
+                  inProgress,
+                  sectionPagination.inProgress
+                )}
+                {renderSessionGroup("recent", "Recent", finished, sectionPagination.finished)}
               </>
             )}
 
-            <Link
-              href="/settings?tab=data-controls"
-              onClick={handleNavigationSelect}
-              className="mt-2 flex items-center gap-1 px-4 py-2 text-xs font-medium uppercase tracking-wider text-secondary-foreground transition hover:bg-muted hover:text-foreground"
-            >
-              <ChevronRightIcon className="h-3.5 w-3.5" />
-              Archived
-            </Link>
+            {hasPermission("sessions.read") && (
+              <Link
+                href={buildSessionsHref({ ...teamQuery, lifecycle: "archived" })}
+                onClick={handleNavigationSelect}
+                className="mt-2 flex items-center gap-1 px-4 py-2 text-xs font-medium uppercase tracking-wider text-secondary-foreground transition hover:bg-muted hover:text-foreground"
+              >
+                <ChevronRightIcon className="h-3.5 w-3.5" />
+                Archived
+              </Link>
+            )}
           </>
         )}
       </div>

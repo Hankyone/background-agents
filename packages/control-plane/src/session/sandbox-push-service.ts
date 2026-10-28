@@ -1,5 +1,6 @@
 import type { SandboxEvent } from "@open-inspect/shared/types/sandbox-events";
 import type { Logger } from "../logger";
+import type { SandboxPushAdmission } from "../sandbox/lifecycle/manager";
 import type { GitPushSpec } from "../source-control";
 import type { SessionWebSocketManager } from "./websocket-manager";
 
@@ -27,7 +28,8 @@ export class SandboxPushService {
 
   constructor(
     private readonly log: Logger,
-    private readonly wsManager: SessionWebSocketManager
+    private readonly wsManager: SessionWebSocketManager,
+    private readonly pushAdmission: () => SandboxPushAdmission = () => "unmanaged"
   ) {}
 
   /**
@@ -41,18 +43,54 @@ export class SandboxPushService {
   async pushBranchToRemote(
     pushSpec: GitPushSpec
   ): Promise<{ success: true } | { success: false; error: string }> {
-    const sandboxWs = this.wsManager.getSandboxSocket();
-
-    if (!sandboxWs) {
-      this.log.info("No sandbox connected, assuming branch was pushed manually");
-      return { success: true };
+    const admission = this.pushAdmission();
+    if (admission !== "ready" && admission !== "unmanaged") {
+      if (admission === "held") {
+        return { success: false, error: "Sandbox graceful shutdown is in progress; push is held" };
+      }
+      return {
+        success: false,
+        error: "Sandbox must be started before pushing; retry once ready",
+      };
     }
-
     const resolverKey = this.pushResolverKey(
       pushSpec.repoOwner,
       pushSpec.repoName,
       pushSpec.targetBranch
     );
+    // Terminal events carry no request id, so same-key pushes cannot be distinguished.
+    if (this.pendingPushResolvers.has(resolverKey)) {
+      return {
+        success: false,
+        error: `Push already in flight for ${pushSpec.repoOwner}/${pushSpec.repoName} on branch ${pushSpec.targetBranch}; retry once it completes`,
+      };
+    }
+
+    // The ready socket, not the attached one: a bridge attached ahead of its
+    // boot would otherwise be handed a push it cannot run, and the caller
+    // would wait out PUSH_TIMEOUT_MS for an answer that never comes. Nor is
+    // a booting sandbox "no sandbox": that path assumes the branch was pushed
+    // by hand, and a PR opened on that assumption would point at nothing.
+    const target = this.wsManager.getSandboxCommandTarget();
+
+    if (target.kind !== "dispatch") {
+      if (target.kind === "booting") {
+        this.log.info("Sandbox attached but not ready, refusing push", {
+          branch_name: pushSpec.targetBranch,
+        });
+        return { success: false, error: "Sandbox is still starting; retry once it is ready" };
+      }
+      if (admission === "unmanaged") {
+        this.log.info("No sandbox connected, assuming branch was pushed manually");
+        return { success: true };
+      }
+      this.log.info("Managed sandbox is not connected, refusing push", {
+        branch_name: pushSpec.targetBranch,
+      });
+      return { success: false, error: "Sandbox is disconnected; retry once it is ready" };
+    }
+
+    const sandboxWs = target.socket;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
     const pushPromise = new Promise<void>((resolve, reject) => {

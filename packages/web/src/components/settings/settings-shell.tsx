@@ -1,13 +1,15 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useIsMobile } from "@/hooks/use-media-query";
+import { MOBILE_BREAKPOINT, useMediaQuerySnapshot } from "@/hooks/use-media-query";
 import { supportsRepoImages } from "@/lib/sandbox-provider";
 import { SettingsViewportProvider } from "@/components/settings/settings-viewport-context";
 import { SettingsNav } from "@/components/settings/settings-nav";
 import { resolveSettingsCategory } from "@/components/settings/settings-registry";
 import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
+import { useMeTeams } from "@/hooks/use-teams";
+import { ErrorBanner } from "@/components/ui/error-banner";
 
 /**
  * Hosts responsive settings content and redirects routes whose category is unavailable to the current user.
@@ -16,27 +18,63 @@ export function SettingsShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const isMobile = useIsMobile();
-  const [isHydrated, setIsHydrated] = useState(false);
+  const isMobile = useMediaQuerySnapshot(MOBILE_BREAKPOINT);
+  const isHydrated = isMobile !== undefined;
   const tab = searchParams.get("tab");
   const { hasPermission, loading } = useCurrentUserAuthorization();
-  const requestedCategory = pathname.startsWith("/settings/integrations/") ? "integrations" : tab;
+  const { teams, loading: teamsLoading, error: teamsError } = useMeTeams();
+  const canEditTeam = teams.some((team) => team.capabilities?.canEditMetadata === true);
+  const requestedCategory = pathname.startsWith("/settings/integrations/")
+    ? "integrations"
+    : pathname.startsWith("/settings/teams/")
+      ? "teams"
+      : tab;
   const activeCategory = resolveSettingsCategory(
     requestedCategory,
     supportsRepoImages(),
-    hasPermission
+    hasPermission,
+    canEditTeam
   );
   const categoryRedirectRequired =
     requestedCategory !== null && activeCategory !== requestedCategory;
+  const teamLookupFailed =
+    requestedCategory === "teams" && !!teamsError && !hasPermission("workspace.members.manage");
 
-  useEffect(() => setIsHydrated(true), []);
   useEffect(() => {
-    if (isHydrated && !loading && categoryRedirectRequired) {
+    if (
+      isHydrated &&
+      !loading &&
+      !(requestedCategory === "teams" && teamsLoading) &&
+      !teamLookupFailed &&
+      categoryRedirectRequired
+    ) {
       router.replace(`/settings?tab=${activeCategory}`);
     }
-  }, [activeCategory, categoryRedirectRequired, isHydrated, loading, router]);
+  }, [
+    activeCategory,
+    categoryRedirectRequired,
+    isHydrated,
+    loading,
+    requestedCategory,
+    teamLookupFailed,
+    teamsLoading,
+    router,
+  ]);
 
-  if (!isHydrated || loading || categoryRedirectRequired) {
+  if (teamLookupFailed) {
+    return (
+      <main className="h-dvh bg-background p-6">
+        <ErrorBanner>Failed to load teams.</ErrorBanner>
+      </main>
+    );
+  }
+
+  if (
+    !isHydrated ||
+    loading ||
+    (requestedCategory === "teams" && teamsLoading) ||
+    categoryRedirectRequired
+  ) {
     return <main className="h-dvh overflow-hidden bg-background" aria-busy="true" />;
   }
 

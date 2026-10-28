@@ -2,13 +2,21 @@
 
 import { Fragment, useState } from "react";
 import {
-  getReasoningConfig,
   type ModelCategory,
   type ReasoningEffort,
   type ValidModel,
 } from "@open-inspect/shared/models";
+import {
+  DEFAULT_HARNESS,
+  HARNESS_IDS,
+  getHarnessReasoningConfig,
+  getHarnessLabel,
+  isValidHarness,
+  type HarnessId,
+} from "@open-inspect/shared/harnesses";
 import { formatModelNameLower } from "@/lib/format";
 import { BackIcon, ChevronDownIcon } from "@/components/ui/icons";
+import { HarnessIcon, HarnessName } from "@/components/harness-icon";
 import { useIsMobile } from "@/hooks/use-media-query";
 import {
   DropdownMenu,
@@ -30,6 +38,10 @@ type ModelReasoningSelectorProps = {
   items: ModelCategory[];
   onModelChange: (model: ValidModel) => void;
   onReasoningEffortChange: (effort: ReasoningEffort | undefined) => void;
+  /** Agent harness shown as the trigger's prefix. */
+  harness?: HarnessId;
+  /** Adds an Agent row to the menu; leave unset once the session's harness is fixed. */
+  onHarnessChange?: (harness: HarnessId) => void;
   disabled?: boolean;
 };
 
@@ -45,14 +57,23 @@ export function ModelReasoningSelector({
   items,
   onModelChange,
   onReasoningEffortChange,
+  harness,
+  onHarnessChange,
   disabled = false,
 }: ModelReasoningSelectorProps) {
   const isMobile = useIsMobile();
-  const [mobileView, setMobileView] = useState<"main" | "model" | "effort">("main");
-  const reasoningConfig = getReasoningConfig(selectedModel);
+  const [mobileView, setMobileView] = useState<"main" | "agent" | "model" | "effort">("main");
+  const reasoningConfig = getHarnessReasoningConfig(harness ?? DEFAULT_HARNESS, selectedModel);
   const selectedEffort = reasoningEffort ?? reasoningConfig?.default;
   const effortLabel = selectedEffort ? formatEffort(selectedEffort) : "Default";
   const modelLabel = formatModelNameLower(selectedModel);
+  const harnessLabel = harness ? getHarnessLabel(harness) : null;
+  const canChangeHarness = harness !== undefined && onHarnessChange !== undefined;
+  const triggerLabel = [
+    harnessLabel ? `Agent, model and effort: ${harnessLabel}` : "Model and effort:",
+    modelLabel,
+    ...(reasoningConfig ? [effortLabel] : []),
+  ].join(", ");
 
   return (
     <DropdownMenu onOpenChange={(open) => !open && setMobileView("main")}>
@@ -61,8 +82,14 @@ export function ModelReasoningSelector({
           type="button"
           disabled={disabled}
           className="flex max-w-full items-center gap-1.5 text-sm text-muted-foreground transition hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-          aria-label={`Model and effort: ${modelLabel}${reasoningConfig ? `, ${effortLabel}` : ""}`}
+          aria-label={triggerLabel}
         >
+          {harness && harnessLabel && (
+            <>
+              <HarnessIcon harness={harness} className="size-3.5" />
+              <span className="hidden shrink-0 sm:inline">{harnessLabel}:</span>
+            </>
+          )}
           <span className="max-w-[9rem] truncate sm:max-w-none">{modelLabel}</span>
           {reasoningConfig && (
             <span className="shrink-0 text-secondary-foreground">{effortLabel}</span>
@@ -86,6 +113,19 @@ export function ModelReasoningSelector({
         {isMobile ? (
           mobileView === "main" ? (
             <>
+              {canChangeHarness && (
+                <DropdownMenuItem
+                  onSelect={(event) => {
+                    event.preventDefault();
+                    setMobileView("agent");
+                  }}
+                >
+                  <span>Agent</span>
+                  <span className="ml-auto max-w-32 truncate text-muted-foreground">
+                    {harnessLabel}
+                  </span>
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem
                 onSelect={(event) => {
                   event.preventDefault();
@@ -121,7 +161,9 @@ export function ModelReasoningSelector({
                 Back
               </DropdownMenuItem>
               <DropdownMenuSeparator />
-              {mobileView === "model" ? (
+              {mobileView === "agent" && harness && onHarnessChange ? (
+                <HarnessOptions value={harness} onChange={onHarnessChange} />
+              ) : mobileView === "model" ? (
                 <ModelOptions items={items} value={selectedModel} onChange={onModelChange} />
               ) : (
                 reasoningConfig && (
@@ -136,6 +178,19 @@ export function ModelReasoningSelector({
           )
         ) : (
           <>
+            {canChangeHarness && harness && onHarnessChange && (
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <span>Agent</span>
+                  <span className="ml-auto max-w-32 truncate text-muted-foreground">
+                    {harnessLabel}
+                  </span>
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent align="end" collisionPadding={8} className="w-48">
+                  <HarnessOptions value={harness} onChange={onHarnessChange} />
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            )}
             <DropdownMenuSub>
               <DropdownMenuSubTrigger>
                 <span>Model</span>
@@ -170,6 +225,29 @@ export function ModelReasoningSelector({
         )}
       </DropdownMenuContent>
     </DropdownMenu>
+  );
+}
+
+function HarnessOptions({
+  value,
+  onChange,
+}: {
+  value: HarnessId;
+  onChange: (harness: HarnessId) => void;
+}) {
+  return (
+    <DropdownMenuRadioGroup
+      value={value}
+      onValueChange={(next) => {
+        if (isValidHarness(next)) onChange(next);
+      }}
+    >
+      {HARNESS_IDS.map((candidate) => (
+        <DropdownMenuRadioItem key={candidate} value={candidate}>
+          <HarnessName harness={candidate} />
+        </DropdownMenuRadioItem>
+      ))}
+    </DropdownMenuRadioGroup>
   );
 }
 

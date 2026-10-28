@@ -34,6 +34,11 @@ interface ModelCatalogEntry {
   name: string;
   description: string;
   default?: true;
+  /** Presence qualifies this model for Codex; only differences from reasoning are recorded. */
+  codex?: {
+    readonly additionalEfforts?: readonly ReasoningEffort[];
+    readonly default?: ReasoningEffort;
+  };
   reasoning?: {
     readonly efforts: readonly ReasoningEffort[];
     readonly default: ReasoningEffort | undefined;
@@ -70,7 +75,16 @@ export const MODEL_CATALOG = [
       {
         id: "anthropic/claude-sonnet-5",
         name: "Claude Sonnet 5",
-        description: "Latest Sonnet, adaptive thinking",
+        description: "Balanced performance, adaptive thinking",
+        reasoning: {
+          efforts: ["low", "medium", "high", "xhigh", "max"],
+          default: "high",
+        },
+      },
+      {
+        id: "anthropic/claude-sonnet-5-5",
+        name: "Claude Sonnet 5.5",
+        description: "Latest Sonnet, fast and intelligent",
         reasoning: {
           efforts: ["low", "medium", "high", "xhigh", "max"],
           default: "high",
@@ -109,7 +123,16 @@ export const MODEL_CATALOG = [
       {
         id: "anthropic/claude-opus-5",
         name: "Claude Opus 5",
-        description: "Latest Opus, adaptive thinking",
+        description: "Most capable, adaptive thinking",
+        reasoning: {
+          efforts: ["low", "medium", "high", "xhigh", "max"],
+          default: "high",
+        },
+      },
+      {
+        id: "anthropic/claude-opus-5-5",
+        name: "Claude Opus 5.5",
+        description: "Latest Opus, long-running agentic coding",
         reasoning: {
           efforts: ["low", "medium", "high", "xhigh", "max"],
           default: "high",
@@ -119,6 +142,15 @@ export const MODEL_CATALOG = [
         id: "anthropic/claude-fable-5",
         name: "Claude Fable 5",
         description: "Most powerful, new tier above Opus",
+        reasoning: {
+          efforts: ["low", "medium", "high", "xhigh", "max"],
+          default: "high",
+        },
+      },
+      {
+        id: "anthropic/claude-fable-5-1",
+        name: "Claude Fable 5.1",
+        description: "Demanding reasoning and long-horizon agentic work",
         reasoning: {
           efforts: ["low", "medium", "high", "xhigh", "max"],
           default: "high",
@@ -141,6 +173,7 @@ export const MODEL_CATALOG = [
       },
       {
         id: "openai/gpt-5.5",
+        codex: { default: "medium" },
         name: "GPT 5.5",
         description: "Latest flagship model",
         reasoning: {
@@ -150,6 +183,7 @@ export const MODEL_CATALOG = [
       },
       {
         id: "openai/gpt-5.6-sol",
+        codex: { additionalEfforts: ["max"], default: "low" },
         name: "GPT 5.6 Sol",
         description: "Frontier model for complex professional work",
         reasoning: {
@@ -159,6 +193,7 @@ export const MODEL_CATALOG = [
       },
       {
         id: "openai/gpt-5.6-terra",
+        codex: { additionalEfforts: ["max"] },
         name: "GPT 5.6 Terra",
         description: "Balanced, cost-efficient everyday work",
         reasoning: {
@@ -168,6 +203,7 @@ export const MODEL_CATALOG = [
       },
       {
         id: "openai/gpt-5.6-luna",
+        codex: {},
         name: "GPT 5.6 Luna",
         description: "Fast, cost-efficient high-volume workloads",
         reasoning: {
@@ -176,16 +212,44 @@ export const MODEL_CATALOG = [
         },
       },
       {
-        id: "openai/gpt-5.3-codex",
-        name: "GPT 5.3 Codex",
-        description: "Latest codex",
-        reasoning: { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
+        id: "openai/gpt-6-astra",
+        codex: { default: "low" },
+        name: "GPT-6 Astra",
+        description: "Most capable model for complex, demanding work",
+        reasoning: {
+          efforts: ["low", "medium", "high", "xhigh", "max"],
+          default: "medium",
+        },
       },
       {
-        id: "openai/gpt-5.3-codex-spark",
-        name: "GPT 5.3 Codex Spark",
-        description: "Low-latency codex variant",
-        reasoning: { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
+        id: "openai/gpt-6-sol",
+        codex: {},
+        name: "GPT-6 Sol",
+        description: "Complex coding and agentic workflows",
+        reasoning: {
+          efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+          default: "medium",
+        },
+      },
+      {
+        id: "openai/gpt-6.1-sol",
+        codex: { default: "low" },
+        name: "GPT-6.1 Sol",
+        description: "Complex coding, computer use, and professional work",
+        reasoning: {
+          efforts: ["low", "medium", "high", "xhigh", "max"],
+          default: "medium",
+        },
+      },
+      {
+        id: "openai/gpt-6-luna",
+        codex: {},
+        name: "GPT-6 Luna",
+        description: "Efficient model for focused, high-volume tasks",
+        reasoning: {
+          efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+          default: "medium",
+        },
       },
     ],
   },
@@ -204,6 +268,61 @@ export const MODEL_CATALOG = [
     ],
   },
   {
+    // OpenCode Go is a flat-rate subscription over the same Zen credential:
+    // one OPENCODE_API_KEY, a separate gateway (zen/go/v1) and its own
+    // curated model list.
+    category: "OpenCode Go",
+    enabledByDefault: false,
+    models: [
+      { id: "opencode-go/grok-4.6", name: "Grok 4.6", description: "xAI" },
+      { id: "opencode-go/gpt-5.6-luna", name: "GPT 5.6 Luna", description: "OpenAI" },
+      { id: "opencode-go/glm-5.3-flash", name: "GLM 5.3 Flash", description: "Z.ai" },
+      { id: "opencode-go/glm-5.3", name: "GLM 5.3", description: "Z.ai" },
+      { id: "opencode-go/glm-5.2", name: "GLM 5.2", description: "Z.ai" },
+      { id: "opencode-go/glm-5.1", name: "GLM 5.1", description: "Z.ai" },
+      { id: "opencode-go/kimi-k3", name: "Kimi K3", description: "Moonshot AI" },
+      { id: "opencode-go/kimi-k2.7-code", name: "Kimi K2.7 Code", description: "Moonshot AI" },
+      { id: "opencode-go/kimi-k2.6", name: "Kimi K2.6", description: "Moonshot AI" },
+      { id: "opencode-go/longcat-2.0", name: "LongCat 2.0", description: "Meituan" },
+      {
+        id: "opencode-go/deepseek-v4.1-flash",
+        name: "DeepSeek V4.1 Flash",
+        description: "DeepSeek",
+      },
+      { id: "opencode-go/deepseek-v4-pro", name: "DeepSeek V4 Pro", description: "DeepSeek" },
+      { id: "opencode-go/deepseek-v4-flash", name: "DeepSeek V4 Flash", description: "DeepSeek" },
+      {
+        id: "opencode-go/deepseek-v4-flash-vision-exp",
+        name: "DeepSeek V4 Flash Vision Exp",
+        description: "DeepSeek, experimental vision",
+      },
+      { id: "opencode-go/mimo-v2.5", name: "MiMo V2.5", description: "Xiaomi" },
+      { id: "opencode-go/mimo-v2.5-pro", name: "MiMo V2.5 Pro", description: "Xiaomi" },
+      { id: "opencode-go/minimax-m3", name: "MiniMax M3", description: "MiniMax" },
+      // Go's docs list minimax-m2.5 too, but opencode does not resolve
+      // opencode-go/minimax-m2.5 at the pinned version — it is reachable as
+      // opencode/minimax-m2.5 on Zen. Re-add when the harness exposes it.
+      { id: "opencode-go/minimax-m2.7", name: "MiniMax M2.7", description: "MiniMax" },
+      {
+        id: "opencode-go/muse-spark-1.3-contributor",
+        name: "Muse Spark 1.3 Contributor",
+        description: "Multimodal contributor tier",
+      },
+      {
+        id: "opencode-go/muse-spark-1.2-contributor",
+        name: "Muse Spark 1.2 Contributor",
+        description: "Multimodal contributor tier",
+      },
+      { id: "opencode-go/qwen3.8-max", name: "Qwen3.8 Max", description: "Alibaba Cloud" },
+      { id: "opencode-go/qwen3.8-flash", name: "Qwen3.8 Flash", description: "Alibaba Cloud" },
+      { id: "opencode-go/qwen3.7-max", name: "Qwen3.7 Max", description: "Alibaba Cloud" },
+      { id: "opencode-go/qwen3.7-plus", name: "Qwen3.7 Plus", description: "Alibaba Cloud" },
+      { id: "opencode-go/qwen3.6-plus", name: "Qwen3.6 Plus", description: "Alibaba Cloud" },
+      { id: "opencode-go/hy4-preview", name: "Hy4 Preview", description: "Tencent Hunyuan" },
+      { id: "opencode-go/hy3", name: "Hy3", description: "Tencent Hunyuan" },
+    ],
+  },
+  {
     category: "xAI / SuperGrok",
     enabledByDefault: false,
     models: [
@@ -216,8 +335,14 @@ export const MODEL_CATALOG = [
       {
         id: "xai/grok-4.6",
         name: "Grok 4.6",
+        description: "Grok for chat, coding, and agentic tools",
+        reasoning: { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
+      },
+      {
+        id: "xai/grok-4.7",
+        name: "Grok 4.7",
         description: "Latest Grok for chat, coding, and agentic tools",
-        reasoning: { efforts: ["low", "medium", "high"], default: "high" },
+        reasoning: { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
       },
       {
         id: "xai/grok-build-0.1",
@@ -299,6 +424,21 @@ export const MODEL_OPTIONS: ModelCategory[] = [
   })),
 ];
 
+const MODEL_DISPLAY_NAMES = new Map<string, string>(
+  MODEL_CATALOG.flatMap((group) => group.models.map((model) => [model.id, model.name]))
+);
+
+/**
+ * Catalog display name for a model ID, falling back to the ID itself for
+ * models that are no longer in the catalog.
+ *
+ * @example
+ * getModelDisplayName("anthropic/claude-sonnet-4-5") // "Claude Sonnet 4.5"
+ */
+export function getModelDisplayName(modelId: string): string {
+  return MODEL_DISPLAY_NAMES.get(normalizeModelId(modelId)) ?? modelId;
+}
+
 /**
  * Models enabled by default when no preferences are stored.
  * Excludes opt-in providers which must be enabled via settings.
@@ -332,6 +472,24 @@ export function isValidModel(model: string): model is ValidModel {
   return VALID_MODELS.includes(normalizeModelId(model) as ValidModel);
 }
 
+function retiredModelReplacement(model: string): ValidModel | undefined {
+  const normalized = normalizeModelId(model);
+  if (normalized === "openai/gpt-5.3-codex" || normalized === "openai/gpt-5.3-codex-spark") {
+    return "openai/gpt-6-sol";
+  }
+  return undefined;
+}
+
+/** Normalize a supported or retired model selection without choosing a default. */
+export function getValidModelOrReplacement(
+  model: string | undefined | null
+): ValidModel | undefined {
+  if (model && isValidModel(model)) {
+    return normalizeModelId(model) as ValidModel;
+  }
+  return (model && retiredModelReplacement(model)) || undefined;
+}
+
 /** Normalize a list to unique, canonical model IDs that exist in the current catalog. */
 export function normalizeValidModels(modelIds: readonly string[]): ValidModel[] {
   const validModels = new Set<ValidModel>();
@@ -342,6 +500,27 @@ export function normalizeValidModels(modelIds: readonly string[]): ValidModel[] 
   return [...validModels];
 }
 
+export interface ModelPreferenceChange {
+  modelId: ValidModel;
+  enabled: boolean;
+}
+
+/** Apply ordered set-membership changes while preserving the order of existing models. */
+export function applyModelPreferenceChanges(
+  enabledModels: readonly ValidModel[],
+  changes: readonly ModelPreferenceChange[]
+): ValidModel[] {
+  const next = new Set(enabledModels);
+  for (const { modelId, enabled } of changes) {
+    if (enabled) {
+      next.add(modelId);
+    } else {
+      next.delete(modelId);
+    }
+  }
+  return [...next];
+}
+
 /** Resolve a desired model against the enabled catalog using a canonical fallback policy. */
 export function resolveEnabledModel(options: {
   model?: string | null;
@@ -349,10 +528,7 @@ export function resolveEnabledModel(options: {
   fallbackModel?: string | null;
 }): ValidModel {
   const fallback = getValidModelOrDefault(options.fallbackModel);
-  const desired =
-    options.model && isValidModel(options.model)
-      ? (normalizeModelId(options.model) as ValidModel)
-      : fallback;
+  const desired = getValidModelOrReplacement(options.model) ?? fallback;
   if (!options.enabledModels) return desired;
 
   const enabledModels = normalizeValidModels(options.enabledModels);
@@ -376,6 +552,25 @@ export function getReasoningConfig(model: string): ModelReasoningConfig | undefi
   const normalized = normalizeModelId(model);
   if (!isValidModel(normalized)) return undefined;
   return MODEL_REASONING_CONFIG[normalized as ValidModel];
+}
+
+/** Codex compatibility derives from the existing catalog, never a separate model list. */
+export function getCodexReasoningConfig(model: string): ModelReasoningConfig | undefined {
+  const normalized = normalizeModelId(model);
+  const entry: ModelCatalogEntry | undefined = MODEL_DEFINITIONS.find(
+    (candidate) => candidate.id === normalized
+  );
+  if (!entry?.codex || !entry.reasoning) return undefined;
+  // Native Codex does not expose the API's no-reasoning mode.
+  return {
+    efforts: [
+      ...new Set([
+        ...entry.reasoning.efforts.filter((effort) => effort !== "none"),
+        ...(entry.codex.additionalEfforts ?? []),
+      ]),
+    ],
+    default: entry.codex.default ?? entry.reasoning.default,
+  };
 }
 
 /**
@@ -402,7 +597,7 @@ export function isValidReasoningEffort(model: string, effort: string): boolean {
  * @example
  * extractProviderAndModel("anthropic/claude-haiku-4-5") // { provider: "anthropic", model: "claude-haiku-4-5" }
  * extractProviderAndModel("claude-haiku-4-5") // { provider: "anthropic", model: "claude-haiku-4-5" }
- * extractProviderAndModel("openai/gpt-5.3-codex") // { provider: "openai", model: "gpt-5.3-codex" }
+ * extractProviderAndModel("openai/gpt-6-sol") // { provider: "openai", model: "gpt-6-sol" }
  */
 export function extractProviderAndModel(modelId: string): { provider: string; model: string } {
   const normalized = normalizeModelId(modelId);
@@ -431,12 +626,9 @@ export function getSubscriptionProviderForModel(modelId: string): SubscriptionPr
 }
 
 /**
- * Get a valid model or fall back to default.
+ * Get a valid model, migrate retired Codex selections, or fall back to default.
  * Accepts both prefixed and bare formats; always returns canonical prefixed format.
  */
 export function getValidModelOrDefault(model: string | undefined | null): ValidModel {
-  if (model && isValidModel(model)) {
-    return normalizeModelId(model) as ValidModel;
-  }
-  return DEFAULT_MODEL;
+  return getValidModelOrReplacement(model) ?? DEFAULT_MODEL;
 }

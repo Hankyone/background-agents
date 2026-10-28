@@ -1,13 +1,15 @@
 import { z } from "zod";
 import type { Logger } from "../../../logger";
 import type { RepositoryRef } from "@open-inspect/shared/types/repositories";
-import { getValidModelOrDefault, isValidModel } from "@open-inspect/shared/models";
+import { getValidHarnessOrDefault, harnessIdSchema } from "@open-inspect/shared/harnesses";
+import { isValidModel } from "@open-inspect/shared/models";
+import { HarnessAdmissionError, resolveHarnessInitialization } from "../../../harness-admission";
 import type { SpawnSource } from "@open-inspect/shared/types/sessions";
 import { normalizeSandboxSettings } from "../../../sandbox/settings";
 import { DEFAULT_BASE_BRANCH } from "../../../repos/default-branch";
 import { validateReasoningEffort } from "../../reasoning-effort";
 import type { SessionCoreRepository } from "../../session-core-repository";
-import type { SandboxRepository } from "../../sandbox-repository";
+import type { SandboxInitializer } from "../../sandbox-ports";
 import type { ParticipantRepository } from "../../participant-repository";
 
 const repositoryRefSchema = z.object({
@@ -47,6 +49,7 @@ const initRequestSchema = z.object({
   /** Launch environment provenance; null for repo-launched/ad-hoc sessions. */
   environmentId: z.string().nullable().optional(),
   title: z.string().optional(),
+  harness: harnessIdSchema.optional(),
   model: z.string().optional(),
   reasoningEffort: z.string().nullable().optional(),
   userId: z.string(),
@@ -55,10 +58,6 @@ const initRequestSchema = z.object({
   scmLogin: z.string().nullable().optional(),
   scmName: z.string().nullable().optional(),
   scmEmail: z.string().nullable().optional(),
-  scmToken: z.string().nullable().optional(),
-  scmTokenEncrypted: z.string().nullable().optional(),
-  scmRefreshTokenEncrypted: z.string().nullable().optional(),
-  scmTokenExpiresAt: z.number().nullable().optional(),
   scmUserId: z.string().nullable().optional(),
   parentSessionId: z.string().nullable().optional(),
   spawnSource: spawnSourceSchema.optional(),
@@ -86,11 +85,10 @@ type InitRequest = z.infer<typeof initRequestSchema>;
 export class SessionInitHandler {
   constructor(
     private readonly sessionCoreRepository: SessionCoreRepository,
-    private readonly sandboxRepository: SandboxRepository,
+    private readonly sandboxRepository: SandboxInitializer,
     private readonly participantRepository: ParticipantRepository,
     private readonly durableObjectId: string,
     private readonly scheduleWarmSandbox: () => void,
-    private readonly encryptScmToken: (token: string) => Promise<string>,
     private readonly generateId: (bytes?: number) => string,
     private readonly now: () => number = Date.now
   ) {}
@@ -128,20 +126,23 @@ export class SessionInitHandler {
         { status: 400 }
       );
     }
-
-    let encryptedToken = body.scmTokenEncrypted ?? null;
-    if (body.scmToken) {
-      try {
-        encryptedToken = await this.encryptScmToken(body.scmToken);
-        log.debug("Encrypted SCM token for storage");
-      } catch (error) {
-        log.error("Failed to encrypt SCM token", {
-          error: error instanceof Error ? error : String(error),
-        });
-      }
+    // A retried init must not rebuild sandbox/participant rows or reset live
+    // budget state. If the first attempt committed but never scheduled the
+    // spawn, the first prompt spawns through processMessageQueue.
+    if (this.sessionCoreRepository.getSession()) {
+      return Response.json({ sessionId, status: "created" });
     }
 
-    const model = getValidModelOrDefault(body.model);
+    const harness = getValidHarnessOrDefault(body.harness);
+    let selection;
+    try {
+      selection = resolveHarnessInitialization(harness, body);
+    } catch (cause) {
+      if (cause instanceof HarnessAdmissionError)
+        return Response.json({ error: cause.message }, { status: cause.status });
+      throw cause;
+    }
+    const { model } = selection;
     if (body.model && !isValidModel(body.model)) {
       log.warn("Invalid model name, using default", {
         requested_model: body.model,
@@ -149,7 +150,7 @@ export class SessionInitHandler {
       });
     }
 
-    const reasoningEffort = validateReasoningEffort(model, body.reasoningEffort ?? undefined, log);
+    const reasoningEffort = validateReasoningEffort(model, selection.reasoningEffort, log, harness);
     const baseBranch = hasRepoOwner
       ? body.branch || body.defaultBranch || DEFAULT_BASE_BRANCH
       : null;
@@ -178,6 +179,10 @@ export class SessionInitHandler {
       );
     }
 
+    const normalizedSandboxSettings = body.sandboxSettings
+      ? normalizeSandboxSettings(body.sandboxSettings, { invalid: "omit" })
+      : null;
+
     this.sessionCoreRepository.transaction(() => {
       this.sessionCoreRepository.upsertSession({
         id: sessionId,
@@ -187,6 +192,7 @@ export class SessionInitHandler {
         repoName,
         repoId: hasRepoOwner ? body.repoId : null,
         baseBranch,
+        harness,
         model,
         reasoningEffort,
         status: "created",
@@ -195,9 +201,10 @@ export class SessionInitHandler {
         spawnDepth: body.spawnDepth ?? 0,
         codeServerEnabled: body.codeServerEnabled ?? false,
         vncEnabled: body.vncEnabled ?? false,
-        sandboxSettings: body.sandboxSettings
-          ? JSON.stringify(normalizeSandboxSettings(body.sandboxSettings, { invalid: "omit" }))
+        sandboxSettings: normalizedSandboxSettings
+          ? JSON.stringify(normalizedSandboxSettings)
           : null,
+        maxCostUsd: normalizedSandboxSettings?.maxSessionCostUsd ?? null,
         environmentId: body.environmentId ?? null,
         createdAt: now,
         updatedAt: now,
@@ -237,9 +244,6 @@ export class SessionInitHandler {
         scmLogin: body.scmLogin ?? null,
         scmName: body.scmName ?? null,
         scmEmail: body.scmEmail ?? null,
-        scmAccessTokenEncrypted: encryptedToken,
-        scmRefreshTokenEncrypted: body.scmRefreshTokenEncrypted ?? null,
-        scmTokenExpiresAt: body.scmTokenExpiresAt ?? null,
         role: "owner",
         joinedAt: now,
       });

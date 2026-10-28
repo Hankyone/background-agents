@@ -8,6 +8,7 @@ import * as matchers from "@testing-library/jest-dom/matchers";
 import useSWR, { SWRConfig, mutate as globalMutate } from "swr";
 import { DataControlsSettings } from "./data-controls-settings";
 import { SIDEBAR_SESSIONS_KEY } from "@/lib/session-list";
+import type { SessionListSummary } from "@open-inspect/shared/types/sessions";
 
 expect.extend(matchers);
 
@@ -38,26 +39,42 @@ vi.mock("next/link", () => ({
   ),
 }));
 
-type ArchivedSession = ReturnType<typeof createArchivedSession>;
+type ArchivedSession = SessionListSummary;
 
-function createArchivedSession(index: number, overrides: Record<string, unknown> = {}) {
+function createArchivedSession(index: number): ArchivedSession {
   return {
     id: `session-${index}`,
+    capabilities: {
+      canRead: true,
+      canCollaborate: false,
+      canManageLifecycle: true,
+      canSandbox: false,
+      canDelete: false,
+      canManageCollaborators: false,
+      canChangeVisibility: false,
+    },
     title: `Session ${index}`,
     repoOwner: "open-inspect",
     repoName: "background-agents",
     baseBranch: "main",
-    branchName: null,
-    baseSha: null,
-    currentSha: null,
-    opencodeSessionId: null,
+    harness: "opencode",
+    model: "anthropic/claude-sonnet-4-6",
+    reasoningEffort: null,
     parentSessionId: null,
     spawnSource: "user",
     spawnDepth: 0,
     status: "archived",
+    automationId: null,
+    automationRunId: null,
+    scmLogin: null,
+    userId: null,
+    totalCost: 0,
+    activeDurationMs: 0,
+    messageCount: 0,
+    prCount: 0,
+    environmentId: null,
     createdAt: 1000 + index,
     updatedAt: 2000 + index,
-    ...overrides,
   };
 }
 
@@ -154,15 +171,59 @@ afterEach(async () => {
   authorizationMock.permissions = null;
 });
 
+describe("DataControlsSettings — loading state", () => {
+  it("shows a skeleton until the first page of archived sessions arrives", async () => {
+    let resolveList!: (response: Response) => void;
+    installFetch({
+      onArchivedList: () => new Promise<Response>((resolve) => (resolveList = resolve)),
+    });
+    renderComponent();
+
+    expect(
+      await screen.findByRole("status", { name: "Loading archived sessions" })
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+
+    resolveList(jsonResponse({ sessions: [createArchivedSession(1)], hasMore: false }));
+
+    expect(await screen.findByText("Session 1")).toBeInTheDocument();
+    expect(screen.getByText("1 archived session")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Loading archived sessions" })
+    ).not.toBeInTheDocument();
+  });
+});
+
 describe("DataControlsSettings — unarchive flow", () => {
   it("keeps archived sessions readable without exposing unarchive to read-only roles", async () => {
     authorizationMock.permissions = new Set(["sessions.read"]);
-    installFetch({ archivedSessions: [createArchivedSession(1)] });
+    const session = createArchivedSession(1);
+    session.capabilities!.canManageLifecycle = false;
+    installFetch({ archivedSessions: [session] });
 
     renderComponent();
 
     expect(await screen.findByText("Session 1")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Unarchive" })).not.toBeInTheDocument();
+  });
+
+  it("uses response lifecycle capabilities even without browser permission grants", async () => {
+    authorizationMock.permissions = new Set();
+    installFetch({ archivedSessions: [createArchivedSession(1)] });
+    renderComponent();
+    expect(await screen.findByRole("button", { name: "Unarchive" })).toBeInTheDocument();
+  });
+
+  it("toasts the server reason_code on an unarchive denial and keeps the row", async () => {
+    installFetch({
+      archivedSessions: [createArchivedSession(1)],
+      onUnarchive: () => jsonResponse({ reason_code: "team_inactive" }, 403),
+    });
+    renderComponent();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Unarchive" }));
+    expect(toastMock.error).toHaveBeenCalledWith("Failed to unarchive session (team_inactive)");
+    expect(screen.getByText("Session 1")).toBeInTheDocument();
   });
 
   it("removes the row when the unarchive request succeeds", async () => {

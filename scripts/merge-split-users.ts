@@ -15,7 +15,7 @@
  * graph mutation as one result-bearing D1 batch.
  *
  * Usage:
- *   node --experimental-transform-types scripts/merge-split-users.ts \
+ *   node scripts/merge-split-users.ts \
  *     --database <d1-database-name> --survivor <user-id> --loser <user-id>
  *     [--execute]
  *
@@ -42,6 +42,38 @@ interface WranglerQueryResult {
   results: Record<string, unknown>[];
   success: boolean;
   meta?: { changes?: number };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseWranglerQueryResults(value: unknown): WranglerQueryResult[] {
+  if (!Array.isArray(value)) throw new Error("wrangler returned malformed JSON output");
+  return value.map((entry) => {
+    if (!isRecord(entry) || typeof entry.success !== "boolean") {
+      throw new Error("wrangler returned malformed query result");
+    }
+    if (!entry.success) throw new Error(`Statement failed: ${JSON.stringify(entry)}`);
+    if (!Array.isArray(entry.results) || !entry.results.every(isRecord)) {
+      throw new Error("wrangler returned malformed query rows");
+    }
+    const meta = isRecord(entry.meta) ? entry.meta : undefined;
+    if (
+      (entry.meta !== undefined && !meta) ||
+      (meta?.changes !== undefined &&
+        (typeof meta.changes !== "number" ||
+          !Number.isSafeInteger(meta.changes) ||
+          meta.changes < 0))
+    ) {
+      throw new Error("wrangler returned malformed query metadata");
+    }
+    return {
+      results: entry.results,
+      success: entry.success,
+      meta: typeof meta?.changes === "number" ? { changes: meta.changes } : undefined,
+    };
+  });
 }
 
 /** Minimal process result used to test Wrangler orchestration without spawning. */
@@ -88,19 +120,31 @@ function inlineParams(sql: string, params: unknown[]): string {
   return rendered;
 }
 
+type WranglerStatement = SqlStatement & { render(): string };
+
 export class WranglerD1Database implements SqlDatabase {
+  private readonly databaseName: string;
+  private readonly remote: boolean;
+  private readonly verbose: boolean;
+  private readonly runner: WranglerRunner;
+
   constructor(
-    private readonly databaseName: string,
-    private readonly remote: boolean,
-    private readonly verbose: boolean,
-    private readonly runner: WranglerRunner = runWrangler
-  ) {}
+    databaseName: string,
+    remote: boolean,
+    verbose: boolean,
+    runner: WranglerRunner = runWrangler
+  ) {
+    this.databaseName = databaseName;
+    this.remote = remote;
+    this.verbose = verbose;
+    this.runner = runner;
+  }
 
   prepare(query: string): SqlStatement {
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const db = this;
     let params: unknown[] = [];
-    const statement: SqlStatement & { render(): string } = {
+    const statement: WranglerStatement = {
       bind(...values: unknown[]) {
         params = values;
         return statement;
@@ -128,13 +172,8 @@ export class WranglerD1Database implements SqlDatabase {
   // batch API. D1 executes the batch transactionally and Wrangler preserves
   // one positional result (including meta.changes) per statement.
   async batch<T = unknown>(statements: SqlStatement[]): Promise<SqlResult<T>[]> {
-    const rendered = statements.map((entry) => (entry as { render(): string }).render());
+    const rendered = statements.map((entry) => (entry as WranglerStatement).render());
     const results = this.execute(rendered);
-    if (results.length !== statements.length) {
-      throw new Error(
-        `Wrangler returned ${results.length} results for ${statements.length} batched statements`
-      );
-    }
     return results.map((result) => toSqlResult<T>(result));
   }
 
@@ -143,7 +182,13 @@ export class WranglerD1Database implements SqlDatabase {
     if (this.verbose) {
       for (const statement of statements) console.error(`[sql] ${statement}`);
     }
-    return this.executeOperation(["--command", statements.join(";\n")]);
+    const results = this.executeOperation(["--command", statements.join(";\n")]);
+    if (results.length !== statements.length) {
+      throw new Error(
+        `Wrangler returned ${results.length} results for ${statements.length} batched statements`
+      );
+    }
+    return results;
   }
 
   private executeOperation(operation: string[]): WranglerQueryResult[] {
@@ -160,11 +205,7 @@ export class WranglerD1Database implements SqlDatabase {
     if (child.status !== 0) {
       throw new Error(`wrangler d1 execute failed:\n${child.stderr || child.stdout}`);
     }
-    const parsed = JSON.parse(child.stdout) as WranglerQueryResult[];
-    const failed = parsed.find((result) => !result.success);
-    if (failed) {
-      throw new Error(`Statement failed: ${JSON.stringify(failed)}`);
-    }
+    const parsed = parseWranglerQueryResults(JSON.parse(child.stdout));
     return parsed;
   }
 }

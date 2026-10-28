@@ -185,7 +185,7 @@ describe("VercelSandboxClient", () => {
     );
   });
 
-  it("creates a sandbox with project id, team query, auth headers, and snapshot source", async () => {
+  it("creates a non-persistent sandbox with project id, team query, auth headers, and snapshot source", async () => {
     fetchSpy.mockResolvedValue(
       jsonResponse({
         sandbox: {
@@ -246,6 +246,7 @@ describe("VercelSandboxClient", () => {
       env: { FOO: "bar" },
       tags: { openinspect_framework: "open-inspect" },
       source: { type: "snapshot", snapshotId: "snapshot-1" },
+      persistent: false,
     });
     expect(result.session.id).toBe("session-1");
   });
@@ -338,6 +339,27 @@ describe("VercelSandboxClient", () => {
       wait: true,
     });
     expect(result).toEqual({ commandId: "cmd-1", exitCode: 0 });
+  });
+
+  it("ignores malformed command stream lines before a valid command update", async () => {
+    fetchSpy.mockResolvedValue(
+      new Response(
+        [
+          JSON.stringify({ command: "not-an-object" }),
+          JSON.stringify({ command: { exitCode: "done" } }),
+          JSON.stringify({ command: { id: "cmd-1", exitCode: null } }),
+          "",
+        ].join("\n"),
+        { status: 200 }
+      )
+    );
+
+    const result = await createClient().runCommandAndWait({
+      sessionId: "session-1",
+      command: "bash",
+    });
+
+    expect(result).toEqual({ commandId: "cmd-1", exitCode: null });
   });
 
   it("streams waited command output across chunk boundaries", async () => {

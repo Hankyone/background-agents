@@ -65,6 +65,17 @@ afterEach(() => {
 });
 
 describe("ImagesSettings", () => {
+  it("shows a skeleton while the image build feed loads", () => {
+    render(
+      <SWRConfig value={{ provider: () => new Map(), fetcher: () => new Promise(() => {}) }}>
+        <ImagesSettings />
+      </SWRConfig>
+    );
+
+    expect(screen.getByRole("status", { name: "Loading image settings" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Pre-Built Images" })).not.toBeInTheDocument();
+  });
+
   it("renders ready details from the primary repository provenance entry", () => {
     renderWithFeed({
       units: [{ scopeKind: "repo", scopeId: "acme/web", repositoriesFingerprint: "fp" }],
@@ -113,6 +124,33 @@ describe("ImagesSettings", () => {
 
     expect(screen.getByText("Failed")).toBeInTheDocument();
     expect(screen.getByText("clone exploded")).toBeInTheDocument();
+  });
+
+  it("says prebuilds are paused and offers no rebuild while admission is closed", () => {
+    renderWithFeed({
+      units: [{ scopeKind: "repo", scopeId: "acme/web", repositoriesFingerprint: "fp" }],
+      enabledRepos: [{ repoOwner: "acme", repoName: "web" }],
+      images: [],
+      admission: { open: false, reason: "daytona_prebuilds_disabled" },
+    });
+
+    expect(screen.getByText(/Prebuilds are paused/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rebuild image" })).toBeDisabled();
+    // The toggle records intent an operator can set before admission opens.
+    expect(
+      screen.getByRole("switch", { name: "Toggle pre-built images for acme/web" })
+    ).toBeEnabled();
+  });
+
+  it("offers rebuilds when the control plane reports no admission state at all", () => {
+    renderWithFeed({
+      units: [{ scopeKind: "repo", scopeId: "acme/web", repositoriesFingerprint: "fp" }],
+      enabledRepos: [{ repoOwner: "acme", repoName: "web" }],
+      images: [],
+    });
+
+    expect(screen.queryByText(/Prebuilds are paused/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rebuild image" })).toBeEnabled();
   });
 
   it("keeps the toggle enabled when unit resolution transiently dropped the repo", () => {

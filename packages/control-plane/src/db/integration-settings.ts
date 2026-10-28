@@ -11,6 +11,7 @@ import {
   getIntegrationGlobalSettingsSchema,
   getIntegrationRepoSettingsSchema,
   normalizeRoutingRules,
+  slackRoutingRuleSchema,
   type EnvironmentSettingsIntegrationId,
   type IntegrationId,
   type IntegrationSettingsMap,
@@ -23,7 +24,16 @@ import {
   type SlackMentionsPolicy,
   type SlackRoutingRule,
 } from "@open-inspect/shared/types/integrations";
-import { isValidModel, isValidReasoningEffort } from "@open-inspect/shared/models";
+import {
+  checkHarnessCompatibility,
+  DEFAULT_HARNESS,
+  getHarnessCapabilities,
+  getHarnessLabel,
+  HARNESS_IDS,
+  isValidHarnessReasoningEffort,
+  type HarnessId,
+} from "@open-inspect/shared/harnesses";
+import { isValidModel } from "@open-inspect/shared/models";
 import { normalizeSandboxSettings } from "../sandbox/settings";
 import type { SqlDatabase } from "./sql-database";
 
@@ -369,6 +379,7 @@ export class IntegrationSettingsStore {
     if (integrationId !== "sandbox") return settings;
     return normalizeSandboxSettings(settings, {
       invalid: "omit",
+      partial: true,
     }) as IntegrationSettingsMap[K]["repo"];
   }
 
@@ -382,12 +393,13 @@ export class IntegrationSettingsStore {
   ): IntegrationSettingsAtLevel<K, L> {
     if (integrationId === "github") {
       return this.validateAndNormalizeGitHubSettings(
-        settings as GitHubBotSettings
+        settings as GitHubBotSettings,
+        level
       ) as IntegrationSettingsAtLevel<K, L>;
     }
 
     if (integrationId === "linear") {
-      this.validateLinearSettings(settings as LinearBotSettings);
+      this.validateLinearSettings(settings as LinearBotSettings, level);
     }
 
     if (integrationId === "code-server") {
@@ -402,6 +414,7 @@ export class IntegrationSettingsStore {
       return normalizeSandboxSettings(settings, {
         invalid: "throw",
         createError: (message) => new IntegrationSettingsValidationError(message),
+        partial: level !== "global",
       }) as IntegrationSettingsAtLevel<K, L>;
     }
 
@@ -415,24 +428,69 @@ export class IntegrationSettingsStore {
     return settings;
   }
 
-  private validateModelAndEffort(settings: { model?: string; reasoningEffort?: string }): void {
+  /**
+   * Model, reasoning effort and (where the integration has one) harness, checked
+   * together. A harness and model saved at the same level must be compatible,
+   * like an automation on save. Sparse values merged from other levels can
+   * still disagree; launchers refuse incompatible resolved pairs.
+   */
+  private validateAgentSelection(
+    settings: {
+      model?: string;
+      reasoningEffort?: string;
+      harness?: HarnessId;
+    },
+    level: SettingsLevel
+  ): void {
     if (settings.model !== undefined && !isValidModel(settings.model)) {
       throw new IntegrationSettingsValidationError(`Invalid model ID: ${settings.model}`);
     }
 
+    // Deployment defaults are not visible here, so a restricted harness needs
+    // an explicit compatible default model at the same settings level.
     if (
-      settings.model !== undefined &&
-      settings.reasoningEffort !== undefined &&
-      !isValidReasoningEffort(settings.model, settings.reasoningEffort)
+      settings.harness !== undefined &&
+      settings.model === undefined &&
+      getHarnessCapabilities(settings.harness).modelFamilies !== "any"
     ) {
       throw new IntegrationSettingsValidationError(
-        `Invalid reasoning effort "${settings.reasoningEffort}" for model "${settings.model}"`
+        `Choose a default model ${getHarnessLabel(settings.harness)} can run.`
       );
+    }
+
+    const harnessIncompatibility =
+      settings.harness !== undefined && settings.model !== undefined
+        ? checkHarnessCompatibility(
+            settings.harness,
+            settings.model,
+            undefined,
+            settings.reasoningEffort
+          )
+        : null;
+    if (harnessIncompatibility) {
+      throw new IntegrationSettingsValidationError(harnessIncompatibility.message);
+    }
+
+    const { model, reasoningEffort } = settings;
+    if (model !== undefined && reasoningEffort !== undefined && settings.harness === undefined) {
+      const possibleHarnesses = level === "global" ? [DEFAULT_HARNESS] : HARNESS_IDS;
+      if (
+        !possibleHarnesses.some((harness) =>
+          isValidHarnessReasoningEffort(harness, model, reasoningEffort)
+        )
+      ) {
+        throw new IntegrationSettingsValidationError(
+          `Invalid reasoning effort "${reasoningEffort}" for model "${model}"`
+        );
+      }
     }
   }
 
-  private validateAndNormalizeGitHubSettings(settings: GitHubBotSettings): GitHubBotSettings {
-    this.validateModelAndEffort(settings);
+  private validateAndNormalizeGitHubSettings(
+    settings: GitHubBotSettings,
+    level: SettingsLevel
+  ): GitHubBotSettings {
+    this.validateAgentSelection(settings, level);
 
     if (
       settings.codeReviewInstructions !== undefined &&
@@ -521,8 +579,8 @@ export class IntegrationSettingsStore {
     return normalized;
   }
 
-  private validateLinearSettings(settings: LinearBotSettings): void {
-    this.validateModelAndEffort(settings);
+  private validateLinearSettings(settings: LinearBotSettings, level: SettingsLevel): void {
+    this.validateAgentSelection(settings, level);
 
     if (
       settings.allowUserPreferenceOverride !== undefined &&
@@ -582,8 +640,10 @@ export class IntegrationSettingsStore {
       level === "global"
         ? new Set([
             "agentNotificationsEnabled",
+            "harness",
             "model",
             "mentionsPolicy",
+            "unboundChannels",
             "routingRules",
             "sessionInstructions",
           ])
@@ -602,7 +662,7 @@ export class IntegrationSettingsStore {
       throw new IntegrationSettingsValidationError("agentNotificationsEnabled must be a boolean");
     }
 
-    this.validateModelAndEffort(settings);
+    this.validateAgentSelection(settings, level);
 
     if (
       settings.mentionsPolicy !== undefined &&
@@ -649,16 +709,17 @@ export class IntegrationSettingsStore {
         `routingRules cannot exceed ${MAX_SLACK_ROUTING_RULES} entries`
       );
     }
+    const parsedRules: SlackRoutingRule[] = [];
     for (const rule of rules) {
       if (typeof rule !== "object" || rule === null) {
         throw new IntegrationSettingsValidationError("each routing rule must be an object");
       }
-      const { keyword, target, targetType } = rule as {
-        keyword?: unknown;
-        target?: unknown;
-        targetType?: unknown;
-      };
-      if (typeof keyword !== "string" || keyword.trim() === "") {
+      const parsedRule = slackRoutingRuleSchema.safeParse(rule);
+      if (!parsedRule.success) {
+        throw new IntegrationSettingsValidationError("each routing rule must be an object");
+      }
+      const { keyword, target, targetType } = parsedRule.data;
+      if (keyword.trim() === "") {
         throw new IntegrationSettingsValidationError(
           "routing rule keyword must be a non-empty string"
         );
@@ -668,14 +729,9 @@ export class IntegrationSettingsStore {
           `routing rule keyword must be ${MAX_SLACK_ROUTING_KEYWORD_LENGTH} characters or fewer`
         );
       }
-      if (targetType !== undefined && targetType !== "repository" && targetType !== "environment") {
-        throw new IntegrationSettingsValidationError(
-          'routing rule targetType must be "repository" or "environment"'
-        );
-      }
       if (targetType === "environment") {
         // The stable environment id, never the rename-able display name.
-        if (typeof target !== "string" || !isEnvironmentId(target.trim())) {
+        if (!isEnvironmentId(target.trim())) {
           throw new IntegrationSettingsValidationError(
             "routing rule target must be an environment id (env_…) when targetType is environment"
           );
@@ -683,8 +739,7 @@ export class IntegrationSettingsStore {
         // The owner segment excludes ":" (GitHub forbids it) so a repository
         // target can never collide with the bots' "env:<id>" value encoding.
       } else {
-        const repository =
-          typeof target === "string" ? parseRepositoryFullName(target.trim()) : null;
+        const repository = parseRepositoryFullName(target.trim());
         if (
           !repository ||
           /[\s:]/.test(repository.repoOwner) ||
@@ -695,8 +750,9 @@ export class IntegrationSettingsStore {
           );
         }
       }
+      parsedRules.push(parsedRule.data);
     }
-    return normalizeRoutingRules(rules as SlackRoutingRule[]);
+    return normalizeRoutingRules(parsedRules);
   }
 }
 
