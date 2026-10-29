@@ -46,14 +46,17 @@ workspace role, and new users receive the Member role by default.
 
 ### Sign-In Allowlist
 
-Active built-in Owners and Administrators manage rules at **Settings > Workspace access > Sign-in
-allowlist**. Custom roles, even with member-management permission, cannot read or edit this policy.
+Active built-in Owners and Administrators manage rules at **Settings > Workspace access > Who can
+sign in**. Custom roles, even with member-management permission, cannot read or edit this policy.
 The policy covers browser sign-in and creation of new accounts through bot enrollment using the
 evidence described below. The member directory, general bot invocation restrictions, integration
 trigger restrictions, and resource authorization remain separate controls. Adding a rule itself
 sends no invitation and creates no member.
 
-The editor shows **Deployment**, **Settings**, or **Both** for each rule. Deployment rules come from
+The editor lists every rule as one plain-language line (for example, "Anyone with an @example.com
+email"). Type an email, domain, or GitHub name into the single add field; the editor infers the rule
+type and asks whether a bare name is a GitHub user or organization. Rules marked with a lock come
+from the deployment; the lock tooltip names the source variable. Deployment rules come from
 `ALLOWED_EMAILS`, `ALLOWED_EMAIL_DOMAINS`, `ALLOWED_USERS` (GitHub usernames), and
 `ALLOWED_GITHUB_ORGS`, or the corresponding Terraform `allowed_*` inputs. They are read-only in the
 UI. Settings rules are persisted in the global SQL store and survive deployments. Both sources are
@@ -71,8 +74,8 @@ further over-limit fan-out. Saving performs syntax validation, not DNS or member
 Review additions/removals before saving. Domain and organization rules admit matching people who are
 not already members. The review warns about overlapping grants and existing sessions, but does not
 enumerate all affected people or guarantee recovery-account reachability. Conflicts and unknown save
-outcomes require an explicit reload and draft review, not automatic retry. Cancel confirms discard;
-browser unload warns about unsaved changes, but arbitrary in-app navigation is not blocked.
+outcomes require an explicit reload and draft review, not automatic retry. Discard confirms; browser
+unload warns about unsaved changes, but arbitrary in-app navigation is not blocked.
 
 The deployment must still have a compatible baseline for every enabled provider; managed rules do
 not satisfy Terraform's safety gates or rescue invalid runtime configuration. Keep an exact verified
@@ -274,6 +277,25 @@ access, and lifecycle operations need lifecycle permission. Deleting a team-owne
 session when enforcement is `on`, also requires session ownership, owning-team lead status, or a
 workspace Owner/Administrator role. Only the session owner or a workspace Owner can change private
 visibility. Leading a team does not grant access to its private sessions.
+
+### Personal Memory in Sessions
+
+Session access and personal memory are separate. However many people can read or prompt a session,
+its owner's personal memories serve only the owner's own prompts. On anyone else's prompt the agent
+cannot search, read, or save them, and once anyone else has prompted the session, personal memory
+search stays off there and in its children for good, because that prompt can leave something running
+in the sandbox. The session's memory sidebar lists personal items only for the owner. New automation
+runs, manual ones included, and new sessions started from Slack channels, Linear, or GitHub don't
+include personal memory. Sessions started earlier keep what they pinned but no longer read it live.
+Sessions also leave personal memory out while its owner lacks `memories.manage_own`.
+
+Two things still reach beyond the owner's prompts. The personal directives and catalog pinned when
+the session started shape every prompt, whoever wrote it, though they give no one else's prompt live
+access to the personal store. Agent replies built from personal memory remain visible to everyone
+who can read the session. Sandbox access is trusted like the session's other credentials: anyone who
+can open its terminal, editor, or desktop can do what its agent can, including reaching the owner's
+personal memories while the owner's prompts run. See
+[Personal memory follows the owner's prompts](MEMORY.md#personal-memory-follows-the-owners-prompts).
 
 ### Team Defaults and Migration
 
